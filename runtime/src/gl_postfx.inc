@@ -53,6 +53,11 @@ static char   s_pfx_user_path[1024] = "";
 static int    s_pfx_user_env = 0;
 
 static float  s_bloom_thr = 0.55f;          /* bloom bright-pass threshold */
+/* Live overrides of the user chain's uniforms (gl_renderer_set_post_uniform),
+ * applied every frame so they survive a reload of the preset. */
+enum { PFX_USER_OVR = 16 };
+static struct { char name[PFX_NAME]; int n; float v[4]; } s_user_ovr[PFX_USER_OVR];
+static int    s_user_novr = 0;
 static uint64_t s_bloom_passes = 0;
 static int    s_bloom_time = 0;             /* debug: glFinish-bracketed cost */
 static double s_bloom_us_sum = 0.0; static uint64_t s_bloom_us_n = 0;   /* real frames */
@@ -470,6 +475,9 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
             const float sp = s_bloom_add_only ? 1.0f : 0.0f;
             pfx_chain_set_uniform(&st->chain, "u_spread", 1, &sp);
         }
+        if (i == PFX_STAGE_USER)
+            for (int k = 0; k < s_user_novr; k++)
+                pfx_chain_set_uniform(&st->chain, s_user_ovr[k].name, s_user_ovr[k].n, s_user_ovr[k].v);
         int reps = 1; double *sum = NULL; uint64_t *cnt = NULL;
 #ifndef PSX_NO_DEBUG_TOOLS
         if (i == PFX_STAGE_AA || i == PFX_STAGE_HQ) {
@@ -539,6 +547,26 @@ void gl_renderer_set_post_shader(const char *path) {
         (void)pfx_stage_load(PFX_STAGE_USER);
     }
     pfx_mask_wanted_update();
+}
+/* Set a user-chain uniform live (every pass that declares it), e.g. from an
+ * in-game menu. count 1..4 floats; the value stays until changed or cleared. */
+void gl_renderer_set_post_uniform(const char *name, int count, const float *v) {
+    if (!name || !*name || !v || count < 1) return;
+    GL_RT_SYNC("post_uniform");
+    if (count > 4) count = 4;
+    int k = 0;
+    while (k < s_user_novr && strcmp(s_user_ovr[k].name, name)) k++;
+    if (k == s_user_novr) {
+        if (s_user_novr == PFX_USER_OVR) return;
+        snprintf(s_user_ovr[k].name, sizeof s_user_ovr[k].name, "%s", name);
+        s_user_novr++;
+    }
+    s_user_ovr[k].n = count;
+    for (int i = 0; i < count; i++) s_user_ovr[k].v[i] = v[i];
+}
+void gl_renderer_clear_post_uniforms(void) {
+    GL_RT_SYNC("post_uniform");
+    s_user_novr = 0;
 }
 int gl_renderer_post_shader_loaded(void) {
     GL_RT_SYNC("post_shader");

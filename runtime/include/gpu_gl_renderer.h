@@ -197,6 +197,10 @@ float gl_renderer_get_bloom(void);
  * ("" = none; PSX_POST_SHADER overrides). A preset that fails to load or
  * compile is logged and skipped. */
 void  gl_renderer_set_post_shader(const char *path);
+/* Live override of a user-chain (.pfx) uniform, 1..4 floats; kept across
+ * reloads until changed or cleared. */
+void  gl_renderer_set_post_uniform(const char *name, int count, const float *v);
+void  gl_renderer_clear_post_uniforms(void);
 int   gl_renderer_post_shader_loaded(void);
 typedef struct {
     float strength, threshold;

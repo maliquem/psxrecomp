@@ -3961,6 +3961,30 @@ static void apply_present_cadence(void) {
 #endif
 }
 
+/* Live display controls for trusted title plugins (an in-game options page).
+ * They run on the emulation loop's thread, which also owns the window. */
+extern "C" void psx_video_set_vsync(int on) {
+    g_video_vsync = on ? 1 : 0;
+    apply_present_cadence();
+}
+extern "C" int psx_video_get_vsync(void) { return g_video_vsync != 0; }
+extern "C" void psx_video_set_window_size(int w, int h) {
+    if (!sdl_window || w < 320 || h < 240) return;
+    if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) return;  /* windowed only */
+    SDL_SetWindowSize(sdl_window, w, h);
+    SDL_SetWindowPosition(sdl_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+extern "C" void psx_video_get_window_size(int *w, int *h) {
+    int ww = 0, hh = 0;
+    if (sdl_window) SDL_GetWindowSize(sdl_window, &ww, &hh);
+    if (w) *w = ww;
+    if (h) *h = hh;
+}
+extern "C" void psx_video_set_fps_overlay(int on) {
+    if ((fps_telemetry_enabled() != 0) != (on != 0)) fps_telemetry_toggle();
+}
+extern "C" int psx_video_get_fps_overlay(void) { return fps_telemetry_enabled(); }
+
 static void log_present_cadence(void) {
     if (present_vsync_owns_cadence()) {
         /* The pacer still runs underneath as a deadline cap (see
