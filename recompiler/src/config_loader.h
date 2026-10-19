@@ -604,6 +604,11 @@ struct RuntimeConfig {
     bool                  video_pgxp_color_correction = false;
     int                   video_pgxp_seam = 0;
     double                video_pgxp_depth_threshold = 4096.0;
+    // pgxp_depth_tolerance: relative near bias of the depth test (0..0.5,
+    // default 0.02, plus 48 SZ when above 0). Above 0 a batch tests against
+    // earlier batches only, so decals drawn after their surface stay visible.
+    // 0 = plain per-triangle LEQUAL (surfaces inside one batch occlude too).
+    double                video_pgxp_depth_tolerance = 0.02;
 
     // pgxp_mod_only: the title ships PGXP through the psx.enhancement.pgxp
     // mod (typically a default-on override of it), which is then the one

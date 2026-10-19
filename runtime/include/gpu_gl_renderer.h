@@ -341,6 +341,8 @@ int  gl_renderer_get_pgxp_color_perspective(void);
 void gl_renderer_set_pgxp_seam(int mode);
 int  gl_renderer_get_pgxp_seam(void);
 void gl_renderer_set_pgxp_depth_threshold(float sz);
+/* Relative near bias of the PGXP depth test (0..0.5); 0 = per-triangle LEQUAL. */
+void gl_renderer_set_pgxp_depth_tolerance(float t);
 /* Cumulative depth clears by cause: config, drawing-area change, fill,
  * average-SZ jump-back threshold, displayed frame. */
 void gl_renderer_pgxp_depth_clear_reasons(uint64_t out[5]);

@@ -3390,6 +3390,9 @@ void gl_renderer_set_pgxp_seam(int mode) {
 int  gl_renderer_get_pgxp_seam(void) { return s_pgxp_seam; }
 void gl_renderer_set_pgxp_depth_threshold(float sz) {
     GL_RT_SYNC("set_pgxp_depth_threshold"); s_pgxp_depth_threshold = sz; }
+void gl_renderer_set_pgxp_depth_tolerance(float t) {
+    GL_RT_SYNC("set_pgxp_depth_tolerance");
+    s_pgxp_depth_tol = t < 0.0f ? 0.0f : (t > 0.5f ? 0.5f : t); }
 void gl_renderer_pgxp_depth_clear_reasons(uint64_t out[5]) {
     GL_RT_SYNC("pgxp_depth_clear_reasons");
     for (int i = 0; i < DCLR_N; i++) out[i] = s_depth_clear_reason[i];
