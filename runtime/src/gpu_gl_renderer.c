@@ -2411,7 +2411,9 @@ static void depth_apply_ex(int mode, int tex) {
         glDisable(GL_STENCIL_TEST);
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     } else {
-        glDepthMask(GL_FALSE);
+        /* Tolerance 0: one pass that tests and writes per triangle, so
+         * surfaces inside one batch occlude each other (plain LEQUAL). */
+        glDepthMask(pgxp_depth_tol() > 0.0f ? GL_FALSE : GL_TRUE);
         glDepthFunc(GL_LEQUAL);
         p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, pgxp_depth_tol());
     }
@@ -2420,7 +2422,7 @@ static void depth_apply_ex(int mode, int tex) {
  * bound buffer), then back to the default state. */
 static void depth_restore_ex(int mode, int tex, int n) {
     if (mode == 0) return;
-    if (mode == 1) {
+    if (mode == 1 && pgxp_depth_tol() > 0.0f) {
         p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, 0.0f);
         GLboolean st = glIsEnabled(GL_STENCIL_TEST), bl = glIsEnabled(GL_BLEND);
         glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
