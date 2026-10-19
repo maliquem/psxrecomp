@@ -467,6 +467,11 @@ struct RuntimeConfig {
     // bloom: opt-in glow strength, 0.0 (off, the default) .. 2.0. A plain
     // [video] key, so [quality.*] presets can set it.
     float                 video_bloom = 0.0f;
+    // bloom_threshold: bright-pass threshold (0 = built-in 0.55).
+    // bloom_source: "all" (3D + additive, default) or "additive" (lights and
+    // effects only; their halo then spreads over the pixels around them).
+    float                 video_bloom_threshold = 0.0f;
+    bool                  video_bloom_additive_only = false;
     // post_shader: a post-effect chain (.pfx, docs/POST_EFFECTS.md), "" = none.
     // Relative paths resolve against the game root.
     std::filesystem::path video_post_shader;

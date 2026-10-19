@@ -91,10 +91,13 @@ static const char BLUR_FS[] =
 /* The glow, screen-blended (blend screen) onto lit pixels only: every other
  * pixel is discarded, so it keeps the image's value exactly (the HUD next to
  * a lamp included). No copy of the image is read. */
+/* u_spread 1 ([video] bloom_source = "additive"): the sources are lights and
+ * effects only, so their halo spreads over every pixel around them. */
 static const char BLOOM_COMPOSITE_FS[] =
     "uniform float u_strength;\n"
+    "uniform float u_spread;\n"
     "void main(){\n"
-    "  if (texelFetch(u_mask, ivec2(gl_FragCoord.xy) - u_org, 0).r < 0.5) discard;\n"
+    "  if (u_spread < 0.5 && texelFetch(u_mask, ivec2(gl_FragCoord.xy) - u_org, 0).r < 0.5) discard;\n"
     "  o = vec4(clamp(textureLod(u_bloom, v_uv, 0.0).rgb * u_strength, 0.0, 1.0), 0.0);\n"
     "}\n";
 
@@ -138,7 +141,8 @@ static const char BLOOM_PFX[] =
     "  input u_bloom previous\n"
     "  input u_mask mask\n"
     "  blend screen\n"
-    "  uniform u_strength 1.0\n";
+    "  uniform u_strength 1.0\n"
+    "  uniform u_spread 0.0\n";
 
 static const char FXAA_PFX[] =
     "pfx 1\npass fxaa\n  shader builtin:fxaa\n  input u_tex source\n  uniform u_quality 0\n";

@@ -783,6 +783,19 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 throw std::runtime_error(fmt::format("[video] bloom out of range (0.0..2.0): {}", f));
             rt.video_bloom = static_cast<float>(f);
         }
+        if (video.contains("bloom_threshold")) {
+            const double t = toml_number(video, "bloom_threshold");
+            if (!(t >= 0.0 && t <= 2.0))
+                throw std::runtime_error(fmt::format("[video] bloom_threshold out of range (0.0..2.0): {}", t));
+            rt.video_bloom_threshold = static_cast<float>(t);
+        }
+        if (video.contains("bloom_source")) {
+            const auto s = toml::find<std::string>(video, "bloom_source");
+            if (s == "all") rt.video_bloom_additive_only = false;
+            else if (s == "additive") rt.video_bloom_additive_only = true;
+            else throw std::runtime_error(fmt::format(
+                "[video] bloom_source must be \"all\" or \"additive\": {}", s));
+        }
         // post_shader: an elective post-effect chain (.pfx), relative to the
         // game root. The runtime parses it and logs (and skips) a bad one.
         if (video.contains("post_shader")) {

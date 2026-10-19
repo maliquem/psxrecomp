@@ -190,6 +190,8 @@ enum { GL_POST_AA_OFF = 0, GL_POST_AA_FXAA = 1, GL_POST_AA_FXAA_HQ = 2 };
  * Bloom ([video] bloom, 0 = off .. 2; PSX_BLOOM overrides) is the built-in
  * "bloom" chain: glow from 3D and additive primitives only, never the HUD. */
 void  gl_renderer_set_bloom(float strength);
+void  gl_renderer_set_bloom_threshold(float thr);       /* 0 = built-in default */
+void  gl_renderer_set_bloom_additive_only(int on);      /* sources: additive only */
 float gl_renderer_get_bloom(void);
 /* [video] post_shader: a .pfx chain file run after bloom and before AA
  * ("" = none; PSX_POST_SHADER overrides). A preset that fails to load or

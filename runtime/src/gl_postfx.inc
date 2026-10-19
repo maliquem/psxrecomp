@@ -467,6 +467,8 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
             const float k = s_bloom;
             pfx_chain_set_uniform(&st->chain, "u_strength", 1, &k);
             pfx_chain_set_uniform(&st->chain, "u_thr", 1, &s_bloom_thr);
+            const float sp = s_bloom_add_only ? 1.0f : 0.0f;
+            pfx_chain_set_uniform(&st->chain, "u_spread", 1, &sp);
         }
         int reps = 1; double *sum = NULL; uint64_t *cnt = NULL;
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -554,6 +556,22 @@ void gl_renderer_set_bloom(float strength) {
     pfx_mask_wanted_update();
 }
 float gl_renderer_get_bloom(void) { return s_bloom; }
+
+/* [video] bloom_threshold (0 keeps the built-in 0.55) and bloom_source
+ * ("all" = 3D + additive, "additive" = lights and effects only).
+ * PSX_BLOOM_THRESHOLD / PSX_BLOOM_SOURCE=additive override. */
+void gl_renderer_set_bloom_threshold(float thr) {
+    GL_RT_SYNC("set_bloom_threshold");
+    const char *e = getenv("PSX_BLOOM_THRESHOLD");
+    if (e && *e) thr = (float)atof(e);
+    if (thr > 0.0f && thr <= 2.0f) s_bloom_thr = thr;
+}
+void gl_renderer_set_bloom_additive_only(int on) {
+    GL_RT_SYNC("set_bloom_source");
+    const char *e = getenv("PSX_BLOOM_SOURCE");
+    if (e && *e) on = !strcmp(e, "additive");
+    s_bloom_add_only = on ? 1 : 0;
+}
 
 void gl_renderer_bloom_debug(float strength, float threshold, int time,
                              GlBloomInfo *out) {

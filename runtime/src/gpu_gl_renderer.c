@@ -1398,6 +1398,7 @@ static uint64_t    s_pres_seq = 0;
 
 static float s_bloom = 0.0f;           /* [video] bloom strength (gl_postfx.inc) */
 static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chain reads it) */
+static int   s_bloom_add_only = 0;     /* [video] bloom_source = "additive": opaque 3D does not glow */
 static int  postfx_active(void);
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh);
 static void pres_record(int path, int dx, int dy, int w, int h,
@@ -1834,10 +1835,11 @@ static const char *GEO_FS =
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;   /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
     "uniform int u_badd;   /* this batch blends additively */\n"
+    "uniform int u_baddonly; /* only additive primitives feed the bloom */\n"
     "noperspective in vec2 v_npos; flat in int v_dith;\n"
     PSX_DITHER_GLSL
     "void main(){\n"
-    "  if (u_bcls != 0) { if (u_bcls == 1 && !(v_b3d > 0.999 || u_badd != 0)) discard; frag = vec4(0.0); return; }\n"
+    "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || u_badd != 0)) discard; frag = vec4(0.0); return; }\n"
     "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\n"
     "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\n";
 
@@ -1931,6 +1933,7 @@ static const char *TEX_FS =
     "out vec4 frag; out vec4 blend_factor;\n"
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;      /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
+    "uniform int u_baddonly;  /* only additive texels feed the bloom */\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
     "flat in int v_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
@@ -2160,7 +2163,7 @@ static const char *TEX_FS =
     "  }\n"
     "  if ((v_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
     "  if (u_bcls != 0) {   /* 3D, or additive (modes 1 and 3) semi texels */\n"
-    "    if (u_bcls == 1 && !(v_b3d > 0.999 || ((v_semi == 2 || v_semi == 4) && stp == 1))) discard;\n"
+    "    if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || ((v_semi == 2 || v_semi == 4) && stp == 1))) discard;\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
     "    frag = vec4(0.0); blend_factor = vec4(0.0); return;\n"
     "  }\n"
@@ -3649,6 +3652,7 @@ void gl_renderer_batch_diag(uint64_t out[9]) {
  * painter ordered like the colour; semi-transparent texels and primitives
  * leave it as it was. Bloom off: none of this runs and no state changes. */
 static GLint s_tex_uBcls = -1, s_geo_uBcls = -1, s_geo_uBadd = -1;
+static GLint s_tex_uBaddonly = -1, s_geo_uBaddonly = -1;
 /* No glGet here: on a threaded driver every query is a round trip, and these
  * run per batch. The passes set what they need; the caller's draw state is
  * then put back from what the caller knows (bcls_end_geo / tex_bcls_end).
@@ -3661,6 +3665,7 @@ static void bcls_begin(int tex, int additive) {
     glStencilMask(0x02);
     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     if (!tex) p_glUniform1i(s_geo_uBadd, additive);
+    p_glUniform1i(tex ? s_tex_uBaddonly : s_geo_uBaddonly, s_bloom_add_only);
 }
 /* pass 2: clear bit 1 under every covered pixel; pass 1: set it on sources. */
 static void bcls_pass(int tex, int pass) {
@@ -3684,6 +3689,7 @@ static void bcls_end_geo(int semi, int mask, int check) {
 enum { BCLS_CLEAR = 1, BCLS_SET = 2 };
 static int bcls_passes(int semi, int b3d) {
     if (semi >= 0) return BCLS_SET;
+    if (s_bloom_add_only) return BCLS_CLEAR;   /* opaque never feeds it */
     if (b3d == 1) return BCLS_SET;
     if (b3d == 0) return BCLS_CLEAR;
     return BCLS_CLEAR | BCLS_SET;
@@ -6116,6 +6122,8 @@ static int init_gpu_raster(void) {
     s_tex_uBcls = p_glGetUniformLocation(s_tex_prog, "u_bcls");
     s_geo_uBcls = p_glGetUniformLocation(s_geo_prog, "u_bcls");
     s_geo_uBadd = p_glGetUniformLocation(s_geo_prog, "u_badd");
+    s_tex_uBaddonly = p_glGetUniformLocation(s_tex_prog, "u_baddonly");
+    s_geo_uBaddonly = p_glGetUniformLocation(s_geo_prog, "u_baddonly");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
