@@ -188,3 +188,14 @@ int psx_mod_psyq_load_image(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     if (words >= 16u) gpu_write_gp1(0x04000002u);
     return 1;
 }
+
+extern CPUState *debug_cpu_ptr;
+int psx_mod_gte_rotation(int16_t out[9]) {
+    const CPUState *cpu = debug_cpu_ptr;
+    if (!cpu || !out) return 0;
+    const uint32_t *c = cpu->gte_ctrl;
+    out[0] = (int16_t)c[0]; out[1] = (int16_t)(c[0] >> 16); out[2] = (int16_t)c[1];
+    out[3] = (int16_t)(c[1] >> 16); out[4] = (int16_t)c[2]; out[5] = (int16_t)(c[2] >> 16);
+    out[6] = (int16_t)c[3]; out[7] = (int16_t)(c[3] >> 16); out[8] = (int16_t)c[4];
+    return 1;
+}

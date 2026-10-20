@@ -148,6 +148,11 @@ uint16_t psx_mod_read_half(uint32_t address);
 void psx_mod_write_half(uint32_t address, uint16_t value);
 uint32_t psx_mod_read_word(uint32_t address);
 void psx_mod_write_word(uint32_t address, uint32_t value);
+/* The GTE rotation matrix (control registers 0..4) as the guest left it,
+ * row-major R11..R33 in 4.12 fixed point (4096 = 1.0). Read-only; a game
+ * that loads its camera last before VBlank exposes the camera here.
+ * Returns 0 before the CPU is bound. */
+int psx_mod_gte_rotation(int16_t out[9]);
 /*
  * Replace one guest instruction and route that address through the runtime's
  * executable-RAM path. Use this instead of psx_mod_write_word for code so a
