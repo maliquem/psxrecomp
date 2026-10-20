@@ -8654,6 +8654,17 @@ static void handle_post_shader(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"loaded\":%d}", id, gl_renderer_post_shader_loaded());
 }
 
+/* extra_shader: {"cmd":"extra_shader","slot":0,"path":"x.pfx"} sets one of
+ * the extra file-chain slots live ("" = none), e.g. to tune a game effect. */
+static void handle_extra_shader(int id, const char *json)
+{
+    char path[1024];
+    const int slot = json_get_int(json, "slot", -1);
+    if (slot < 0 || !json_get_str(json, "path", path, sizeof path)) { send_err(id, "need slot and path"); return; }
+    gl_renderer_set_extra_shader(slot, path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d}", id, slot);
+}
+
 /* post_uniform: {"cmd":"post_uniform","uniform":"u_x","v":"a b c d"} sets a
  * file-chain uniform live (1..4 floats; every pass that declares it). */
 static void handle_post_uniform(int id, const char *json)
@@ -16037,6 +16048,7 @@ static const CmdEntry s_commands[] = {
     { "post_aa",           handle_post_aa },
     { "post_shader",       handle_post_shader },
     { "post_uniform",      handle_post_uniform },
+    { "extra_shader",      handle_extra_shader },
     { "fmv_chroma",        handle_fmv_chroma },
     { "texture_lod",       handle_texture_lod },
     { "accurate_blending", handle_accurate_blending },
