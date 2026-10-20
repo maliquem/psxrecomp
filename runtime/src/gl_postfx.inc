@@ -832,8 +832,8 @@ void gl_renderer_set_bloom_threshold(float thr) {
 void gl_renderer_set_bloom_additive_only(int on) {
     GL_RT_SYNC("set_bloom_source");
     const char *e = getenv("PSX_BLOOM_SOURCE");
-    if (e && *e) on = !strcmp(e, "additive");
-    s_bloom_add_only = on ? 1 : 0;
+    if (e && *e) on = !strcmp(e, "additive3d") ? 2 : !strcmp(e, "additive") ? 1 : 0;
+    s_bloom_add_only = on == 2 ? 2 : on ? 1 : 0;
 }
 
 void gl_renderer_bloom_debug(float strength, float threshold, int time,

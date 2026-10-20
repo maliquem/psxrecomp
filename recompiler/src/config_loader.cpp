@@ -791,10 +791,11 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("bloom_source")) {
             const auto s = toml::find<std::string>(video, "bloom_source");
-            if (s == "all") rt.video_bloom_additive_only = false;
-            else if (s == "additive") rt.video_bloom_additive_only = true;
+            if (s == "all") rt.video_bloom_additive_only = 0;
+            else if (s == "additive") rt.video_bloom_additive_only = 1;
+            else if (s == "additive3d") rt.video_bloom_additive_only = 2;
             else throw std::runtime_error(fmt::format(
-                "[video] bloom_source must be \"all\" or \"additive\": {}", s));
+                "[video] bloom_source must be \"all\", \"additive\" or \"additive3d\": {}", s));
         }
         // post_shader: an elective post-effect chain (.pfx), relative to the
         // game root. The runtime parses it and logs (and skips) a bad one.

@@ -468,10 +468,12 @@ struct RuntimeConfig {
     // [video] key, so [quality.*] presets can set it.
     float                 video_bloom = 0.0f;
     // bloom_threshold: bright-pass threshold (0 = built-in 0.55).
-    // bloom_source: "all" (3D + additive, default) or "additive" (lights and
-    // effects only; their halo then spreads over the pixels around them).
+    // bloom_source: "all" (3D + additive, default), "additive" (lights and
+    // effects only; their halo then spreads over the pixels around them) or
+    // "additive3d" (additive 3D primitives only: menu highlights and other
+    // additive 2D UI stay unlit). 0 / 1 / 2.
     float                 video_bloom_threshold = 0.0f;
-    bool                  video_bloom_additive_only = false;
+    int                   video_bloom_additive_only = 0;
     // post_shader: a post-effect chain (.pfx, docs/POST_EFFECTS.md), "" = none.
     // Relative paths resolve against the game root.
     std::filesystem::path video_post_shader;

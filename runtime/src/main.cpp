@@ -1711,7 +1711,7 @@ static void quality_apply_video_globals(const PSXRecompV4::RuntimeConfig& r) {
     /* Preset-only keys (no settings.toml form): picking a preset applies them. */
     g_video_bloom        = r.video_bloom;
     g_video_bloom_threshold = r.video_bloom_threshold;
-    g_video_bloom_add_only  = r.video_bloom_additive_only ? 1 : 0;
+    g_video_bloom_add_only  = r.video_bloom_additive_only;
     g_video_fmv_chroma   = r.video_fmv_chroma_smoothing ? 1 : 0;
     g_video_texture_lod  = r.video_texture_lod;
     g_video_aniso        = r.video_anisotropic_filtering;
@@ -17663,7 +17663,7 @@ int main(int argc, char** argv) {
             g_video_post_aa    = gc.runtime.video_antialiasing_mode;
             g_video_bloom      = gc.runtime.video_bloom;
             g_video_bloom_threshold = gc.runtime.video_bloom_threshold;
-            g_video_bloom_add_only  = gc.runtime.video_bloom_additive_only ? 1 : 0;
+            g_video_bloom_add_only  = gc.runtime.video_bloom_additive_only;
             {   /* UTF-8 bytes on every host (C++17: string, C++20: u8string) */
                 const auto u8 = gc.runtime.video_post_shader.u8string();
                 g_video_post_shader.assign(u8.begin(), u8.end());

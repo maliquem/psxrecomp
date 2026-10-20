@@ -1398,7 +1398,8 @@ static uint64_t    s_pres_seq = 0;
 
 static float s_bloom = 0.0f;           /* [video] bloom strength (gl_postfx.inc) */
 static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chain reads it) */
-static int   s_bloom_add_only = 0;     /* [video] bloom_source = "additive": opaque 3D does not glow */
+static int   s_bloom_add_only = 0;     /* [video] bloom_source: 1 "additive" (opaque 3D does not glow),
+                                        * 2 "additive3d" (additive 2D UI does not glow either) */
 static int  postfx_active(void);
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh);
 static void postfx_pillar_fill(int lx, int ly, int lw, int lh);
@@ -1838,11 +1839,11 @@ static const char *GEO_FS =
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;   /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
     "uniform int u_badd;   /* this batch blends additively */\n"
-    "uniform int u_baddonly; /* only additive primitives feed the bloom */\n"
+    "uniform int u_baddonly; /* 1: only additive primitives feed the bloom; 2: only additive 3D ones */\n"
     "noperspective in vec2 v_npos; flat in int v_dith;\n"
     PSX_DITHER_GLSL
     "void main(){\n"
-    "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || u_badd != 0)) discard; frag = vec4(0.0); return; }\n"
+    "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || (u_badd != 0 && (u_baddonly != 2 || v_b3d > 0.999)))) discard; frag = vec4(0.0); return; }\n"
     "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\n"
     "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\n";
 
@@ -1936,7 +1937,7 @@ static const char *TEX_FS =
     "out vec4 frag; out vec4 blend_factor;\n"
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;      /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
-    "uniform int u_baddonly;  /* only additive texels feed the bloom */\n"
+    "uniform int u_baddonly;  /* 1: only additive texels feed the bloom; 2: only additive 3D ones */\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
     "flat in int v_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
@@ -2166,7 +2167,7 @@ static const char *TEX_FS =
     "  }\n"
     "  if ((v_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
     "  if (u_bcls != 0) {   /* 3D, or additive (modes 1 and 3) semi texels */\n"
-    "    if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || ((v_semi == 2 || v_semi == 4) && stp == 1))) discard;\n"
+    "    if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || ((v_semi == 2 || v_semi == 4) && stp == 1 && (u_baddonly != 2 || v_b3d > 0.999)))) discard;\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
     "    frag = vec4(0.0); blend_factor = vec4(0.0); return;\n"
     "  }\n"
