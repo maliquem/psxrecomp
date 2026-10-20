@@ -58,9 +58,9 @@ typedef struct {
     int      dw[PFX_MAX_PASSES], dh[PFX_MAX_PASSES];
     int      tw[PFX_MAX_PASSES], th[PFX_MAX_PASSES];
 } PfxStage;
-/* EXTRA0..2: further file chains run, in order, before USER (e.g. a depth
+/* EXTRA0..3: further file chains run, in order, before USER (e.g. a depth
  * look, then a down-sample, under a CRT chain). */
-#define PFX_EXTRA 3
+#define PFX_EXTRA 4
 enum { PFX_STAGE_BLOOM, PFX_STAGE_EXTRA0, PFX_STAGE_USER = PFX_STAGE_EXTRA0 + PFX_EXTRA,
        PFX_STAGE_AA, PFX_STAGE_HQ, PFX_NSTAGES };
 #define PFX_IS_EXTRA(i)  ((i) >= PFX_STAGE_EXTRA0 && (i) < PFX_STAGE_EXTRA0 + PFX_EXTRA)
