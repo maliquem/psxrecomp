@@ -11,7 +11,10 @@
  * thread included), and Smooth motion's generated frames run stages 1 and 2.
  *
  * Inputs a pass may read: `source` (the composed image, one shared copy),
- * `mask` (optional: the primitive-derived "may glow" mask, see below), and
+ * `mask` (optional: the primitive-derived "may glow" mask, see below),
+ * `mask3d` (optional: 1 where the last opaque thing drawn was a PGXP-proven 3D
+ * primitive, or a 3D primitive shows through something see-through; marked in
+ * stencil bit 2, only while a chain reads it; the same texture, green), and
  * earlier passes' targets. The executor owns target allocation and lifetime,
  * program build/cache, uniform binding (u_rcp, u_size, u_org and the preset's
  * uniforms) and GL state: everything the pass touches is put back.
@@ -47,9 +50,11 @@ typedef struct {
     int      dw[PFX_MAX_PASSES], dh[PFX_MAX_PASSES];
     int      tw[PFX_MAX_PASSES], th[PFX_MAX_PASSES];
 } PfxStage;
-enum { PFX_STAGE_BLOOM, PFX_STAGE_USER, PFX_STAGE_AA, PFX_STAGE_HQ, PFX_NSTAGES };
+/* PRE: a second file chain run before USER (e.g. a down-sample under a CRT). */
+enum { PFX_STAGE_BLOOM, PFX_STAGE_PRE, PFX_STAGE_USER, PFX_STAGE_AA, PFX_STAGE_HQ, PFX_NSTAGES };
 static PfxStage s_pfx[PFX_NSTAGES];
 static char   s_pfx_user_path[1024] = "";
+static char   s_pfx_pre_path[1024] = "";
 static int    s_pfx_user_env = 0;
 
 static float  s_bloom_thr = 0.55f;          /* bloom bright-pass threshold */
@@ -88,6 +93,7 @@ static int    s_mask_w = 0, s_mask_h = 0;
 static int pfx_stage_on(int i) {
     switch (i) {
     case PFX_STAGE_BLOOM: return s_bloom > 0.0f;
+    case PFX_STAGE_PRE:   return s_pfx_pre_path[0] != 0;
     case PFX_STAGE_USER:  return s_pfx_user_path[0] != 0;
     case PFX_STAGE_AA:    return s_post_aa == GL_POST_AA_FXAA;
     case PFX_STAGE_HQ:    return s_post_aa == GL_POST_AA_FXAA_HQ;
@@ -123,7 +129,13 @@ static void pfx_mask_wanted_update(void) {
         if (i == PFX_STAGE_BLOOM) want = 1;          /* the bloom preset reads it */
         else if (s_pfx[i].loaded && s_pfx[i].chain.uses_mask) want = 1;
     }
-    if (want != s_bcls_on) { s_bcls_on = want; pgxp_render_wanted_update(); }
+    int want3d = 0;
+    for (int i = 0; i < PFX_NSTAGES; i++)
+        if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_mask3d) want3d = 1;
+    if (want != s_bcls_on || want3d != s_b3d_on) {
+        s_bcls_on = want; s_b3d_on = want3d;
+        pgxp_render_wanted_update();
+    }
 }
 
 static int pfx_stage_load(int i) {
@@ -134,19 +146,22 @@ static int pfx_stage_load(int i) {
     if (st->loaded) return 1;
     char err[256] = "";
     int ok;
-    if (i == PFX_STAGE_USER) ok = pfx_chain_load_file(s_pfx_user_path, &st->chain, err, sizeof err);
+    const char *file = i == PFX_STAGE_USER ? s_pfx_user_path : i == PFX_STAGE_PRE ? s_pfx_pre_path : NULL;
+    if (file) ok = pfx_chain_load_file(file, &st->chain, err, sizeof err);
     else ok = pfx_chain_builtin(i == PFX_STAGE_BLOOM ? "bloom" : i == PFX_STAGE_AA ? "fxaa" : "fxaa_hq",
                                 &st->chain, err, sizeof err);
     if (!ok) {
         fprintf(stdout, "psxrecomp: post effect '%s' not loaded: %s\n",
-                i == PFX_STAGE_USER ? s_pfx_user_path : "built-in", err);
+                file ? file : "built-in", err);
         st->failed = 1;
         return 0;
     }
     st->loaded = 1;
-    if (i == PFX_STAGE_USER)
-        fprintf(stdout, "psxrecomp: post shader '%s' (%d passes%s)\n", s_pfx_user_path,
-                st->chain.npasses, st->chain.uses_mask ? ", mask" : "");
+    if (file)
+        fprintf(stdout, "psxrecomp: post shader '%s' (%d passes%s%s)\n", file,
+                st->chain.npasses, st->chain.uses_mask ? ", mask" : "",
+                st->chain.uses_mask3d ? ", mask3d" : "");
+    pfx_mask_wanted_update();   /* what the chain reads is known now */
     return 1;
 }
 
@@ -193,7 +208,7 @@ static void pfx_rect_px(GLuint tex, float tex_w, float tex_h, int x, int y, int 
 static void postfx_note_center(GLuint fbo, GLuint tex, float tex_w, float tex_h,
                                int x, int y, int w, int h, int off, int wide_w) {
     s_mask_ctr_valid = 0;
-    if (!s_bcls_on || !fbo || !tex || wide_w <= 0) return;
+    if (!(s_bcls_on || s_b3d_on) || !fbo || !tex || wide_w <= 0) return;
     s_mask_ctr_rb = pfx_surface_rb(fbo);
     if (!s_mask_ctr_rb) return;
     pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_ctr, &s_mask_ctr_tw, &s_mask_ctr_th);
@@ -209,7 +224,7 @@ static void postfx_note_source(GLuint fbo, GLuint tex, float tex_w, float tex_h,
                                int x, int y, int w, int h) {
     s_mask_src_valid = 0;
     s_mask_ctr_valid = 0;
-    if (!s_bcls_on || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
+    if (!(s_bcls_on || s_b3d_on) || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
     s_mask_src_rb = pfx_surface_rb(fbo);
     if (!s_mask_src_rb) return;
     pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_src, &s_mask_src_tw, &s_mask_src_th);
@@ -222,6 +237,7 @@ static void pfx_tex_alloc(GLuint *t, int w, int h, int fmt, int nearest) {
     glBindTexture(GL_TEXTURE_2D, *t);
     if (fmt == PFX_FMT_RGBA16F) glTexImage2D(GL_TEXTURE_2D, 0, 0x881A /*RGBA16F*/, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
     else if (fmt == -1)         glTexImage2D(GL_TEXTURE_2D, 0, 0x8229 /*R8*/, w, h, 0, 0x1903 /*RED*/, GL_UNSIGNED_BYTE, NULL);
+    else if (fmt == -2)         glTexImage2D(GL_TEXTURE_2D, 0, 0x822B /*RG8*/, w, h, 0, 0x8227 /*RG*/, GL_UNSIGNED_BYTE, NULL);
     else                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -236,11 +252,12 @@ static void pfx_fbo_attach(GLuint *f, GLuint tex) {
 
 /* Window-sized mask from the presented surface's marks (fresh) or the last. */
 /* The marks of rect r (surface px) of surface rb (tw x th px) into slot k's
- * R8 texture: 0 over the rect, then 1 where stencil bit 1 is set. */
+ * RG8 texture: 0 over the rect, then red 1 where stencil bit 1 (may glow) is
+ * set and green 1 where bit 2 (3D) is. */
 static int pfx_surf_mask(int k, GLuint rb, int tw, int th, const int r[4]) {
     PfxSurfMask *m = &s_smask[k];
     if (m->rb != rb || m->w != tw || m->h != th) {
-        pfx_tex_alloc(&m->tex, tw, th, -1, 1);
+        pfx_tex_alloc(&m->tex, tw, th, -2, 1);
         pfx_fbo_attach(&m->fbo, m->tex);
         p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
                                     PSXGL_RENDERBUFFER, rb);
@@ -252,10 +269,19 @@ static int pfx_surf_mask(int k, GLuint rb, int tw, int th, const int r[4]) {
     p_glUniform1f(s_mask_uV, 0.0f);
     post_fullscreen(s_mask_prog, s_mask_uUv);
     glEnable(GL_STENCIL_TEST);
-    glStencilFunc(GL_EQUAL, 0x02, 0x02);
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
     p_glUniform1f(s_mask_uV, 1.0f);
-    post_fullscreen(s_mask_prog, s_mask_uUv);
+    if (s_bcls_on) {
+        glColorMask(GL_TRUE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glStencilFunc(GL_EQUAL, 0x02, 0x02);
+        post_fullscreen(s_mask_prog, s_mask_uUv);
+    }
+    if (s_b3d_on) {
+        glColorMask(GL_FALSE, GL_TRUE, GL_FALSE, GL_FALSE);
+        glStencilFunc(GL_EQUAL, 0x04, 0x04);
+        post_fullscreen(s_mask_prog, s_mask_uUv);
+    }
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_STENCIL_TEST);
     return 1;
 }
@@ -285,7 +311,8 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
             "  vec2 f = gl_FragCoord.xy;\n"
             "  int sx = u_src.x + int(floor((f.x - u_dst.x) * float(u_src.z - u_src.x) / u_dst.y));\n"
             "  int sy = u_src.y + int(floor((u_dst.z - f.y) * float(u_src.w - u_src.y) / u_dst.z));\n"
-            "  o = vec4(texelFetch(u_s, ivec2(sx, sy), 0).r);\n"
+            "  vec2 m = texelFetch(u_s, ivec2(sx, sy), 0).rg;\n"
+            "  o = vec4(m.r, m.g, 0.0, m.r);\n"
             "}\n");
         if (!s_mask_prog || !s_mask_map_prog) { s_mask_prog = 0; return 0; }
         s_mask_uUv = p_glGetUniformLocation(s_mask_prog, "u_uv_rect");
@@ -296,7 +323,7 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
         s_mmap_uDst = p_glGetUniformLocation(s_mask_map_prog, "u_dst");
     }
     if (s_mask_w != lw || s_mask_h != lh) {
-        pfx_tex_alloc(&s_mask_tex, lw, lh, -1, 1);
+        pfx_tex_alloc(&s_mask_tex, lw, lh, -2, 1);
         pfx_fbo_attach(&s_mask_fbo, s_mask_tex);
         s_mask_w = lw; s_mask_h = lh; s_mask_ok = 0;
     }
@@ -347,7 +374,12 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         }
         int w = lw, h = lh;
         if (!last) {
-            w = (int)((float)lw * ps->scale); h = (int)((float)lh * ps->scale);
+            if (ps->lines > 0) {   /* a fixed height (e.g. the console's lines), the rect's aspect */
+                h = ps->lines;
+                w = (int)lrintf((float)ps->lines * (float)lw / (float)lh);
+            } else {
+                w = (int)((float)lw * ps->scale); h = (int)((float)lh * ps->scale);
+            }
             if (w < 1) w = 1;
             if (h < 1) h = 1;
             if (generated && ps->reuse_generated && st->fbo[i] && st->tw[i] == w && st->th[i] == h) {
@@ -386,7 +418,8 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             const int from = ps->in[k].from;
             const GLuint t = from == PFX_IN_SOURCE ? s_post_copy_tex
                            : from == PFX_IN_SOURCE_DOWN ? st->dtex[i]
-                           : from == PFX_IN_MASK ? s_mask_tex : st->tex[from];
+                           : (from == PFX_IN_MASK || from == PFX_IN_MASK3D) ? s_mask_tex
+                           : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
             glBindTexture(GL_TEXTURE_2D, t);
             p_glUniform1i(L->in[k], k);
@@ -464,7 +497,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if ((i == PFX_STAGE_AA || i == PFX_STAGE_HQ) && !with_aa) continue;
         if (!pfx_stage_load(i)) continue;
         PfxStage *st = &s_pfx[i];
-        if (st->chain.uses_mask) {
+        if (st->chain.uses_mask || st->chain.uses_mask3d) {
             if (!mask_done) { mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1; }
             if (!mask_ok) continue;                  /* no marks yet */
         }
@@ -475,7 +508,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
             const float sp = s_bloom_add_only ? 1.0f : 0.0f;
             pfx_chain_set_uniform(&st->chain, "u_spread", 1, &sp);
         }
-        if (i == PFX_STAGE_USER)
+        if (i == PFX_STAGE_USER || i == PFX_STAGE_PRE)
             for (int k = 0; k < s_user_novr; k++)
                 pfx_chain_set_uniform(&st->chain, s_user_ovr[k].name, s_user_ovr[k].n, s_user_ovr[k].v);
         int reps = 1; double *sum = NULL; uint64_t *cnt = NULL;
@@ -781,6 +814,16 @@ void gl_renderer_set_post_shader(const char *path) {
         /* No context yet: the parse needs none, so the mask decision is made now. */
         (void)pfx_stage_load(PFX_STAGE_USER);
     }
+    pfx_mask_wanted_update();
+}
+/* A second file chain run right before the post_shader one (the same format;
+ * "" = none), e.g. a down-sample a CRT chain then reads. No config key: set by
+ * code (a game's menu). Live uniforms below reach both chains. */
+void gl_renderer_set_pre_shader(const char *path) {
+    GL_RT_SYNC("pre_shader");
+    pfx_stage_unload(&s_pfx[PFX_STAGE_PRE]);
+    snprintf(s_pfx_pre_path, sizeof s_pfx_pre_path, "%s", path ? path : "");
+    if (s_pfx_pre_path[0]) (void)pfx_stage_load(PFX_STAGE_PRE);
     pfx_mask_wanted_update();
 }
 /* Set a user-chain uniform live (every pass that declares it), e.g. from an

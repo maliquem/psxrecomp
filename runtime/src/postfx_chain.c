@@ -242,13 +242,14 @@ int pfx_chain_parse(const char *text, const char *name, PfxShaderLoader load, vo
             if (!strcmp(f, "source")) from = PFX_IN_SOURCE;
             else if (!strcmp(f, "source_down")) from = PFX_IN_SOURCE_DOWN;
             else if (!strcmp(f, "mask")) { from = PFX_IN_MASK; out->uses_mask = 1; }
+            else if (!strcmp(f, "mask3d")) { from = PFX_IN_MASK3D; out->uses_mask3d = 1; }
             else if (!strcmp(f, "previous")) {
                 if (self == 0) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "the first pass has no previous"); }
                 from = self - 1;
             } else {
                 from = -100;
                 for (int i = 0; i < self; i++) if (!strcmp(out->pass[i].name, f)) from = i;
-                if (from == -100) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "unknown input '%s' (source, mask, previous or an earlier pass)", f); }
+                if (from == -100) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "unknown input '%s' (source, mask, mask3d, previous or an earlier pass)", f); }
             }
             snprintf(cur->in[cur->ninputs].sampler, PFX_NAME, "%s", s);
             cur->in[cur->ninputs++].from = from;
@@ -257,6 +258,11 @@ int pfx_chain_parse(const char *text, const char *name, PfxShaderLoader load, vo
             float f = pfx_word(&q, v, sizeof v) ? strtof(v, NULL) : 0.0f;
             if (!(f > 0.0f && f <= 4.0f)) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "scale must be in (0, 4]"); }
             cur->scale = f;
+        } else if (!strcmp(kw, "lines")) {
+            char v[32];
+            const long n = pfx_word(&q, v, sizeof v) ? strtol(v, NULL, 10) : 0;
+            if (n < 16 || n > 4096) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "lines must be in 16..4096"); }
+            cur->lines = (int)n;
         } else if (!strcmp(kw, "format")) {
             char v[16]; pfx_word(&q, v, sizeof v);
             if (!strcmp(v, "rgba8")) cur->format = PFX_FMT_RGBA8;

@@ -1398,6 +1398,7 @@ static uint64_t    s_pres_seq = 0;
 
 static float s_bloom = 0.0f;           /* [video] bloom strength (gl_postfx.inc) */
 static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chain reads it) */
+static int   s_b3d_on = 0;             /* draws keep the "3D" mask, stencil bit 2 (a chain reads mask3d) */
 static int   s_bloom_add_only = 0;     /* [video] bloom_source: 1 "additive" (opaque 3D does not glow),
                                         * 2 "additive3d" (additive 2D UI does not glow either) */
 static int  postfx_active(void);
@@ -1837,13 +1838,14 @@ static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; smooth in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
     "noperspective in float v_b3d;\n"
-    "uniform int u_bcls;   /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
+    "uniform int u_bcls;   /* mask pass (gl_postfx.inc): 0 off, 2 clear, 1 mark glow, 3 mark 3D */\n"
     "uniform int u_badd;   /* this batch blends additively */\n"
     "uniform int u_baddonly; /* 1: only additive primitives feed the bloom; 2: only additive 3D ones */\n"
     "noperspective in vec2 v_npos; flat in int v_dith;\n"
     PSX_DITHER_GLSL
     "void main(){\n"
-    "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || (u_badd != 0 && (u_baddonly != 2 || v_b3d > 0.999)))) discard; frag = vec4(0.0); return; }\n"
+    "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || (u_badd != 0 && (u_baddonly != 2 || v_b3d > 0.999)))) discard;\n"
+    "    if (u_bcls == 3 && v_b3d <= 0.999) discard; frag = vec4(0.0); return; }\n"
     "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\n"
     "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\n";
 
@@ -1936,7 +1938,7 @@ static const char *TEX_FS =
     PSX_DITHER_GLSL
     "out vec4 frag; out vec4 blend_factor;\n"
     "noperspective in float v_b3d;\n"
-    "uniform int u_bcls;      /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
+    "uniform int u_bcls;      /* mask pass (gl_postfx.inc): 0 off, 2 clear, 1 mark glow, 3 mark 3D */\n"
     "uniform int u_baddonly;  /* 1: only additive texels feed the bloom; 2: only additive 3D ones */\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
@@ -2168,6 +2170,7 @@ static const char *TEX_FS =
     "  if ((v_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
     "  if (u_bcls != 0) {   /* 3D, or additive (modes 1 and 3) semi texels */\n"
     "    if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || ((v_semi == 2 || v_semi == 4) && stp == 1 && (u_baddonly != 2 || v_b3d > 0.999)))) discard;\n"
+    "    if (u_bcls == 3 && v_b3d <= 0.999) discard;            /* 3D mask: 3D texels only */\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
     "    frag = vec4(0.0); blend_factor = vec4(0.0); return;\n"
     "  }\n"
@@ -3369,7 +3372,7 @@ static void pgxp_render_wanted_update(void) {
     /* Bloom marks PGXP-proven 3D triangles as its sources, so it wants the
      * per-triangle depth too (it never enables the depth test). */
     __atomic_store_n(&s_pgxp_render_wanted,
-                     (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on) ? 1 : 0,
+                     (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on || s_b3d_on) ? 1 : 0,
                      __ATOMIC_RELEASE);
 }
 int gl_renderer_pgxp_render_wanted(void) {
@@ -3662,18 +3665,20 @@ static GLint s_tex_uBaddonly = -1, s_geo_uBaddonly = -1;
  * then put back from what the caller knows (bcls_end_geo / tex_bcls_end).
  * Depth writes need no care: mode-1 batches already have them off and
  * mode-0 batches have no depth test; mode-2 (depth clear) draws mark nothing. */
-static void bcls_begin(int tex, int additive) {
+/* bit: 0x02 the "may glow" mark, 0x04 the "3D" mark (mask3d). */
+static void bcls_begin(int tex, int additive, GLuint bit) {
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDisable(GL_BLEND);
     glEnable(GL_STENCIL_TEST);
-    glStencilMask(0x02);
+    glStencilMask(bit);
     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     if (!tex) p_glUniform1i(s_geo_uBadd, additive);
     p_glUniform1i(tex ? s_tex_uBaddonly : s_geo_uBaddonly, s_bloom_add_only);
 }
-/* pass 2: clear bit 1 under every covered pixel; pass 1: set it on sources. */
+/* pass 2: clear the bit under every covered pixel; pass 1 (glow) or 3 (3D):
+ * set it on that mark's sources. */
 static void bcls_pass(int tex, int pass) {
-    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : 0x00, 0xFF);
+    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : pass == 3 ? 0x04 : 0x00, 0xFF);
     p_glUniform1i(tex ? s_tex_uBcls : s_geo_uBcls, pass);
 }
 /* Back to an untextured draw's state: its blend and mask-bit stencil. */
@@ -3698,6 +3703,14 @@ static int bcls_passes(int semi, int b3d) {
     if (b3d == 0) return BCLS_CLEAR;
     return BCLS_CLEAR | BCLS_SET;
 }
+/* The 3D mark: opaque 2D clears it, 3D (opaque or not) sets it, see-through
+ * 2D leaves what is under it. */
+static int b3dm_passes(int semi, int b3d) {
+    if (semi >= 0) return BCLS_SET;
+    if (b3d == 1) return BCLS_SET;
+    if (b3d == 0) return BCLS_CLEAR;
+    return BCLS_CLEAR | BCLS_SET;
+}
 /* DRAW (an untextured draw set up with blend `semi`, mask_stencil_ex(mask,
  * check) and PGXP depth mode `dmode`; b3d as above), then (mask on) its
  * marking passes. GEO semi modes 1 and 3 add. A semi-transparent primitive
@@ -3705,11 +3718,19 @@ static int bcls_passes(int semi, int b3d) {
  * keeps glowing. */
 #define BCLS_DRAW(semi, dmode, mask, check, b3d, DRAW) do {                    \
         DRAW;                                                                 \
-        if (s_bcls_on && (dmode) != 2 && !s_fg_drawing) {                     \
-            const int bcls_p_ = bcls_passes((semi), (b3d));                   \
-            bcls_begin(0, (semi) == 1 || (semi) == 3);                        \
-            if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }              \
-            if (bcls_p_ & BCLS_SET)   { bcls_pass(0, 1); DRAW; }              \
+        if ((s_bcls_on || s_b3d_on) && (dmode) != 2 && !s_fg_drawing) {      \
+            if (s_bcls_on) {                                                  \
+                const int bcls_p_ = bcls_passes((semi), (b3d));               \
+                bcls_begin(0, (semi) == 1 || (semi) == 3, 0x02);              \
+                if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
+                if (bcls_p_ & BCLS_SET)   { bcls_pass(0, 1); DRAW; }          \
+            }                                                                 \
+            if (s_b3d_on) {                                                   \
+                const int b3dm_p_ = b3dm_passes((semi), (b3d));               \
+                bcls_begin(0, 0, 0x04);                                       \
+                if (b3dm_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
+                if (b3dm_p_ & BCLS_SET)   { bcls_pass(0, 3); DRAW; }          \
+            }                                                                 \
             bcls_end_geo((semi), (mask), (check));                            \
         }                                                                     \
     } while (0)
@@ -3760,11 +3781,19 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         p_glUniform1i(s_uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
     }
-    if (s_bcls_on && !s_fg_drawing) {
-        const int bp = bcls_passes(semi, b3d);
-        bcls_begin(1, 0);
-        if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
-        if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+    if ((s_bcls_on || s_b3d_on) && !s_fg_drawing) {
+        if (s_bcls_on) {
+            const int bp = bcls_passes(semi, b3d);
+            bcls_begin(1, 0, 0x02);
+            if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+            if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+        }
+        if (s_b3d_on) {
+            const int bp = b3dm_passes(semi, b3d);
+            bcls_begin(1, 0, 0x04);
+            if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+            if (bp & BCLS_SET)   { bcls_pass(1, 3); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+        }
         /* Back to the state the branch above ended in. */
         p_glUniform1i(s_tex_uBcls, 0);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -4713,7 +4742,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     const int dmode = n == 3 ? pgxp_tri_depth_mode(semi) : 0;
     if (dmode) depth_before_tri();
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
-    const int b3d = s_bcls_on && n == 3 && pgxp_tri_is_3d();
+    const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d();
     if (s_fb_n > 0 && (s_fb_mode != GL_TRIANGLES || s_fb_semi != semi ||
                        s_fb_mask != (int)s_mask_set || s_fb_gate != gate ||
                        s_fb_depth != dmode || s_fb_b3d != b3d))
@@ -4878,7 +4907,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (tdmode != s_tb_depth) reason = 7;
             /* Bloom marks a batch in two passes (clear, then sources), so
              * one batch holds either 3D sources or not: painter order. */
-            else if (s_bcls_on && pgxp_tri_is_3d() != s_tb_b3d) reason = 7;
+            else if ((s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() != s_tb_b3d) reason = 7;
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -4888,7 +4917,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = filter; s_tb_gate = gate;
             s_tb_depth = tdmode;
-            s_tb_b3d = s_bcls_on && pgxp_tri_is_3d();
+            s_tb_b3d = (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d();
             s_tb_bank_tex = s_selected_bank_tex;
             s_tb_bank_live_clut = s_selected_bank_live_clut;
             s_tb_hd_tex = hd_tex;
@@ -10301,7 +10330,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
      * them from the hr surface itself (postfx_note_center). The windowed
      * high-resolution tiles are the exception: there the centre comes from
      * tiles and the bits travel with it. */
-    const GLbitfield bits = GL_COLOR_BUFFER_BIT | (s_bcls_on && s_hiw ? GL_STENCIL_BUFFER_BIT : 0);
+    const GLbitfield bits = GL_COLOR_BUFFER_BIT | ((s_bcls_on || s_b3d_on) && s_hiw ? GL_STENCIL_BUFFER_BIT : 0);
     /* Colour only: the centre's stencil is left behind (see s_wst_*). */
     wst_add(wide_index(wide_fbo), g_wide_off, 0, g_wide_off + native_w, VRAM_H);
     /* Copy the canonical framebuffer column into the wide surface CENTRE over the
