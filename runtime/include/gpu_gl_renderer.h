@@ -404,6 +404,11 @@ int  gl_renderer_dynamic_resolution_ceiling(void);
 /* Ask for a level: applied at the next post-present point outside a render
  * pass (clamped to 1..ceiling). Returns 0 when steps are not available. */
 int  gl_renderer_request_internal_scale(int scale);
+/* Move the ceiling (a step reallocates the hr and native-wide surfaces at its
+ * level, so it may sit above the start scale). Clamped to what a full-VRAM
+ * surface may use here; a step whose allocation fails is refused. Returns
+ * the ceiling (0: steps unavailable). */
+int  gl_renderer_set_internal_scale_ceiling(int scale);
 /* Step now (debug probes and tests): 1 when the level is `scale` on return,
  * 0 when refused or deferred (inside a render pass; it then applies after
  * the next present). Never call it inside a render pass. */

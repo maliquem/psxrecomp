@@ -10967,6 +10967,26 @@ int gl_renderer_request_internal_scale(int scale) {
     return 1;
 }
 
+/* Move the live step ceiling (normally the scale allocated at start). A step
+ * already reallocates the hr surface at exactly its level, so a ceiling above
+ * the start scale only lets requests go higher; it is clamped to what a
+ * full-VRAM surface may use on this GPU (texture size, VRAM budget), and a
+ * step whose allocation fails is refused as before. A ceiling below the
+ * current level is fine: the next request steps down to it. Needs the step
+ * regime (s_alloc_scale set at context ready or by
+ * gl_renderer_set_dynamic_resolution). Returns the ceiling now in force
+ * (0: steps unavailable). */
+int gl_renderer_set_internal_scale_ceiling(int scale) {
+    GL_RT_SYNC("internal_scale_ceiling");
+    if (!s_alloc_scale || !s_raster_ok) return 0;
+    const int max = psx_gl_clamp_full_vram_scale(GL_MAX_INTERNAL_SCALE, GL_MAX_INTERNAL_SCALE,
+                                                 s_gl_max_dim, s_vram_budget, NULL);
+    if (scale > max) scale = max;
+    if (scale < 1) scale = 1;
+    s_alloc_scale = scale;
+    return scale;
+}
+
 int gl_renderer_step_internal_scale_now(int scale) {
     if (!s_alloc_scale || !s_raster_ok) return 0;
     if (scale > s_alloc_scale) scale = s_alloc_scale;
