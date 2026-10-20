@@ -197,7 +197,7 @@ float gl_renderer_get_bloom(void);
  * ("" = none; PSX_POST_SHADER overrides). A preset that fails to load or
  * compile is logged and skipped. */
 void  gl_renderer_set_post_shader(const char *path);
-/* Further .pfx chains run in slot order (0..3) right before post_shader
+/* Further .pfx chains run in slot order (0..4) right before post_shader
  * ("" = none); live uniforms (gl_renderer_set_post_uniform) reach them all. */
 void  gl_renderer_set_extra_shader(int slot, const char *path);
 /* Blurred pillarbox: a picture narrower than the window gets its side bars
