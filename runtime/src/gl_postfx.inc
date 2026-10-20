@@ -50,11 +50,15 @@ typedef struct {
     int      dw[PFX_MAX_PASSES], dh[PFX_MAX_PASSES];
     int      tw[PFX_MAX_PASSES], th[PFX_MAX_PASSES];
 } PfxStage;
-/* PRE: a second file chain run before USER (e.g. a down-sample under a CRT). */
-enum { PFX_STAGE_BLOOM, PFX_STAGE_PRE, PFX_STAGE_USER, PFX_STAGE_AA, PFX_STAGE_HQ, PFX_NSTAGES };
+/* EXTRA0..2: further file chains run, in order, before USER (e.g. a depth
+ * look, then a down-sample, under a CRT chain). */
+#define PFX_EXTRA 3
+enum { PFX_STAGE_BLOOM, PFX_STAGE_EXTRA0, PFX_STAGE_USER = PFX_STAGE_EXTRA0 + PFX_EXTRA,
+       PFX_STAGE_AA, PFX_STAGE_HQ, PFX_NSTAGES };
+#define PFX_IS_EXTRA(i)  ((i) >= PFX_STAGE_EXTRA0 && (i) < PFX_STAGE_EXTRA0 + PFX_EXTRA)
 static PfxStage s_pfx[PFX_NSTAGES];
 static char   s_pfx_user_path[1024] = "";
-static char   s_pfx_pre_path[1024] = "";
+static char   s_pfx_extra_path[PFX_EXTRA][1024];
 static int    s_pfx_user_env = 0;
 
 static float  s_bloom_thr = 0.55f;          /* bloom bright-pass threshold */
@@ -91,9 +95,9 @@ static PfxSurfMask s_smask[2];
 static int    s_mask_w = 0, s_mask_h = 0;
 
 static int pfx_stage_on(int i) {
+    if (PFX_IS_EXTRA(i)) return s_pfx_extra_path[i - PFX_STAGE_EXTRA0][0] != 0;
     switch (i) {
     case PFX_STAGE_BLOOM: return s_bloom > 0.0f;
-    case PFX_STAGE_PRE:   return s_pfx_pre_path[0] != 0;
     case PFX_STAGE_USER:  return s_pfx_user_path[0] != 0;
     case PFX_STAGE_AA:    return s_post_aa == GL_POST_AA_FXAA;
     case PFX_STAGE_HQ:    return s_post_aa == GL_POST_AA_FXAA_HQ;
@@ -146,7 +150,8 @@ static int pfx_stage_load(int i) {
     if (st->loaded) return 1;
     char err[256] = "";
     int ok;
-    const char *file = i == PFX_STAGE_USER ? s_pfx_user_path : i == PFX_STAGE_PRE ? s_pfx_pre_path : NULL;
+    const char *file = i == PFX_STAGE_USER ? s_pfx_user_path
+                     : PFX_IS_EXTRA(i) ? s_pfx_extra_path[i - PFX_STAGE_EXTRA0] : NULL;
     if (file) ok = pfx_chain_load_file(file, &st->chain, err, sizeof err);
     else ok = pfx_chain_builtin(i == PFX_STAGE_BLOOM ? "bloom" : i == PFX_STAGE_AA ? "fxaa" : "fxaa_hq",
                                 &st->chain, err, sizeof err);
@@ -508,7 +513,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
             const float sp = s_bloom_add_only ? 1.0f : 0.0f;
             pfx_chain_set_uniform(&st->chain, "u_spread", 1, &sp);
         }
-        if (i == PFX_STAGE_USER || i == PFX_STAGE_PRE)
+        if (i == PFX_STAGE_USER || PFX_IS_EXTRA(i))
             for (int k = 0; k < s_user_novr; k++)
                 pfx_chain_set_uniform(&st->chain, s_user_ovr[k].name, s_user_ovr[k].n, s_user_ovr[k].v);
         int reps = 1; double *sum = NULL; uint64_t *cnt = NULL;
@@ -816,14 +821,17 @@ void gl_renderer_set_post_shader(const char *path) {
     }
     pfx_mask_wanted_update();
 }
-/* A second file chain run right before the post_shader one (the same format;
- * "" = none), e.g. a down-sample a CRT chain then reads. No config key: set by
- * code (a game's menu). Live uniforms below reach both chains. */
-void gl_renderer_set_pre_shader(const char *path) {
-    GL_RT_SYNC("pre_shader");
-    pfx_stage_unload(&s_pfx[PFX_STAGE_PRE]);
-    snprintf(s_pfx_pre_path, sizeof s_pfx_pre_path, "%s", path ? path : "");
-    if (s_pfx_pre_path[0]) (void)pfx_stage_load(PFX_STAGE_PRE);
+/* Further file chains run in slot order right before the post_shader one (the
+ * same format; "" = none), e.g. a look and a down-sample a CRT chain then
+ * reads. No config key: set by code (a game's menu). Live uniforms below
+ * reach every file chain. */
+void gl_renderer_set_extra_shader(int slot, const char *path) {
+    if (slot < 0 || slot >= PFX_EXTRA) return;
+    GL_RT_SYNC("extra_shader");
+    const int st = PFX_STAGE_EXTRA0 + slot;
+    pfx_stage_unload(&s_pfx[st]);
+    snprintf(s_pfx_extra_path[slot], sizeof s_pfx_extra_path[slot], "%s", path ? path : "");
+    if (s_pfx_extra_path[slot][0]) (void)pfx_stage_load(st);
     pfx_mask_wanted_update();
 }
 /* Set a user-chain uniform live (every pass that declares it), e.g. from an
