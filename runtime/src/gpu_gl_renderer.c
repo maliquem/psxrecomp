@@ -1401,6 +1401,7 @@ static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chai
 static int   s_bloom_add_only = 0;     /* [video] bloom_source = "additive": opaque 3D does not glow */
 static int  postfx_active(void);
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh);
+static void postfx_pillar_fill(int lx, int ly, int lw, int lh);
 static void pres_record(int path, int dx, int dy, int w, int h,
                         int lx, int ly, int lw, int lh) {
     int drawable_w = 0, drawable_h = 0;
@@ -1411,6 +1412,8 @@ static void pres_record(int path, int dx, int dy, int w, int h,
      * post-effect chains (bloom, [video] post_shader, AA; gl_postfx.inc). */
     if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && postfx_active())
         postfx_present(path != GL_PRES_INTERP, 1, lx, ly, lw, lh);
+    if (path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP)
+        postfx_pillar_fill(lx, ly, lw, lh);     /* blurred side bars (opt-in) */
     s_native_surface_pending=s_native_surface_enabled &&
         (path==GL_PRES_VRAM || path==GL_PRES_WIDE || path==GL_PRES_CPU || path==GL_PRES_BLANK);
     s_native_surface_rect[0]=lx;s_native_surface_rect[1]=ly;
@@ -10139,6 +10142,7 @@ int gl_renderer_present_hold_last(void) {
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
                             0, 0, s_hold_tw, s_hold_th, s_hold_linear,
                             lx, ly, lw, lh, 1, 1, 1);
+        postfx_pillar_fill(lx, ly, lw, lh);
         /* Upgrade to drawable after letterboxing once. Live+interp leaves
          * HOLD_NATIVE (no Swap on main); drawable path is the soak-proven
          * full-window image (GL without interp). */
@@ -12320,6 +12324,7 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
      * depth-stencil blit costs the CPU milliseconds on macOS) and no marking
      * while they are drawn. */
     if (postfx_active()) postfx_present(0, 0, lx, ly, lw, lh);
+    postfx_pillar_fill(lx, ly, lw, lh);
 }
 
 /* Draw and present the frame at phase t between the two lists. Returns 1

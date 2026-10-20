@@ -513,6 +513,240 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
     pfx_state_restore(&saved);
 }
 
+/* ---- Pillarbox fill ([video] pillarbox_fill) ---------------------------------
+ * A picture narrower than the window (a 4:3 logo, title screen or menu in a
+ * 16:9 window) normally leaves black side bars. With the fill on, each
+ * present looks at the picture's own left and right edges:
+ *   - edges of one flat colour (a plain logo or title background): the bars
+ *     take exactly that colour, so the background simply continues;
+ *   - anything else (menu art): the bars show the picture scaled to cover the
+ *     window, heavily blurred and darkened, as video players and remasters do.
+ * FMV keeps black bars (CPU-readout presents and recent MDEC decodes are
+ * skipped). It reads only the finished output pixels (after the post-effect
+ * chains, before hold-last capture and the OSD) and draws only outside the
+ * picture, so the picture, guest VRAM and every surface stay untouched. Off by
+ * default; a bezel image, when set, takes precedence. */
+extern int mdec_recently_active(uint32_t within_frames);
+static GLuint s_bezel_tex;                  /* defined with the bezel code below */
+static int    s_pillar_blur = 0;
+/* 0..2: 8x, 4x, 2x staging; 3 and 4: blur ping-pong at 1x; 5: 1x1 edge colour. */
+#define PB_LEVELS 6
+static GLuint s_pb_tex[PB_LEVELS], s_pb_fbo[PB_LEVELS];
+static GLuint s_pb_blur_prog, s_pb_edge_prog, s_pb_draw_prog;
+static GLint  s_pb_blur_uv, s_pb_blur_src, s_pb_blur_dir;
+static GLint  s_pb_edge_uv, s_pb_edge_src, s_pb_edge_px, s_pb_edge_rows;
+static GLint  s_pb_draw_uv, s_pb_draw_src, s_pb_draw_edge, s_pb_draw_dim, s_pb_draw_flat;
+/* Edge flatness limit, on the edge pixel's alpha (4 x the largest colour step
+ * along the edges relative to their brightness). Measured with the CRT
+ * shaders on: plain logo / title backgrounds ~0.11..0.15, menu art ~0.87. */
+static float  s_pb_flat = 0.28f;
+static int    s_pb_w, s_pb_h, s_pb_failed;
+static uint64_t s_pb_fills = 0;             /* filled presents */
+
+#define PB_SMALL_W 96                       /* work width; height follows the window */
+static const char *PB_BLUR_FS =
+    "#version 330\nin vec2 v_uv; out vec4 o;\n"
+    "uniform sampler2D u_src; uniform vec2 u_dir;\n"
+    "void main(){\n"
+    "  vec4 c = texture(u_src, v_uv) * 0.227027;\n"
+    "  c += (texture(u_src, v_uv + u_dir * 1.384615) + texture(u_src, v_uv - u_dir * 1.384615)) * 0.316216;\n"
+    "  c += (texture(u_src, v_uv + u_dir * 3.230769) + texture(u_src, v_uv - u_dir * 3.230769)) * 0.070270;\n"
+    "  o = c; }\n";
+/* One pixel: rgb = mean of the outermost columns (each already the average
+ * of ~15 window columns and several rows, so scanlines and dithering wash
+ * out), a = their largest step relative to their brightness (x4, clamped). */
+static const char *PB_EDGE_FS =
+    "#version 330\nin vec2 v_uv; out vec4 o;\n"
+    "uniform sampler2D u_src; uniform vec2 u_px; uniform int u_rows;\n"
+    "void main(){\n"
+    "  vec3 sum = vec3(0.0), lo = vec3(1.0), hi = vec3(0.0);\n"
+    "  for (int i = 0; i < u_rows; i++) {\n"
+    "    float v = (float(i) + 0.5) * u_px.y;\n"
+    "    vec3 a = texture(u_src, vec2(0.5 * u_px.x, v)).rgb;\n"
+    "    vec3 b = texture(u_src, vec2(1.0 - 0.5 * u_px.x, v)).rgb;\n"
+    "    sum += a + b; lo = min(lo, min(a, b)); hi = max(hi, max(a, b));\n"
+    "  }\n"
+    "  vec3 d = hi - lo;\n"
+    "  vec3 m = sum / float(2 * u_rows);\n"
+    "  float rel = max(d.r, max(d.g, d.b)) / max(max(m.r, max(m.g, m.b)), 0.1);\n"
+    "  o = vec4(m, clamp(rel * 4.0, 0.0, 1.0)); }\n";
+static const char *PB_DRAW_FS =
+    "#version 330\nin vec2 v_uv; out vec4 o;\n"
+    "uniform sampler2D u_src; uniform sampler2D u_edge; uniform float u_dim, u_flat;\n"
+    "void main(){\n"
+    "  vec4 e = texture(u_edge, vec2(0.5));\n"
+    "  o = vec4(e.a < u_flat ? e.rgb : texture(u_src, v_uv).rgb * u_dim, 1.0); }\n";
+
+static void pillar_release(void) {
+    memset(s_pb_tex, 0, sizeof s_pb_tex);
+    memset(s_pb_fbo, 0, sizeof s_pb_fbo);
+    s_pb_blur_prog = s_pb_edge_prog = s_pb_draw_prog = 0;
+    s_pb_w = s_pb_h = 0; s_pb_failed = 0;
+}
+
+static int pillar_ready(int w, int h) {
+    if (s_pb_failed) return 0;
+    if (!s_pb_blur_prog) {
+        s_pb_blur_prog = build_program(PRESENT_VS, PB_BLUR_FS);
+        s_pb_edge_prog = build_program(PRESENT_VS, PB_EDGE_FS);
+        s_pb_draw_prog = build_program(PRESENT_VS, PB_DRAW_FS);
+        if (!s_pb_blur_prog || !s_pb_edge_prog || !s_pb_draw_prog) {
+            fprintf(stdout, "psxrecomp: pillarbox fill shaders failed; bars stay black\n");
+            s_pb_failed = 1;
+            return 0;
+        }
+        s_pb_blur_uv = p_glGetUniformLocation(s_pb_blur_prog, "u_uv_rect");
+        s_pb_blur_src = p_glGetUniformLocation(s_pb_blur_prog, "u_src");
+        s_pb_blur_dir = p_glGetUniformLocation(s_pb_blur_prog, "u_dir");
+        s_pb_edge_uv = p_glGetUniformLocation(s_pb_edge_prog, "u_uv_rect");
+        s_pb_edge_src = p_glGetUniformLocation(s_pb_edge_prog, "u_src");
+        s_pb_edge_px = p_glGetUniformLocation(s_pb_edge_prog, "u_px");
+        s_pb_edge_rows = p_glGetUniformLocation(s_pb_edge_prog, "u_rows");
+        s_pb_draw_uv = p_glGetUniformLocation(s_pb_draw_prog, "u_uv_rect");
+        s_pb_draw_src = p_glGetUniformLocation(s_pb_draw_prog, "u_src");
+        s_pb_draw_edge = p_glGetUniformLocation(s_pb_draw_prog, "u_edge");
+        s_pb_draw_dim = p_glGetUniformLocation(s_pb_draw_prog, "u_dim");
+        s_pb_draw_flat = p_glGetUniformLocation(s_pb_draw_prog, "u_flat");
+        const char *e = getenv("PSX_PILLARBOX_FLAT");
+        if (e && *e) s_pb_flat = (float)atof(e);
+    }
+    if (s_pb_w != w || s_pb_h != h) {
+        /* Each staging step is 2:1 linear; one big step would sample a few
+         * rows and alias scanlines into bands. */
+        for (int i = 0; i < PB_LEVELS; i++) {
+            const int k = i < 3 ? 8 >> i : 1;
+            if (i == 5) pfx_tex_alloc(&s_pb_tex[i], 1, 1, PFX_FMT_RGBA8, 1);
+            else pfx_tex_alloc(&s_pb_tex[i], w * k, h * k, PFX_FMT_RGBA8, 0);
+            pfx_fbo_attach(&s_pb_fbo[i], s_pb_tex[i]);
+        }
+        s_pb_w = w; s_pb_h = h;
+    }
+    return 1;
+}
+
+static void pillar_pass(GLuint prog, GLint uv, float u0, float v0, float u1, float v1) {
+    p_glUseProgram(prog);
+    p_glUniform4f(uv, u0, v0, u1, v1);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* Fill the window outside the picture rect (lx, ly, lw, lh; GL window px). */
+static void postfx_pillar_fill(int lx, int ly, int lw, int lh) {
+    if (!s_pillar_blur || !s_ctx || !s_win || s_bezel_tex) return;
+    if (mdec_recently_active(30)) return;          /* FMV keeps black bars */
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || lw <= 0 || lh <= 0) return;
+    if (lx <= 0 && lw >= ww) return;                /* no side bars */
+    const int bw = PB_SMALL_W;
+    int bh = (int)((int64_t)bw * wh / ww);
+    if (bh < 8) bh = 8;
+    if (!pillar_ready(bw, bh)) return;
+    PfxGlState saved;
+    pfx_state_save(&saved);
+    GLint prev_tex = 0;
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);   /* unit 0, left as found */
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    /* The picture scaled to cover the window: full width, centre rows. */
+    int sh = (int)((int64_t)lw * wh / ww);
+    if (sh > lh) sh = lh;
+    const int sy = ly + (lh - sh) / 2;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_pb_fbo[0]);
+    p_glBlitFramebuffer(lx, sy, lx + lw, sy + sh, 0, 0, bw * 8, bh * 8, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    for (int i = 0; i < 3; i++) {
+        const int k = 8 >> i;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_pb_fbo[i]);
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_pb_fbo[i + 1]);
+        p_glBlitFramebuffer(0, 0, bw * k, bh * k, 0, 0, bw * k / 2, bh * k / 2,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
+    /* Edge colour and flatness, from the 1x picture blurred vertically only
+     * (scanlines and CRT masks average out; nothing mixes in from the side). */
+    glViewport(0, 0, bw, bh);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_pb_fbo[4]);
+    glBindTexture(GL_TEXTURE_2D, s_pb_tex[3]);
+    p_glUseProgram(s_pb_blur_prog);
+    p_glUniform1i(s_pb_blur_src, 0);
+    p_glUniform2f(s_pb_blur_dir, 0.0f, 1.0f / (float)bh);
+    pillar_pass(s_pb_blur_prog, s_pb_blur_uv, 0.0f, 1.0f, 1.0f, 0.0f);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_pb_fbo[5]);
+    glViewport(0, 0, 1, 1);
+    glBindTexture(GL_TEXTURE_2D, s_pb_tex[4]);
+    p_glUseProgram(s_pb_edge_prog);
+    p_glUniform1i(s_pb_edge_src, 0);
+    p_glUniform2f(s_pb_edge_px, 1.0f / (float)bw, 1.0f / (float)bh);
+    p_glUniform1i(s_pb_edge_rows, bh);
+    pillar_pass(s_pb_edge_prog, s_pb_edge_uv, 0.0f, 1.0f, 1.0f, 0.0f);
+    /* Separable Gaussian, two rounds with doubled taps: a strong, smooth blur. */
+    glViewport(0, 0, bw, bh);
+    p_glUseProgram(s_pb_blur_prog);
+    p_glUniform1i(s_pb_blur_src, 0);
+    for (int r = 0; r < 2; r++) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_pb_fbo[4]);
+        glBindTexture(GL_TEXTURE_2D, s_pb_tex[3]);
+        p_glUniform2f(s_pb_blur_dir, 2.0f / (float)bw, 0.0f);
+        pillar_pass(s_pb_blur_prog, s_pb_blur_uv, 0.0f, 1.0f, 1.0f, 0.0f);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_pb_fbo[3]);
+        glBindTexture(GL_TEXTURE_2D, s_pb_tex[4]);
+        p_glUniform2f(s_pb_blur_dir, 0.0f, 2.0f / (float)bh);
+        pillar_pass(s_pb_blur_prog, s_pb_blur_uv, 0.0f, 1.0f, 1.0f, 0.0f);
+    }
+    /* The bars: the flat edge colour, or window-space uv into the blurred cover image. */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_pb_tex[5]);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_pb_tex[3]);
+    p_glUseProgram(s_pb_draw_prog);
+    p_glUniform1i(s_pb_draw_src, 0);
+    p_glUniform1i(s_pb_draw_edge, 1);
+    p_glUniform1f(s_pb_draw_dim, 0.7f);
+    p_glUniform1f(s_pb_draw_flat, s_pb_flat);
+    const float fw = (float)ww;
+    if (lx > 0) {
+        glViewport(0, 0, lx, wh);
+        pillar_pass(s_pb_draw_prog, s_pb_draw_uv, 0.0f, 1.0f, (float)lx / fw, 0.0f);
+    }
+    const int rx = lx + lw;
+    if (rx < ww) {
+        glViewport(rx, 0, ww - rx, wh);
+        pillar_pass(s_pb_draw_prog, s_pb_draw_uv, (float)rx / fw, 1.0f, 1.0f, 0.0f);
+    }
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* PSX_PILLARBOX_DEBUG=1: log the edge measure every 60 fills (a sync read). */
+    static int dbg = -1;
+    if (dbg < 0) { const char *e = getenv("PSX_PILLARBOX_DEBUG"); dbg = e && e[0] == '1'; }
+    if (dbg && s_pb_fills % 60 == 0) {
+        unsigned char px[4] = {0, 0, 0, 0};
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_pb_fbo[5]);
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        fprintf(stdout, "psxrecomp: pillarbox edge rgb %u %u %u measure %.3f (%s)\n",
+                px[0], px[1], px[2], px[3] / 255.0, px[3] / 255.0f < s_pb_flat ? "flat" : "blur");
+        fflush(stdout);
+    }
+#endif
+    pfx_state_restore(&saved);
+    s_pb_fills++;
+}
+
+/* PSX_PILLARBOX_FILL=auto|black overrides [video] pillarbox_fill. */
+void gl_renderer_set_pillarbox_blur(int on) {
+    GL_RT_SYNC("pillarbox_fill");
+    const char *e = getenv("PSX_PILLARBOX_FILL");
+    if (e && *e) on = strcmp(e, "black") != 0;
+    s_pillar_blur = on ? 1 : 0;
+}
+int gl_renderer_get_pillarbox_blur(void) { return s_pillar_blur; }
+
 /* Objects died with the context. */
 static void postfx_release(void) {
     for (int i = 0; i < PFX_NSTAGES; i++) {
@@ -526,6 +760,7 @@ static void postfx_release(void) {
     s_mask_tex = s_mask_fbo = s_mask_prog = s_mask_map_prog = 0;
     memset(s_smask, 0, sizeof s_smask);
     s_mask_w = s_mask_h = 0; s_mask_ok = 0; s_mask_src_valid = 0;
+    pillar_release();
 }
 
 /* [video] post_shader (PSX_POST_SHADER overrides): a .pfx chain, "" = none. */

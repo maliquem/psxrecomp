@@ -197,6 +197,11 @@ float gl_renderer_get_bloom(void);
  * ("" = none; PSX_POST_SHADER overrides). A preset that fails to load or
  * compile is logged and skipped. */
 void  gl_renderer_set_post_shader(const char *path);
+/* Blurred pillarbox: a picture narrower than the window gets its side bars
+ * filled with itself, scaled to cover, blurred and darkened (0 = black bars,
+ * the default). Output pixels only; PSX_PILLARBOX_FILL=blur|black overrides. */
+void  gl_renderer_set_pillarbox_blur(int on);
+int   gl_renderer_get_pillarbox_blur(void);
 /* Live override of a user-chain (.pfx) uniform, 1..4 floats; kept across
  * reloads until changed or cleared. */
 void  gl_renderer_set_post_uniform(const char *name, int count, const float *v);
