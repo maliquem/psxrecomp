@@ -1839,7 +1839,7 @@ static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; smooth in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
     "noperspective in float v_b3d;\n"
-    "uniform int u_bcls;   /* mask pass (gl_postfx.inc): 0 off, 2 clear, 1 mark glow, 3 mark 3D */\n"
+    "uniform int u_bcls;   /* mask pass (gl_postfx.inc): 0 off, 2 clear, 1 mark glow, 3 mark 3D, 4 mark see-through */\n"
     "uniform int u_badd;   /* this batch blends additively */\n"
     "uniform int u_baddonly; /* 1: only additive primitives feed the bloom; 2: only additive 3D ones */\n"
     "noperspective in vec2 v_npos; flat in int v_dith;\n"
@@ -2173,6 +2173,7 @@ static const char *TEX_FS =
     "    if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || ((v_semi == 2 || v_semi == 4) && stp == 1 && (u_baddonly != 2 || v_b3d > 0.999)))) discard;\n"
     "    if (u_bcls == 3 && v_b3d <= 0.999) discard;            /* 3D mask: 3D texels only */\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
+    "    if (u_bcls == 4 && !(v_semi != 0 && stp == 1)) discard; /* see-through cover: those texels only */\n"
     "    frag = vec4(0.0); blend_factor = vec4(0.0); return;\n"
     "  }\n"
     "  if (u_semipass == 1 && stp == 1) discard;\n"
@@ -3666,7 +3667,9 @@ static GLint s_tex_uBaddonly = -1, s_geo_uBaddonly = -1;
  * then put back from what the caller knows (bcls_end_geo / tex_bcls_end).
  * Depth writes need no care: mode-1 batches already have them off and
  * mode-0 batches have no depth test; mode-2 (depth clear) draws mark nothing. */
-/* bit: 0x02 the "may glow" mark, 0x04 the "3D" mark (mask3d). */
+/* bit: 0x02 the "may glow" mark, 0x04 the "3D" mark (mask3d), 0x08 the
+ * "see-through cover" mark (mask3d blue: something semi-transparent was
+ * drawn over the last opaque thing; kept with the 3D mark). */
 static void bcls_begin(int tex, int additive, GLuint bit) {
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDisable(GL_BLEND);
@@ -3677,9 +3680,10 @@ static void bcls_begin(int tex, int additive, GLuint bit) {
     p_glUniform1i(tex ? s_tex_uBaddonly : s_geo_uBaddonly, s_bloom_add_only);
 }
 /* pass 2: clear the bit under every covered pixel; pass 1 (glow) or 3 (3D):
- * set it on that mark's sources. */
+ * set it on that mark's sources; pass 4: set the cover bit under see-through
+ * fragments. */
 static void bcls_pass(int tex, int pass) {
-    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : pass == 3 ? 0x04 : 0x00, 0xFF);
+    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : pass == 3 ? 0x04 : pass == 4 ? 0x08 : 0x00, 0xFF);
     p_glUniform1i(tex ? s_tex_uBcls : s_geo_uBcls, pass);
 }
 /* Back to an untextured draw's state: its blend and mask-bit stencil. */
@@ -3728,9 +3732,11 @@ static int b3dm_passes(int semi, int b3d) {
             }                                                                 \
             if (s_b3d_on) {                                                   \
                 const int b3dm_p_ = b3dm_passes((semi), (b3d));               \
-                bcls_begin(0, 0, 0x04);                                       \
+                /* opaque: its passes also clear the cover bit */             \
+                bcls_begin(0, 0, (semi) < 0 ? 0x0C : 0x04);                   \
                 if (b3dm_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
                 if (b3dm_p_ & BCLS_SET)   { bcls_pass(0, 3); DRAW; }          \
+                if ((semi) >= 0) { glStencilMask(0x08); bcls_pass(0, 4); DRAW; } \
             }                                                                 \
             bcls_end_geo((semi), (mask), (check));                            \
         }                                                                     \
@@ -3790,10 +3796,15 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
             if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, 0, nverts); }
         }
         if (s_b3d_on) {
-            const int bp = b3dm_passes(semi, b3d);
-            bcls_begin(1, 0, 0x04);
+            /* A semi-transparent sprite or polygon still has opaque texels (STP
+             * 0): the clear pass (it skips the see-through ones) runs for those
+             * too, so a HUD panel drawn semi-transparent is 2D where it is solid.
+             * Both bits: the 3D mark and the see-through cover. */
+            const int bp = b3dm_passes(semi, b3d) | (semi >= 0 ? BCLS_CLEAR : 0);
+            bcls_begin(1, 0, 0x0C);
             if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
             if (bp & BCLS_SET)   { bcls_pass(1, 3); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+            if (semi >= 0) { glStencilMask(0x08); bcls_pass(1, 4); glDrawArrays(GL_TRIANGLES, 0, nverts); }
         }
         /* Back to the state the branch above ended in. */
         p_glUniform1i(s_tex_uBcls, 0);

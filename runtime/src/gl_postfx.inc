@@ -14,7 +14,9 @@
  * `mask` (optional: the primitive-derived "may glow" mask, see below),
  * `mask3d` (optional: 1 where the last opaque thing drawn was a PGXP-proven 3D
  * primitive, or a 3D primitive shows through something see-through; marked in
- * stencil bit 2, only while a chain reads it; the same texture, green),
+ * stencil bit 2, only while a chain reads it; the same texture, green; blue
+ * is 1 where something semi-transparent was drawn over the last opaque thing,
+ * stencil bit 3, e.g. a see-through HUD panel or a light shaft over scenery),
  * `depth` (optional: the PGXP depth buffer of the presented picture, window
  * aligned like the masks, DEPTH24_STENCIL8 sampled as .r = window depth d;
  * the PS1 SZ is 256 / (1 - d) - 256, and d = 1 where nothing 3D wrote: the
@@ -251,7 +253,6 @@ static void pfx_tex_alloc(GLuint *t, int w, int h, int fmt, int nearest) {
     glBindTexture(GL_TEXTURE_2D, *t);
     if (fmt == PFX_FMT_RGBA16F) glTexImage2D(GL_TEXTURE_2D, 0, 0x881A /*RGBA16F*/, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
     else if (fmt == -1)         glTexImage2D(GL_TEXTURE_2D, 0, 0x8229 /*R8*/, w, h, 0, 0x1903 /*RED*/, GL_UNSIGNED_BYTE, NULL);
-    else if (fmt == -2)         glTexImage2D(GL_TEXTURE_2D, 0, 0x822B /*RG8*/, w, h, 0, 0x8227 /*RG*/, GL_UNSIGNED_BYTE, NULL);
     else                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -266,12 +267,12 @@ static void pfx_fbo_attach(GLuint *f, GLuint tex) {
 
 /* Window-sized mask from the presented surface's marks (fresh) or the last. */
 /* The marks of rect r (surface px) of surface rb (tw x th px) into slot k's
- * RG8 texture: 0 over the rect, then red 1 where stencil bit 1 (may glow) is
- * set and green 1 where bit 2 (3D) is. */
+ * RGBA8 texture: 0 over the rect, then red 1 where stencil bit 1 (may glow) is
+ * set, green 1 where bit 2 (3D) is and blue 1 where bit 3 (see-through cover) is. */
 static int pfx_surf_mask(int k, GLuint rb, int tw, int th, const int r[4]) {
     PfxSurfMask *m = &s_smask[k];
     if (m->rb != rb || m->w != tw || m->h != th) {
-        pfx_tex_alloc(&m->tex, tw, th, -2, 1);
+        pfx_tex_alloc(&m->tex, tw, th, 0, 1);
         pfx_fbo_attach(&m->fbo, m->tex);
         p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
                                     PSXGL_RENDERBUFFER, rb);
@@ -293,6 +294,9 @@ static int pfx_surf_mask(int k, GLuint rb, int tw, int th, const int r[4]) {
     if (s_b3d_on) {
         glColorMask(GL_FALSE, GL_TRUE, GL_FALSE, GL_FALSE);
         glStencilFunc(GL_EQUAL, 0x04, 0x04);
+        post_fullscreen(s_mask_prog, s_mask_uUv);
+        glColorMask(GL_FALSE, GL_FALSE, GL_TRUE, GL_FALSE);
+        glStencilFunc(GL_EQUAL, 0x08, 0x08);
         post_fullscreen(s_mask_prog, s_mask_uUv);
     }
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -370,8 +374,8 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
             "  vec2 f = gl_FragCoord.xy;\n"
             "  int sx = u_src.x + int(floor((f.x - u_dst.x) * float(u_src.z - u_src.x) / u_dst.y));\n"
             "  int sy = u_src.y + int(floor((u_dst.z - f.y) * float(u_src.w - u_src.y) / u_dst.z));\n"
-            "  vec2 m = texelFetch(u_s, ivec2(sx, sy), 0).rg;\n"
-            "  o = vec4(m.r, m.g, 0.0, m.r);\n"
+            "  vec3 m = texelFetch(u_s, ivec2(sx, sy), 0).rgb;\n"
+            "  o = vec4(m, m.r);\n"
             "}\n");
         if (!s_mask_prog || !s_mask_map_prog) { s_mask_prog = 0; return 0; }
         s_mask_uUv = p_glGetUniformLocation(s_mask_prog, "u_uv_rect");
@@ -382,7 +386,7 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
         s_mmap_uDst = p_glGetUniformLocation(s_mask_map_prog, "u_dst");
     }
     if (s_mask_w != lw || s_mask_h != lh) {
-        pfx_tex_alloc(&s_mask_tex, lw, lh, -2, 1);
+        pfx_tex_alloc(&s_mask_tex, lw, lh, 0, 1);
         pfx_fbo_attach(&s_mask_fbo, s_mask_tex);
         s_mask_w = lw; s_mask_h = lh; s_mask_ok = 0;
     }
