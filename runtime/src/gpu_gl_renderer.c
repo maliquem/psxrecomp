@@ -1399,6 +1399,7 @@ static uint64_t    s_pres_seq = 0;
 static float s_bloom = 0.0f;           /* [video] bloom strength (gl_postfx.inc) */
 static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chain reads it) */
 static int   s_b3d_on = 0;             /* draws keep the "3D" mask, stencil bit 2 (a chain reads mask3d) */
+static int   s_dep_on = 0;             /* a chain reads `depth`: the presented surface's depth is noted */
 static int   s_bloom_add_only = 0;     /* [video] bloom_source: 1 "additive" (opaque 3D does not glow),
                                         * 2 "additive3d" (additive 2D UI does not glow either) */
 static int  postfx_active(void);
@@ -3372,7 +3373,7 @@ static void pgxp_render_wanted_update(void) {
     /* Bloom marks PGXP-proven 3D triangles as its sources, so it wants the
      * per-triangle depth too (it never enables the depth test). */
     __atomic_store_n(&s_pgxp_render_wanted,
-                     (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on || s_b3d_on) ? 1 : 0,
+                     (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on || s_b3d_on || s_dep_on) ? 1 : 0,
                      __ATOMIC_RELEASE);
 }
 int gl_renderer_pgxp_render_wanted(void) {

@@ -14,7 +14,13 @@
  * `mask` (optional: the primitive-derived "may glow" mask, see below),
  * `mask3d` (optional: 1 where the last opaque thing drawn was a PGXP-proven 3D
  * primitive, or a 3D primitive shows through something see-through; marked in
- * stencil bit 2, only while a chain reads it; the same texture, green), and
+ * stencil bit 2, only while a chain reads it; the same texture, green),
+ * `depth` (optional: the PGXP depth buffer of the presented picture, window
+ * aligned like the masks, DEPTH24_STENCIL8 sampled as .r = window depth d;
+ * the PS1 SZ is 256 / (1 - d) - 256, and d = 1 where nothing 3D wrote: the
+ * cleared background, 2D, sprites and semi-transparent primitives never write
+ * depth, so under a sprite it is the scenery behind it; combine with mask3d),
+ * and
  * earlier passes' targets. The executor owns target allocation and lifetime,
  * program build/cache, uniform binding (u_rcp, u_size, u_org and the preset's
  * uniforms) and GL state: everything the pass touches is put back.
@@ -136,8 +142,11 @@ static void pfx_mask_wanted_update(void) {
     int want3d = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_mask3d) want3d = 1;
-    if (want != s_bcls_on || want3d != s_b3d_on) {
-        s_bcls_on = want; s_b3d_on = want3d;
+    int wantd = 0;
+    for (int i = 0; i < PFX_NSTAGES; i++)
+        if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
+    if (want != s_bcls_on || want3d != s_b3d_on || wantd != s_dep_on) {
+        s_bcls_on = want; s_b3d_on = want3d; s_dep_on = wantd;
         pgxp_render_wanted_update();
     }
 }
@@ -213,7 +222,7 @@ static void pfx_rect_px(GLuint tex, float tex_w, float tex_h, int x, int y, int 
 static void postfx_note_center(GLuint fbo, GLuint tex, float tex_w, float tex_h,
                                int x, int y, int w, int h, int off, int wide_w) {
     s_mask_ctr_valid = 0;
-    if (!(s_bcls_on || s_b3d_on) || !fbo || !tex || wide_w <= 0) return;
+    if (!(s_bcls_on || s_b3d_on || s_dep_on) || !fbo || !tex || wide_w <= 0) return;
     s_mask_ctr_rb = pfx_surface_rb(fbo);
     if (!s_mask_ctr_rb) return;
     pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_ctr, &s_mask_ctr_tw, &s_mask_ctr_th);
@@ -229,7 +238,7 @@ static void postfx_note_source(GLuint fbo, GLuint tex, float tex_w, float tex_h,
                                int x, int y, int w, int h) {
     s_mask_src_valid = 0;
     s_mask_ctr_valid = 0;
-    if (!(s_bcls_on || s_b3d_on) || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
+    if (!(s_bcls_on || s_b3d_on || s_dep_on) || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
     s_mask_src_rb = pfx_surface_rb(fbo);
     if (!s_mask_src_rb) return;
     pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_src, &s_mask_src_tw, &s_mask_src_th);
@@ -302,6 +311,51 @@ static void pfx_mask_map(int k, const int r[4], int x0, int x1, int lh) {
     p_glUniform4i(s_mmap_uSrc, r[0], r[1], r[2], r[3]);
     p_glUniform4f(s_mmap_uDst, (float)x0, (float)(x1 - x0), (float)lh, 0.0f);
     post_fullscreen(s_mask_map_prog, s_mmap_uUv);
+}
+
+/* Window-sized depth (DEPTH24_STENCIL8 texture) from the presented surface's
+ * depth buffer (fresh) or the last: a NEAREST depth blit of the displayed rect,
+ * flipped so window row lh-1 is the rect's top (as the masks map), then the
+ * native-wide centre from the hr surface over its columns. */
+static GLuint s_dep_tex = 0, s_dep_fbo = 0;
+static int    s_dep_w = 0, s_dep_h = 0, s_dep_ok = 0;
+static int pfx_depth_build(int fresh, int lw, int lh) {
+    if (s_dep_w != lw || s_dep_h != lh) {
+        if (!s_dep_tex) glGenTextures(1, &s_dep_tex);
+        glBindTexture(GL_TEXTURE_2D, s_dep_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_DEPTH24_STENCIL8, lw, lh, 0,
+                     0x84F9 /*DEPTH_STENCIL*/, 0x84FA /*UNSIGNED_INT_24_8*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (!s_dep_fbo) p_glGenFramebuffers(1, &s_dep_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_dep_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s_dep_tex, 0);
+        s_dep_w = lw; s_dep_h = lh; s_dep_ok = 0;
+    }
+    if (fresh && s_mask_src_valid) {
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_dep_fbo);
+        glDepthMask(GL_TRUE);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_mask_src_fbo);
+        p_glBlitFramebuffer(s_mask_src[0], s_mask_src[1], s_mask_src[2], s_mask_src[3],
+                            0, lh, lw, 0, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        if (s_mask_ctr_valid) {
+            const int c0 = (int)lrintf(s_mask_ctr_x0 * (float)lw), c1 = (int)lrintf(s_mask_ctr_x1 * (float)lw);
+            if (c1 > c0) {
+                p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_mask_ctr_fbo);
+                p_glBlitFramebuffer(s_mask_ctr[0], s_mask_ctr[1], s_mask_ctr[2], s_mask_ctr[3],
+                                    c0, lh, c1, 0, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+            }
+        }
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+        s_dep_ok = 1;
+    }
+    return s_dep_ok;
 }
 
 /* Window-sized mask from the presented surface's marks (fresh) or the last. */
@@ -424,6 +478,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             const GLuint t = from == PFX_IN_SOURCE ? s_post_copy_tex
                            : from == PFX_IN_SOURCE_DOWN ? st->dtex[i]
                            : (from == PFX_IN_MASK || from == PFX_IN_MASK3D) ? s_mask_tex
+                           : from == PFX_IN_DEPTH ? s_dep_tex
                            : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
             glBindTexture(GL_TEXTURE_2D, t);
@@ -496,7 +551,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
     PfxGlState saved;
     pfx_state_save(&saved);
     glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
-    int mask_done = 0, mask_ok = 0;
+    int mask_done = 0, mask_ok = 0, dep_done = 0, dep_ok = 0;
     for (int i = 0; i < PFX_NSTAGES; i++) {
         if (!pfx_stage_on(i)) continue;
         if ((i == PFX_STAGE_AA || i == PFX_STAGE_HQ) && !with_aa) continue;
@@ -505,6 +560,10 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if (st->chain.uses_mask || st->chain.uses_mask3d) {
             if (!mask_done) { mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1; }
             if (!mask_ok) continue;                  /* no marks yet */
+        }
+        if (st->chain.uses_depth) {
+            if (!dep_done) { dep_ok = pfx_depth_build(src_fresh, lw, lh); dep_done = 1; }
+            if (!dep_ok) continue;                   /* no depth yet */
         }
         if (i == PFX_STAGE_BLOOM) {
             const float k = s_bloom;
@@ -798,6 +857,7 @@ static void postfx_release(void) {
     s_mask_tex = s_mask_fbo = s_mask_prog = s_mask_map_prog = 0;
     memset(s_smask, 0, sizeof s_smask);
     s_mask_w = s_mask_h = 0; s_mask_ok = 0; s_mask_src_valid = 0;
+    s_dep_tex = s_dep_fbo = 0; s_dep_w = s_dep_h = 0; s_dep_ok = 0;
     pillar_release();
 }
 

@@ -38,7 +38,7 @@ extern "C" {
 
 enum { PFX_MAX_PASSES = 16, PFX_MAX_INPUTS = 4, PFX_MAX_UNIFORMS = 8, PFX_NAME = 32 };
 /* Input sources; a value >= 0 is an earlier pass's index. */
-enum { PFX_IN_SOURCE = -1, PFX_IN_MASK = -2, PFX_IN_SOURCE_DOWN = -3, PFX_IN_MASK3D = -4 };
+enum { PFX_IN_SOURCE = -1, PFX_IN_MASK = -2, PFX_IN_SOURCE_DOWN = -3, PFX_IN_MASK3D = -4, PFX_IN_DEPTH = -5 };
 enum { PFX_BLEND_REPLACE = 0, PFX_BLEND_SCREEN = 1 };
 enum { PFX_FMT_RGBA8 = 0, PFX_FMT_RGBA16F = 1 };
 
@@ -71,6 +71,7 @@ typedef struct {
     int     npasses;
     int     uses_mask;               /* some pass reads `mask` */
     int     uses_mask3d;             /* some pass reads `mask3d` (3D primitives only) */
+    int     uses_depth;              /* some pass reads `depth` (PGXP depth buffer) */
     PfxPass pass[PFX_MAX_PASSES];
 } PfxChain;
 

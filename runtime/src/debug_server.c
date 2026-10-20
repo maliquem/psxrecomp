@@ -8644,6 +8644,36 @@ static void handle_bloom(int id, const char *json)
              bi.gen_us_mean, (unsigned long long)bi.reused);
 }
 
+/* post_shader: {"cmd":"post_shader","path":"x.pfx"} sets the [video]
+ * post_shader chain live ("" = none; an env override still wins);
+ * {"cmd":"post_shader"} reads whether one is loaded. */
+static void handle_post_shader(int id, const char *json)
+{
+    char path[1024];
+    if (json_get_str(json, "path", path, sizeof path)) gl_renderer_set_post_shader(path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"loaded\":%d}", id, gl_renderer_post_shader_loaded());
+}
+
+/* post_uniform: {"cmd":"post_uniform","uniform":"u_x","v":"a b c d"} sets a
+ * file-chain uniform live (1..4 floats; every pass that declares it). */
+static void handle_post_uniform(int id, const char *json)
+{
+    char name[64], vals[128];
+    if (!json_get_str(json, "uniform", name, sizeof name) || !json_get_str(json, "v", vals, sizeof vals)) {
+        send_err(id, "need uniform and v");
+        return;
+    }
+    float v[4]; int n = 0;
+    for (char *p = vals; n < 4 && *p; ) {
+        char *end; const float f = strtof(p, &end);
+        if (end == p) break;
+        v[n++] = f; p = end;
+    }
+    if (!n) { send_err(id, "v: 1..4 numbers"); return; }
+    gl_renderer_set_post_uniform(name, n, v);
+    send_fmt("{\"id\":%d,\"ok\":true,\"name\":\"%s\",\"n\":%d}", id, name, n);
+}
+
 static void handle_post_aa(int id, const char *json)
 {
     int mode = json_get_int(json, "mode", -1);
@@ -16005,6 +16035,8 @@ static const CmdEntry s_commands[] = {
     { "frame_perf",        handle_frame_perf },
     { "batch_sites",       handle_batch_sites },
     { "post_aa",           handle_post_aa },
+    { "post_shader",       handle_post_shader },
+    { "post_uniform",      handle_post_uniform },
     { "fmv_chroma",        handle_fmv_chroma },
     { "texture_lod",       handle_texture_lod },
     { "accurate_blending", handle_accurate_blending },
