@@ -1831,6 +1831,14 @@ function(psxrecomp_add_runtime_target target)
         endif()
     endif()
 
+    # ---- shipped post-effect presets (shaders/README.md) ---------------------
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../shaders"
+            "$<TARGET_FILE_DIR:${target}>/shaders"
+        COMMENT "Staging psxrecomp post-effect presets"
+        VERBATIM)
+
     # ---- overlay codegen hash (auto cache key) -----------------------------
     # Hash the recompiler's codegen sources into runtime/include/overlay_codegen_hash.h
     # (gitignored) so the overlay cache path carries cg<N>_<hash>: any emitter change
