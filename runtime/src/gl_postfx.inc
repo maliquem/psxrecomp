@@ -498,6 +498,15 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     const float *sun = pfx_pass_uniform(ps, "u_sun");
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
+    const ScSlot *sc = sc_presented();
+    /* The scene's own geometry (gl_renderer_shadow_world) and the camera the
+     * picture on screen was drawn with: the whole scenery, placed exactly. */
+    const int use_world = s_wg_n > 0 && sc && sc->cam_ok;
+    if (use_world) {
+        memcpy(s_cam_r, sc->cam.r, sizeof s_cam_r); memcpy(s_cam_t, sc->cam.t, sizeof s_cam_t);
+        s_cam_of[0] = sc->cam.of[0]; s_cam_of[1] = sc->cam.of[1]; s_cam_h = sc->cam.h;
+        s_cam_ok = 1;
+    }
     memset(s_sm_world, 0, sizeof s_sm_world);
     if (s_cam_ok) {
         /* The world's axes in view space (y up) from the frame's camera:
@@ -525,8 +534,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
-    const ScSlot *sc = sc_presented();
-    const int use_store = s_cam_ok && s_scc_alive > 0;
+    const int use_store = !use_world && s_cam_ok && s_scc_alive > 0;
     if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
         L[0] /= ll; L[1] /= ll; L[2] /= ll;
         /* a: across the light, level in view space when it can be */
@@ -562,7 +570,9 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
                 pick[npick++] = e;
             }
         }
-        n = use_store ? npick * 3 : sc->n * 3;
+        /* world geometry first (nw vertices), then the frame's own triangles */
+        const int nw = use_world ? s_wg_n * 3 : 0;
+        n = use_store ? npick * 3 : nw + sc->n * 3;
         if (n > s_sm_cap) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
@@ -574,7 +584,13 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         for (int i = 0; i < n; i++) {
             float P[3], scr[2];
             float *o = s_sm_buf + (size_t)i * SC_V;
-            if (use_store) {
+            if (i < nw) {
+                float V[3]; scc_view(s_wg + (size_t)i * 3, V);
+                P[0] = V[0]; P[1] = -V[1]; P[2] = V[2];
+                if (V[2] > 1.0f) { scr[0] = s_cam_h * V[0] / V[2]; scr[1] = s_cam_h * V[1] / V[2]; }
+                else scr[0] = scr[1] = 1e30f;   /* behind the camera: casts, never on screen */
+                o[3] = o[4] = o[5] = o[6] = o[7] = o[8] = o[10] = 0.0f; o[9] = -1.0f;   /* solid */
+            } else if (use_store) {
                 const ScCached *c = &s_scc[pick[ci]];
                 const int j = i % 3;
                 float V[3]; scc_view(c->w + j * 3, V);
@@ -585,7 +601,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
                 memcpy(o + 5, c->t + 6, 6 * sizeof(float));
                 if (j == 2) ci++;
             } else {
-                const float *v = sc->v + (size_t)i * SC_V;
+                const float *v = sc->v + (size_t)(i - nw) * SC_V;
                 const float z = v[2];
                 P[0] = (v[0] - s_sc_cx) * z * k; P[1] = -(v[1] - s_sc_cy) * z * k; P[2] = z;
                 scr[0] = v[0] - s_sc_cx; scr[1] = v[1] - s_sc_cy;

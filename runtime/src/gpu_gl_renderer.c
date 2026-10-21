@@ -810,6 +810,9 @@ static unsigned s_sc_use = 0;
 static ScCam    s_fcam;                /* the camera of the triangles being drawn */
 static int      s_fcam_ok = 0;
 static unsigned s_fcam_ver = 0;
+/* The scene's static geometry, world space (gl_renderer_shadow_world). */
+static float   *s_wg = NULL;
+static int      s_wg_n = 0, s_wg_cap = 0;
 static ScSlot *sc_slot(const int area[4], int make) {
     ScSlot *lru = &s_sc[0];
     for (int i = 0; i < SC_SLOTS; i++) {
@@ -1160,6 +1163,17 @@ void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], floa
     memcpy(s_fcam.r, rot, sizeof s_fcam.r); memcpy(s_fcam.t, tr, sizeof s_fcam.t);
     s_fcam.of[0] = ofx; s_fcam.of[1] = ofy; s_fcam.h = h > 0.0f ? h : 1024.0f;
 }
+void gl_renderer_shadow_world(const float *w9, int n) {
+    GL_RT_SYNC("shadow_world");
+    if (!w9 || n <= 0) { s_wg_n = 0; return; }
+    if (n > s_wg_cap) {
+        float *p = (float *)realloc(s_wg, (size_t)n * 9 * sizeof(float));
+        if (!p) { s_wg_n = 0; return; }
+        s_wg = p; s_wg_cap = n;
+    }
+    memcpy(s_wg, w9, (size_t)n * 9 * sizeof(float));
+    s_wg_n = n;
+}
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();
@@ -1168,9 +1182,9 @@ int gl_renderer_shadow_cache_stats(char *out, int cap) {
     GL_RT_SYNC("shadow_cache_stats");
     return snprintf(out, (size_t)cap,
         "\"camera\":%d,\"stored\":%d,\"alive\":%d,\"matched\":%llu,\"added\":%llu,\"dropped\":%llu,"
-        "\"resets\":%llu,\"pick\":%d,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
+        "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
-        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick,
+        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver,
         s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
         scc_log_json(out, cap);
 }

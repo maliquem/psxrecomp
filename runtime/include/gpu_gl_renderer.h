@@ -220,6 +220,12 @@ int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
 /* The camera the triangles drawn from now on use (gpu.c, camera "ram:"): the
  * picture they make is lit with exactly this camera. */
 void  gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h);
+/* The scene's static geometry in world space (a game mod reads it from the
+ * game's own map data): n triangles x 9 floats (x, y, z per corner, the
+ * coordinates the game feeds the GTE). While set, and the picture's camera is
+ * known, the shadow map takes it whole plus the frame's own triangles, in
+ * place of the scenery memory. n 0: none. */
+void  gl_renderer_shadow_world(const float *w9, int n);
 /* Faces the game culled (NCLIP back-facing), shadow-only casters: n x 9
  * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
 void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);
