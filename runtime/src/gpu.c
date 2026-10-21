@@ -732,6 +732,66 @@ int psx_overdraw_x(void) { return ws_overdraw_x; }
 int psx_overdraw_y(void) { return ws_overdraw_y; }
 int psx_overdraw_axis(int axis) { return axis ? ws_overdraw_y : ws_overdraw_x; }
 static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_overdraw_x; }
+
+/* [video.shadow]: while a post-effect chain reads `shadow` (the shadow map of
+ * the scenery, gl_postfx.inc), each VBlank hands the renderer the game's
+ * camera as the GTE holds it (rotation, translation, screen offset, H): a
+ * proper rotation only; the renderer keeps the last three and uses the one
+ * that places the frame on the scenery it remembers. A change in the
+ * configured scene keys clears that memory. The overdraw guard band is on
+ * meanwhile, so the casters just off the picture are drawn too. */
+static int      sh_camera = 0, sh_od_x = 0, sh_od_y = 0, sh_nkeys = 0, sh_od_on = 0;
+static uint32_t sh_key_addr[8], sh_key_size[8], sh_key_last = 0xFFFFFFFFu;
+static uint32_t sh_fed = 0, sh_rejected = 0;   /* VBlank reads handed over / not a rotation */
+static float    sh_last_bad[10];
+void psx_shadow_configure(int camera, int od_x, int od_y, const uint32_t *addr,
+                          const uint32_t *size, int nkeys) {
+    sh_camera = camera; sh_od_x = od_x; sh_od_y = od_y;
+    sh_nkeys = nkeys < 0 ? 0 : nkeys > 8 ? 8 : nkeys;
+    for (int i = 0; i < sh_nkeys; i++) { sh_key_addr[i] = addr[i]; sh_key_size[i] = size[i]; }
+}
+/* Through the mod services (mod_guest_services.c), which see the CPU state
+ * as the running build lays it out. */
+extern int psx_mod_gte_rotation(int16_t out[9]);
+extern int psx_mod_gte_projection(int32_t out[6]);
+static void shadow_vblank(void) {
+    const int wanted = gl_renderer_shadow_wanted();
+    if (wanted != sh_od_on && (sh_od_x || sh_od_y)) {
+        gpu_set_overdraw(wanted ? sh_od_x : 0, wanted ? sh_od_y : 0);
+        sh_od_on = wanted;
+    }
+    if (!wanted || !sh_camera) return;
+    uint32_t key = 0;
+    for (int i = 0; i < sh_nkeys; i++) {
+        uint32_t v = psx_read_byte(sh_key_addr[i]);
+        if (sh_key_size[i] >= 2) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 1) << 8;
+        if (sh_key_size[i] == 4) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 2) << 16
+                                    | (uint32_t)psx_read_byte(sh_key_addr[i] + 3) << 24;
+        key = key * 2654435761u ^ v;
+    }
+    if (sh_nkeys && key != sh_key_last) { sh_key_last = key; gl_renderer_shadow_cache_clear(); }
+    int16_t ri[9];
+    int32_t pj[6];
+    if (!psx_mod_gte_rotation(ri) || !psx_mod_gte_projection(pj)) return;
+    float r[9];
+    for (int i = 0; i < 9; i++) r[i] = (float)ri[i] * (1.0f / 4096.0f);
+    /* a proper rotation: unit rows, orthogonal, det +1 (4.12 rounding allowed) */
+    for (int a = 0; a < 3; a++)
+        for (int b = a; b < 3; b++) {
+            const float d = r[a * 3] * r[b * 3] + r[a * 3 + 1] * r[b * 3 + 1] + r[a * 3 + 2] * r[b * 3 + 2];
+            if (fabsf(d - (a == b ? 1.0f : 0.0f)) > 0.02f) {
+                sh_rejected++; memcpy(sh_last_bad, r, sizeof r); sh_last_bad[9] = d; return;
+            }
+        }
+    const float det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6])
+                    + r[2] * (r[3] * r[7] - r[4] * r[6]);
+    if (det < 0.9f) { sh_rejected++; return; }
+    const float t[3] = {(float)pj[0], (float)pj[1], (float)pj[2]};
+    const float h = (float)pj[5];
+    if (h <= 0.0f) return;
+    sh_fed++;
+    gl_renderer_shadow_camera(r, t, (float)pj[3] / 65536.0f, (float)pj[4] / 65536.0f, h);
+}
 static int ws_activation_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
 void gpu_ws_set_cull_guard_pixels(int pixels) {
@@ -4215,6 +4275,7 @@ void gpu_vblank_tick(void) {
     gpustat_poll_count = 0;
     /* Trusted package-selected plugins run on guest VBlank, independent of
      * host presentation, pacing, turbo, or skipped frames. */
+    shadow_vblank();   /* [video.shadow]: before the plugins, which may override */
     mod_runtime_on_vblank();
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (!vblank_callback)

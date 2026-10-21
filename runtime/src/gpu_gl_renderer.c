@@ -959,6 +959,20 @@ static void scc_ingest(void) {
         wbuf = p; wcap = n1 - n0;
     }
     int front_pos = 0, front_neg = 0, matched = -1, pick = s_cam_pick < s_cam_ring_n ? s_cam_pick : 0;
+    if (s_scc_alive == 0) {
+        /* Nothing to place against yet: the rotation seen most among the reads
+         * (other matrices pass through the GTE too; the camera dominates). */
+        int best = -1;
+        for (int a = 0; a < s_cam_ring_n; a++) {
+            int same = 0;
+            for (int b = 0; b < s_cam_ring_n; b++) {
+                int k = 0;
+                for (; k < 9; k++) if (fabsf(s_cam_ring[a].r[k] - s_cam_ring[b].r[k]) > 0.01f) break;
+                same += k == 9;
+            }
+            if (same > best || (same == best && a == 1)) { best = same; pick = a; }
+        }
+    }
     /* Each candidate camera: how many of the frame's triangles land on the
      * store. The best one wins (ties: the one picked last time). */
     for (int cand = 0; cand < s_cam_ring_n; cand++) {
@@ -1083,6 +1097,7 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
     return k;
 }
+int gl_renderer_shadow_wanted(void) { return s_sc_on; }
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();

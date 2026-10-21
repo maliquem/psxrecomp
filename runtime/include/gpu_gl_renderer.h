@@ -216,6 +216,7 @@ void  gl_renderer_set_post_uniform(const char *name, int count, const float *v);
 void  gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h);
 int   gl_renderer_shadow_cache_stats(char *out, int cap);
 void  gl_renderer_shadow_cache_clear(void);
+int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
 void  gl_renderer_clear_post_uniforms(void);
 int   gl_renderer_post_shader_loaded(void);
 typedef struct {

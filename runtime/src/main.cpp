@@ -17668,6 +17668,10 @@ int main(int argc, char** argv) {
                 const auto u8 = gc.runtime.video_post_shader.u8string();
                 g_video_post_shader.assign(u8.begin(), u8.end());
             }
+            psx_shadow_configure(gc.runtime.video_shadow_camera,
+                                 gc.runtime.video_shadow_overdraw_x, gc.runtime.video_shadow_overdraw_y,
+                                 gc.runtime.video_shadow_key_addr.data(), gc.runtime.video_shadow_key_size.data(),
+                                 (int)gc.runtime.video_shadow_key_addr.size());
             g_video_ss_milli   = gc.runtime.video_supersample_milli;
             g_video_texfilter  = gc.runtime.video_texture_filter;
             g_video_fmv_filter = gc.runtime.video_fmv_filter;

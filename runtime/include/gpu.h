@@ -434,6 +434,10 @@ void gpu_set_overdraw(int x, int y);
 int  psx_overdraw_x(void);
 int  psx_overdraw_y(void);
 int  psx_overdraw_axis(int axis);   /* 0 = X, 1 = Y (overlay callback) */
+/* [video.shadow] (config_loader.h): camera 1 = from the GTE at each VBlank,
+ * overdraw while shadows are on, scene keys (guest RAM, 1/2/4 bytes). */
+void psx_shadow_configure(int camera, int od_x, int od_y, const uint32_t *addr,
+                          const uint32_t *size, int nkeys);
 /* Signed-funnel variants (min/max + center±halfwidth idioms — see
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */

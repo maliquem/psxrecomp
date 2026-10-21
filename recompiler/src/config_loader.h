@@ -477,6 +477,16 @@ struct RuntimeConfig {
     // post_shader: a post-effect chain (.pfx, docs/POST_EFFECTS.md), "" = none.
     // Relative paths resolve against the game root.
     std::filesystem::path video_post_shader;
+    // [video.shadow] (docs/POST_EFFECTS.md, `shadow` input): camera = "gte"
+    // reads the game's camera from the GTE at each VBlank while a chain reads
+    // `shadow` (1; "none" = 0, a mod feeds it); overdraw = [x, y] screen px of
+    // geometry kept past the picture's edges meanwhile ([widescreen.cull]
+    // auto_screen_x funnels); scene_keys = ["0xADDR:size", ...] guest RAM whose
+    // change means a new scene (the remembered scenery starts over).
+    int                   video_shadow_camera = 0;
+    int                   video_shadow_overdraw_x = 0, video_shadow_overdraw_y = 0;
+    std::vector<uint32_t> video_shadow_key_addr;
+    std::vector<uint32_t> video_shadow_key_size;
     // supersample: factor on the internal-resolution target (Match display or
     // a line preset), 1.0..4.0, kept in thousandths (internal_resolution.h).
     int                   video_supersample_milli = 1000;

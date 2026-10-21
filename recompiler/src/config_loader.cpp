@@ -803,6 +803,37 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             const std::string ps = toml::find<std::string>(video, "post_shader");
             if (!ps.empty()) rt.video_post_shader = PSXRecompV4::host_resolve(root, ps);
         }
+        if (video.contains("shadow")) {
+            const auto& sh = toml::find(video, "shadow");
+            if (sh.contains("camera")) {
+                const auto c = toml::find<std::string>(sh, "camera");
+                if (c == "gte") rt.video_shadow_camera = 1;
+                else if (c == "none") rt.video_shadow_camera = 0;
+                else throw std::runtime_error(fmt::format(
+                    "[video.shadow] camera must be \"gte\" or \"none\": {}", c));
+            }
+            if (sh.contains("overdraw")) {
+                const auto od = toml::find<std::vector<int>>(sh, "overdraw");
+                if (od.size() != 2 || od[0] < 0 || od[0] > 256 || od[1] < 0 || od[1] > 256)
+                    throw std::runtime_error("[video.shadow] overdraw must be [x, y], 0..256");
+                rt.video_shadow_overdraw_x = od[0]; rt.video_shadow_overdraw_y = od[1];
+            }
+            if (sh.contains("scene_keys")) {
+                for (const auto& k : toml::find<std::vector<std::string>>(sh, "scene_keys")) {
+                    const auto colon = k.find(':');
+                    const uint32_t addr = (uint32_t)std::stoul(k.substr(0, colon), nullptr, 0);
+                    const uint32_t size = colon == std::string::npos ? 4u
+                        : (uint32_t)std::stoul(k.substr(colon + 1), nullptr, 0);
+                    if (size != 1 && size != 2 && size != 4)
+                        throw std::runtime_error(fmt::format(
+                            "[video.shadow] scene_keys size must be 1, 2 or 4: {}", k));
+                    rt.video_shadow_key_addr.push_back(addr);
+                    rt.video_shadow_key_size.push_back(size);
+                }
+                if (rt.video_shadow_key_addr.size() > 8)
+                    throw std::runtime_error("[video.shadow] scene_keys: at most 8");
+            }
+        }
         if (video.contains("supersample")) {
             const auto& v = toml::find(video, "supersample");
             const double f = v.is_integer() ? static_cast<double>(v.as_integer())

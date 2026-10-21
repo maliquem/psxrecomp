@@ -22,8 +22,8 @@
  * the PS1 SZ is 256 / (1 - d) - 256, and d = 1 where nothing 3D wrote: the
  * cleared background, 2D, sprites and semi-transparent primitives never write
  * depth, so under a sprite it is the scenery behind it; combine with mask3d),
- * `shadow` (optional: a shadow map of the frame's opaque PGXP triangles
- * seen from the light the reading pass gives; see pfx_shadow_build),
+ * `shadow` (optional: a shadow map of the scenery seen from the light the
+ * reading pass gives, and the camera's world axes; see pfx_shadow_build),
  * and
  * earlier passes' targets. The executor owns target allocation and lifetime,
  * program build/cache, uniform binding (u_rcp, u_size, u_org and the preset's
@@ -151,6 +151,7 @@ static void pfx_mask_wanted_update(void) {
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_shadow) wants = 1;
+    if (wants && !s_sc_on) gl_renderer_shadow_cache_clear();   /* switched on: a fresh memory */
     s_sc_on = wants;
     if (want != s_bcls_on || want3d != s_b3d_on || wantd != s_dep_on) {
         s_bcls_on = want; s_b3d_on = want3d; s_dep_on = wantd;
@@ -431,6 +432,7 @@ enum { SM_SIZE = 2048 };
 static GLuint s_sm_tex = 0, s_sm_fbo = 0, s_sm_prog = 0, s_sm_vao = 0, s_sm_vbo = 0;
 static GLint  s_sm_uvram = -1;
 static float  s_sm_u[4][4];
+static float  s_sm_world[3][4];   /* u_world, u_worldup, u_shadowdir (view space, y up; w 1 = set) */
 static float *s_sm_buf = NULL; static int s_sm_cap = 0;
 static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
     for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
@@ -493,8 +495,33 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     memset(s_sm_u, 0, sizeof s_sm_u);
     s_sm_u[3][3] = (float)SM_SIZE;
     const float *dir = pfx_pass_uniform(ps, "u_shadowdir"), *proj = pfx_pass_uniform(ps, "u_proj");
+    const float *sun = pfx_pass_uniform(ps, "u_sun");
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
+    memset(s_sm_world, 0, sizeof s_sm_world);
+    if (s_cam_ok) {
+        /* The world's axes in view space (y up) from the frame's camera:
+         * east = R x, up = R y with the sign that points up on screen (a
+         * camera looks down on its scenery). u_sun (azimuth from east toward
+         * the far side, elevation; degrees) then fixes the light in the world. */
+        const float *r = s_cam_r;
+        float e[3] = {r[0], -r[3], r[6]}, u[3] = {r[1], -r[4], r[7]};
+        if (u[1] < 0.0f) { u[0] = -u[0]; u[1] = -u[1]; u[2] = -u[2]; }
+        const float eu = e[0] * u[0] + e[1] * u[1] + e[2] * u[2];
+        float rt[3] = {e[0] - u[0] * eu, e[1] - u[1] * eu, e[2] - u[2] * eu};
+        const float rl = sqrtf(rt[0] * rt[0] + rt[1] * rt[1] + rt[2] * rt[2]);
+        if (rl > 1e-4f) for (int i = 0; i < 3; i++) rt[i] /= rl;
+        const float fw[3] = {rt[1] * u[2] - rt[2] * u[1], rt[2] * u[0] - rt[0] * u[2], rt[0] * u[1] - rt[1] * u[0]};
+        for (int i = 0; i < 3; i++) { s_sm_world[0][i] = e[i]; s_sm_world[1][i] = u[i]; }
+        s_sm_world[0][3] = s_sm_world[1][3] = 1.0f;
+        if (sun) {
+            const float az = sun[0] * 0.01745329f, el = sun[1] * 0.01745329f;
+            for (int i = 0; i < 3; i++)
+                L[i] = u[i] * sinf(el) + (rt[i] * cosf(az) + fw[i] * sinf(az)) * cosf(el);
+            for (int i = 0; i < 3; i++) s_sm_world[2][i] = L[i];
+            s_sm_world[2][3] = 1.0f;
+        }
+    }
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
@@ -595,6 +622,14 @@ static void pfx_shadow_uniforms(GLuint prog) {
         const GLint loc = p_glGetUniformLocation(prog, names[k]);
         if (loc >= 0) p_glUniform4f(loc, s_sm_u[k][0], s_sm_u[k][1], s_sm_u[k][2], s_sm_u[k][3]);
     }
+    /* the camera's world axes and the light, when the framework knows them
+     * (after the preset's own values, which they replace) */
+    static const char *const wn[3] = {"u_world", "u_worldup", "u_shadowdir"};
+    for (int k = 0; k < 3; k++) {
+        if (s_sm_world[k][3] < 0.5f) continue;
+        const GLint loc = p_glGetUniformLocation(prog, wn[k]);
+        if (loc >= 0) p_glUniform4f(loc, s_sm_world[k][0], s_sm_world[k][1], s_sm_world[k][2], 1.0f);
+    }
 }
 
 static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, int lh) {
@@ -681,7 +716,6 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             p_glUniform1i(L->in[k], k);
         }
         p_glActiveTexture(PSXGL_TEXTURE0);
-        if (reads_shadow) pfx_shadow_uniforms(prog);
         p_glUniform2f(L->fixed[PFX_LOC_RCP], 1.0f / (float)w, 1.0f / (float)h);
         p_glUniform2f(L->fixed[PFX_LOC_SIZE], (float)w, (float)h);
         p_glUniform2i(L->fixed[PFX_LOC_ORG], last ? lx : 0, last ? ly : 0);
@@ -696,6 +730,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             default: p_glUniform4f(loc, u->v[0], u->v[1], u->v[2], u->v[3]); break;
             }
         }
+        if (reads_shadow) pfx_shadow_uniforms(prog);   /* after the preset's own */
         if (ps->blend == PFX_BLEND_SCREEN) {
             glEnable(GL_BLEND);
             p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
