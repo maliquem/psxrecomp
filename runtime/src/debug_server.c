@@ -8673,7 +8673,39 @@ static void handle_shadow_cache(int id, const char *json)
 {
     if (json_get_int(json, "clear", 0)) gl_renderer_shadow_cache_clear();
     char body[2048];
-    gl_renderer_shadow_cache_stats(body, (int)sizeof body);
+    const int k = psx_shadow_state(body, (int)sizeof body);
+    body[k] = ',';
+    gl_renderer_shadow_cache_stats(body + k + 1, (int)sizeof body - k - 1);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* postfx_timing: {"on":1,"reset":1} starts measuring; {} reads the means
+ * (GPU microseconds per stage and pass of the post-effect chains). */
+/* shadow_hide: {"list":"0x46:0x7c43,0x149:0x6480"} sets [video.shadow]
+ * hide_textures live ("" = none). */
+static void handle_shadow_hide(int id, const char *json)
+{
+    char list[512];
+    if (!json_get_str(json, "list", list, sizeof list)) { send_err(id, "need list"); return; }
+    uint32_t tp[16], cl[16]; int n = 0;
+    for (char *p = list; *p && n < 16; ) {
+        char *e;
+        tp[n] = (uint32_t)strtoul(p, &e, 0);
+        if (*e != ':') break;
+        if (e[1] == '*') { cl[n] = 0xFFFFu; e += 2; }
+        else cl[n] = (uint32_t)strtoul(e + 1, &e, 0);
+        n++;
+        p = *e == ',' ? e + 1 : e;
+    }
+    gpu_set_hidden_textures(tp, cl, n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"n\":%d}", id, n);
+}
+
+static void handle_postfx_timing(int id, const char *json)
+{
+    gl_renderer_postfx_timing(json_get_int(json, "on", -1), json_get_int(json, "reset", 0));
+    static char body[8192];
+    gl_renderer_postfx_timing_json(body, (int)sizeof body);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
@@ -16059,6 +16091,8 @@ static const CmdEntry s_commands[] = {
     { "post_shader",       handle_post_shader },
     { "post_uniform",      handle_post_uniform },
     { "shadow_cache",      handle_shadow_cache },
+    { "postfx_timing",     handle_postfx_timing },
+    { "shadow_hide",       handle_shadow_hide },
     { "extra_shader",      handle_extra_shader },
     { "fmv_chroma",        handle_fmv_chroma },
     { "texture_lod",       handle_texture_lod },

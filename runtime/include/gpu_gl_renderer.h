@@ -221,6 +221,10 @@ int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
  * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
 void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);
 int   gl_renderer_shadow_front_sign(void);
+/* GPU time per post-effect stage and pass (TCP postfx_timing): on 1/0/-1
+ * (keep), reset clears the means. */
+void  gl_renderer_postfx_timing(int on, int reset);
+int   gl_renderer_postfx_timing_json(char *out, int cap);
 void  gl_renderer_clear_post_uniforms(void);
 int   gl_renderer_post_shader_loaded(void);
 typedef struct {

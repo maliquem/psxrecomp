@@ -658,6 +658,73 @@ static void pfx_shadow_uniforms(GLuint prog) {
     }
 }
 
+
+/* ---- Per-pass GPU timing (TCP postfx_timing) ---------------------------
+ * While on, every pass of every stage is bracketed by GL_TIMESTAMP queries
+ * (they do not nest-conflict with the frame timers' TIME_ELAPSED); a slot is
+ * read three presents later, when the GPU is long done, so nothing stalls.
+ * Mean microseconds per pass and per stage since the last reset. */
+enum { PT_RING = 3, PT_TS = PFX_MAX_PASSES + 1 };
+static int      s_pxt_on = 0, s_pxt_stage = -1, s_pxt_slot = 0;
+static GLuint   s_pxt_q[PT_RING][PFX_NSTAGES][PT_TS];
+static uint8_t  s_pxt_used[PT_RING][PFX_NSTAGES];   /* timestamps issued: npasses + 1, 0 = none */
+static double   s_pxt_sum[PFX_NSTAGES][PFX_MAX_PASSES];
+static uint32_t s_pxt_n[PFX_NSTAGES][PFX_MAX_PASSES];
+static void pxt_stamp(int k) {
+    if (s_pxt_on && s_pxt_stage >= 0 && p_glQueryCounter)
+        p_glQueryCounter(s_pxt_q[s_pxt_slot][s_pxt_stage][k], 0x8E28 /*GL_TIMESTAMP*/);
+}
+/* At the start of a present: collect the slot about to be reused. */
+static void pxt_frame_begin(void) {
+    if (!s_pxt_on || !p_glQueryCounter) return;
+    static int made = 0;
+    if (!made) { p_glGenQueries(PT_RING * PFX_NSTAGES * PT_TS, &s_pxt_q[0][0][0]); made = 1; }
+    s_pxt_slot = (s_pxt_slot + 1) % PT_RING;
+    for (int st = 0; st < PFX_NSTAGES; st++) {
+        const int n = s_pxt_used[s_pxt_slot][st];
+        if (n < 2) continue;
+        GLuint64 t[PT_TS];
+        for (int k = 0; k < n; k++) p_glGetQueryObjectui64v(s_pxt_q[s_pxt_slot][st][k], GL_QUERY_RESULT, &t[k]);
+        for (int k = 0; k + 1 < n; k++) {
+            s_pxt_sum[st][k] += (double)(t[k + 1] - t[k]) * 1e-3;
+            s_pxt_n[st][k]++;
+        }
+        s_pxt_used[s_pxt_slot][st] = 0;
+    }
+}
+void gl_renderer_postfx_timing(int on, int reset) {
+    GL_RT_SYNC("postfx_timing");
+    if (reset || (on && !s_pxt_on)) { memset(s_pxt_sum, 0, sizeof s_pxt_sum); memset(s_pxt_n, 0, sizeof s_pxt_n); memset(s_pxt_used, 0, sizeof s_pxt_used); }
+    if (on >= 0) s_pxt_on = on ? 1 : 0;
+}
+int gl_renderer_postfx_timing_json(char *out, int cap) {
+    GL_RT_SYNC("postfx_timing");
+    static const char *const fixed[] = {"bloom", "extra0", "extra1", "extra2", "extra3", "extra4", "user", "aa", "hq"};
+    int k = snprintf(out, (size_t)cap, "\"on\":%d,\"stages\":[", s_pxt_on);
+    int first = 1;
+    for (int st = 0; st < PFX_NSTAGES && k < cap - 512; st++) {
+        double tot = 0.0; int any = 0;
+        for (int p = 0; p < PFX_MAX_PASSES; p++) if (s_pxt_n[st][p]) { tot += s_pxt_sum[st][p] / s_pxt_n[st][p]; any = 1; }
+        if (!any) continue;
+        const char *file = st == PFX_STAGE_USER ? s_pfx_user_path
+                         : PFX_IS_EXTRA(st) ? s_pfx_extra_path[st - PFX_STAGE_EXTRA0] : "";
+        k += snprintf(out + k, (size_t)(cap - k), "%s{\"stage\":\"%s\",\"file\":\"%s\",\"us\":%.1f,\"passes\":[",
+                      first ? "" : ",", st < (int)(sizeof fixed / sizeof *fixed) ? fixed[st] : "?", file, tot);
+        first = 0;
+        int pf = 1;
+        for (int p = 0; p < PFX_MAX_PASSES && k < cap - 128; p++) {
+            if (!s_pxt_n[st][p]) continue;
+            k += snprintf(out + k, (size_t)(cap - k), "%s{\"pass\":\"%s\",\"us\":%.1f}", pf ? "" : ",",
+                          s_pfx[st].loaded && p < s_pfx[st].chain.npasses ? s_pfx[st].chain.pass[p].name : "?",
+                          s_pxt_sum[st][p] / s_pxt_n[st][p]);
+            pf = 0;
+        }
+        k += snprintf(out + k, (size_t)(cap - k), "]}");
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "]");
+    return k;
+}
+
 static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, int lh) {
     PfxChain *c = &st->chain;
     int copied = 0;
@@ -703,6 +770,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                 st->tw[i] = w; st->th[i] = h;
             }
         }
+        pxt_stamp(i);
         /* The image this pass reads, before its target is bound. */
         int reads_shadow = 0;
         for (int k = 0; k < ps->ninputs; k++)
@@ -765,6 +833,8 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         post_fullscreen(prog, L->fixed[PFX_LOC_UV]);
         if (ps->blend != PFX_BLEND_REPLACE) glDisable(GL_BLEND);
     }
+    pxt_stamp(c->npasses);
+    if (s_pxt_on && s_pxt_stage >= 0) s_pxt_used[s_pxt_slot][s_pxt_stage] = (uint8_t)(c->npasses + 1);
     for (int k = PFX_MAX_INPUTS - 1; k >= 0; k--) {
         p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -807,6 +877,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
     if (!s_ctx) { s_mask_src_valid = 0; return; }
     if (!post_clip_rect(&lx, &ly, &lw, &lh, 8)) { s_mask_src_valid = 0; return; }
     const int mark_shown = fresh && s_sc_on;   /* after this present's shadow map */
+    if (with_aa) pxt_frame_begin();   /* real frames only */
     PfxGlState saved;
     pfx_state_save(&saved);
     glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
@@ -852,7 +923,9 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if (sum) { glFinish(); t0 = SDL_GetPerformanceCounter(); }
 #endif
         int ran = 0;
+        s_pxt_stage = with_aa ? i : -1;
         for (int r = 0; r < reps; r++) ran = pfx_stage_run(st, !with_aa, lx, ly, lw, lh);
+        s_pxt_stage = -1;
 #ifndef PSX_NO_DEBUG_TOOLS
         if (sum && ran) {
             glFinish();
