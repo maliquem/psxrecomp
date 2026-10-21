@@ -799,7 +799,7 @@ static float   s_pz[3];
 static int     s_sc_on = 0;
 static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
 enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
-typedef struct { int area[4]; int n, cap, shown; unsigned use; float *v; } ScSlot;
+typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; } ScSlot;   /* conv: taken into the world store */
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
 static ScSlot *sc_slot(const int area[4], int make) {
@@ -810,7 +810,7 @@ static ScSlot *sc_slot(const int area[4], int make) {
     }
     if (!make) return NULL;
     memcpy(lru->area, area, sizeof lru->area);
-    lru->n = 0;
+    lru->n = 0; lru->conv = 0; lru->shown = 0;
     if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
     return lru->cap ? lru : NULL;
 }
@@ -821,7 +821,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
-    if (sl->shown) { sl->shown = 0; sl->n = 0; }   /* a new frame into a shown picture */
+    if (sl->shown) { sl->shown = 0; sl->n = 0; sl->conv = 0; }   /* a new frame into a shown picture */
     if (sl->n >= SC_MAX_TRIS) return;
     if (sl->n == sl->cap) {
         float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
@@ -845,7 +845,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
 static void sc_area_reset(int x1, int y1, int x2, int y2) {
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 0);
-    if (sl) { sl->n = 0; sl->shown = 0; }
+    if (sl) { sl->n = 0; sl->shown = 0; sl->conv = 0; }
 }
 /* The casters of the picture on screen: the list whose area holds its centre. */
 static const ScSlot *sc_presented(void) {
@@ -863,6 +863,241 @@ static void sc_mark_shown(void) {
     ScSlot *sl = (ScSlot *)sc_presented();
     if (sl) sl->shown = 1;
 }
+/* ---- Shadow caster memory (world space) --------------------------------
+ * The PS1 only draws what is on screen, so a shadow map of one frame loses
+ * every caster that just left it (a cliff above the picture, the mast of a
+ * boat). Given the camera (gl_renderer_shadow_camera, from the game's GTE
+ * at VBlank: V = R W + T, screen = OF + H V.xy / V.z), each new frame's
+ * casters go into a world-space store, merged with the triangles already
+ * there (same place, same texture), so the shadow map is built from all the
+ * scenery seen so far, placed by the current camera.
+ *   - A remembered triangle that should be drawn now (well inside the
+ *     picture, in front, facing the camera like the frame's own triangles)
+ *     but was not, several frames running, is dropped: it moved or is gone.
+ *   - Frames that share almost nothing with the store, three in a row,
+ *     are a new scene (a map change, a battle): the store starts over. */
+enum { SCC_MAX = 65536, SCC_HASH = 1 << 16 };
+typedef struct { float w[9]; float t[12]; int next; unsigned seen; uint8_t miss, alive; } ScCached;
+static ScCached *s_scc = NULL;
+static int       s_scc_n = 0, s_scc_alive = 0, s_scc_head[SCC_HASH];
+static unsigned  s_scc_stamp = 0;
+/* The camera of the frame taken in last (scc_view, the shadow map), chosen
+ * from the last three VBlank reads: the game often leaves the next frame's
+ * camera in the GTE before the VBlank, so the read that matches the store
+ * best is the one the frame was drawn with. */
+typedef struct { float r[9], t[3], of[2], h; } ScCam;
+static int       s_cam_ok = 0, s_cam_ring_n = 0, s_cam_pick = 1;
+static ScCam     s_cam_ring[3];   /* [0] newest */
+static float     s_cam_r[9], s_cam_t[3], s_cam_of[2], s_cam_h = 1024.0f;
+static uint64_t  s_scc_resets = 0, s_scc_matched = 0, s_scc_added = 0, s_scc_dropped = 0;
+static float     s_scc_last_cx = 0.0f, s_scc_last_cy = 0.0f;
+static int       s_scc_log[32][3], s_scc_logn = 0;   /* recent ingests: total, matched, alive before */
+static int scc_cell(const float *w) {
+    const int ix = (int)floorf((w[0] + w[3] + w[6]) * (1.0f / 48.0f));
+    const int iy = (int)floorf((w[1] + w[4] + w[7]) * (1.0f / 48.0f));
+    const int iz = (int)floorf((w[2] + w[5] + w[8]) * (1.0f / 48.0f));
+    return (int)(((unsigned)ix * 73856093u ^ (unsigned)iy * 19349663u ^ (unsigned)iz * 83492791u) & (SCC_HASH - 1));
+}
+static int scc_cell_off(const float *w, int dx, int dy, int dz) {
+    const int ix = (int)floorf((w[0] + w[3] + w[6]) * (1.0f / 48.0f)) + dx;
+    const int iy = (int)floorf((w[1] + w[4] + w[7]) * (1.0f / 48.0f)) + dy;
+    const int iz = (int)floorf((w[2] + w[5] + w[8]) * (1.0f / 48.0f)) + dz;
+    return (int)(((unsigned)ix * 73856093u ^ (unsigned)iy * 19349663u ^ (unsigned)iz * 83492791u) & (SCC_HASH - 1));
+}
+static void scc_clear(void) {
+    s_scc_n = s_scc_alive = 0;
+    for (int i = 0; i < SCC_HASH; i++) s_scc_head[i] = -1;
+}
+/* Drop the dead entries and rebuild the cells. */
+static void scc_compact(void) {
+    int j = 0;
+    for (int i = 0; i < s_scc_n; i++) if (s_scc[i].alive) s_scc[j++] = s_scc[i];
+    s_scc_n = j;
+    for (int i = 0; i < SCC_HASH; i++) s_scc_head[i] = -1;
+    for (int i = 0; i < s_scc_n; i++) {
+        const int c = scc_cell(s_scc[i].w);
+        s_scc[i].next = s_scc_head[c]; s_scc_head[c] = i;
+    }
+}
+/* The remembered triangle at this place with this texture, or -1. Tolerance
+ * a few world units (PGXP sub-pixel positions, 16-bit SZ). */
+static int scc_find(const float *w, const float *t) {
+    for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+                for (int i = s_scc_head[scc_cell_off(w, dx, dy, dz)]; i >= 0; i = s_scc[i].next) {
+                    const ScCached *c = &s_scc[i];
+                    if (!c->alive || c->t[10] != t[10] || c->t[6] != t[6] || c->t[7] != t[7]) continue;
+                    int k = 0;
+                    for (; k < 9; k++) if (fabsf(c->w[k] - w[k]) > 6.0f) break;
+                    if (k == 9) return i;
+                }
+    return -1;
+}
+static void scc_view(const float *w, float *v) {   /* world -> GTE view (y down) */
+    for (int r = 0; r < 3; r++)
+        v[r] = s_cam_r[r * 3] * w[0] + s_cam_r[r * 3 + 1] * w[1] + s_cam_r[r * 3 + 2] * w[2] + s_cam_t[r];
+}
+/* The newest frame's triangles not yet taken in: into the store. */
+static void scc_ingest(void) {
+    ScSlot *sl = NULL;
+    for (int i = 0; i < SC_SLOTS; i++)
+        if (s_sc[i].n > s_sc[i].conv && (!sl || s_sc[i].use > sl->use)) sl = &s_sc[i];
+    if (!sl || !s_cam_ok) return;
+    if (!s_scc) {
+        s_scc = (ScCached *)malloc((size_t)SCC_MAX * sizeof *s_scc);
+        if (!s_scc) return;
+        scc_clear();
+    }
+    const int n0 = sl->conv, n1 = sl->n;
+    /* world positions of the new triangles (in place of a scratch buffer:
+     * reuse the slot's own floats is not allowed, so a static scratch) */
+    static float *wbuf = NULL; static int wcap = 0;
+    if (n1 - n0 > wcap) {
+        float *p = (float *)realloc(wbuf, (size_t)(n1 - n0) * 9 * sizeof(float));
+        if (!p) return;
+        wbuf = p; wcap = n1 - n0;
+    }
+    int front_pos = 0, front_neg = 0, matched = -1, pick = s_cam_pick < s_cam_ring_n ? s_cam_pick : 0;
+    /* Each candidate camera: how many of the frame's triangles land on the
+     * store. The best one wins (ties: the one picked last time). */
+    for (int cand = 0; cand < s_cam_ring_n; cand++) {
+        const ScCam *cm = &s_cam_ring[cand];
+        const float cx = (float)sl->area[0] + cm->of[0], cy = (float)sl->area[1] + cm->of[1];
+        const float kh = 1.0f / cm->h;
+        int m = 0, step = (n1 - n0) > 256 ? (n1 - n0) / 256 : 1;   /* a sample is enough to choose */
+        if (s_scc_alive == 0) { if (cand == pick) matched = 0; continue; }
+        for (int i = n0; i < n1; i += step) {
+            const float *v = sl->v + (size_t)i * 3 * SC_V;
+            float w[9];
+            for (int j = 0; j < 3; j++) {
+                const float *q = v + j * SC_V;
+                const float V[3] = {(q[0] - cx) * q[2] * kh - cm->t[0], (q[1] - cy) * q[2] * kh - cm->t[1], q[2] - cm->t[2]};
+                for (int c = 0; c < 3; c++) w[j * 3 + c] = cm->r[c] * V[0] + cm->r[3 + c] * V[1] + cm->r[6 + c] * V[2];
+            }
+            float t[12];
+            for (int j = 0; j < 3; j++) { t[j * 2] = v[j * SC_V + 3]; t[j * 2 + 1] = v[j * SC_V + 4]; }
+            for (int k = 0; k < 6; k++) t[6 + k] = v[5 + k];
+            if (scc_find(w, t) >= 0) m++;
+        }
+        m *= step;
+        if (m > matched || (m == matched && cand == s_cam_pick)) { matched = m; pick = cand; }
+    }
+    if (matched < 0) matched = 0;
+    s_cam_pick = pick;
+    {
+        const ScCam *cm = &s_cam_ring[pick];
+        memcpy(s_cam_r, cm->r, sizeof s_cam_r); memcpy(s_cam_t, cm->t, sizeof s_cam_t);
+        s_cam_of[0] = cm->of[0]; s_cam_of[1] = cm->of[1]; s_cam_h = cm->h;
+    }
+    const float cx = (float)sl->area[0] + s_cam_of[0], cy = (float)sl->area[1] + s_cam_of[1];
+    const float kh = 1.0f / s_cam_h;
+    s_scc_last_cx = cx; s_scc_last_cy = cy;
+    for (int i = n0; i < n1; i++) {
+        const float *v = sl->v + (size_t)i * 3 * SC_V;
+        float *w = wbuf + (size_t)(i - n0) * 9;
+        for (int j = 0; j < 3; j++) {
+            const float *q = v + j * SC_V;
+            const float V[3] = {(q[0] - cx) * q[2] * kh - s_cam_t[0], (q[1] - cy) * q[2] * kh - s_cam_t[1], q[2] - s_cam_t[2]};
+            for (int c = 0; c < 3; c++)
+                w[j * 3 + c] = s_cam_r[c] * V[0] + s_cam_r[3 + c] * V[1] + s_cam_r[6 + c] * V[2];
+        }
+        const float area = (v[SC_V] - v[0]) * (v[2 * SC_V + 1] - v[1]) - (v[2 * SC_V] - v[0]) * (v[SC_V + 1] - v[1]);
+        if (area > 0.0f) front_pos++; else if (area < 0.0f) front_neg++;
+    }
+    const int total = n1 - n0;
+    { int *L = s_scc_log[s_scc_logn++ & 31]; L[0] = total; L[1] = matched; L[2] = s_scc_alive; }
+    /* Almost nothing in common: one such frame is a camera read that does not
+     * belong to the frame drawn (it happens as walking starts or stops), and
+     * is skipped; three in a row are a new scene. */
+    static int bad = 0;
+    if (total >= 64 && s_scc_alive >= 256 && matched * 10 < total) {
+        if (++bad < 3) { sl->conv = n1; return; }
+        scc_clear(); s_scc_resets++;
+    }
+    bad = 0;
+    s_scc_stamp++;
+    for (int i = n0; i < n1; i++) {
+        const float *v = sl->v + (size_t)i * 3 * SC_V;
+        const float *w = wbuf + (size_t)(i - n0) * 9;
+        float t[12];
+        for (int j = 0; j < 3; j++) { t[j * 2] = v[j * SC_V + 3]; t[j * 2 + 1] = v[j * SC_V + 4]; }
+        for (int k = 0; k < 6; k++) t[6 + k] = v[5 + k];
+        int at = scc_find(w, t);
+        if (at >= 0) { s_scc[at].seen = s_scc_stamp; s_scc[at].miss = 0; s_scc_matched++; continue; }
+        if (s_scc_n == SCC_MAX) { scc_compact(); if (s_scc_n == SCC_MAX) continue; }
+        ScCached *c = &s_scc[s_scc_n];
+        memcpy(c->w, w, sizeof c->w); memcpy(c->t, t, sizeof c->t);
+        c->seen = s_scc_stamp; c->miss = 0; c->alive = 1;
+        const int cell = scc_cell(w);
+        c->next = s_scc_head[cell]; s_scc_head[cell] = s_scc_n;
+        s_scc_n++; s_scc_alive++; s_scc_added++;
+    }
+    sl->conv = n1;
+    /* Gone or moved: should have been drawn this frame (well inside the
+     * picture, in front, facing the camera) and was not, 4 frames running. */
+    const int front_sign = front_pos >= front_neg ? 1 : -1;
+    const float hw = (float)(sl->area[2] - sl->area[0] + 1) * 0.5f * 0.85f;
+    const float hh = (float)(sl->area[3] - sl->area[1] + 1) * 0.5f * 0.85f;
+    int dead = 0;
+    for (int i = 0; i < s_scc_n; i++) {
+        ScCached *c = &s_scc[i];
+        if (!c->alive) { dead++; continue; }
+        if (c->seen == s_scc_stamp) continue;
+        float sx[3], sy[3]; int ok = 1;
+        for (int j = 0; j < 3 && ok; j++) {
+            float V[3]; scc_view(c->w + j * 3, V);
+            if (V[2] < 1024.0f) { ok = 0; break; }
+            sx[j] = s_cam_h * V[0] / V[2]; sy[j] = s_cam_h * V[1] / V[2];
+            if (fabsf(sx[j]) > hw || fabsf(sy[j]) > hh) ok = 0;
+        }
+        if (!ok) continue;
+        const float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+        if ((area > 0.0f ? 1 : -1) != front_sign || fabsf(area) < 4.0f) continue;
+        if (++c->miss >= 4) { c->alive = 0; s_scc_alive--; s_scc_dropped++; dead++; }
+    }
+    if (dead > s_scc_n / 2 && dead > 1024) scc_compact();
+}
+void gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
+    GL_RT_SYNC("shadow_camera");
+    if (!rot) { s_cam_ok = 0; s_cam_ring_n = 0; if (s_scc) scc_clear(); return; }   /* off: forget the scenery */
+    memmove(&s_cam_ring[1], &s_cam_ring[0], 2 * sizeof s_cam_ring[0]);
+    ScCam *cm = &s_cam_ring[0];
+    memcpy(cm->r, rot, sizeof cm->r); memcpy(cm->t, tr, sizeof cm->t);
+    cm->of[0] = ofx; cm->of[1] = ofy; cm->h = h > 0.0f ? h : 1024.0f;
+    if (s_cam_ring_n < 3) s_cam_ring_n++;
+    if (!s_cam_ok) {   /* until a frame is taken in, the newest */
+        memcpy(s_cam_r, cm->r, sizeof s_cam_r); memcpy(s_cam_t, cm->t, sizeof s_cam_t);
+        s_cam_of[0] = ofx; s_cam_of[1] = ofy; s_cam_h = cm->h;
+    }
+    s_cam_ok = 1;
+    if (s_sc_on) scc_ingest();
+}
+static int scc_log_json(char *out, int cap) {   /* appended to the stats */
+    const int at = (int)strlen(out);
+    int k = snprintf(out + at, (size_t)(cap - at), ",\"recent\":[");
+    for (int i = 0; i < 32 && i < s_scc_logn; i++) {
+        const int *L = s_scc_log[(s_scc_logn - 1 - i) & 31];
+        k += snprintf(out + at + k, (size_t)(cap - at - k), "%s[%d,%d,%d]", i ? "," : "", L[0], L[1], L[2]);
+    }
+    k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
+    return k;
+}
+void gl_renderer_shadow_cache_clear(void) {
+    GL_RT_SYNC("shadow_cache_clear");
+    if (s_scc) scc_clear();
+}
+int gl_renderer_shadow_cache_stats(char *out, int cap) {
+    GL_RT_SYNC("shadow_cache_stats");
+    return snprintf(out, (size_t)cap,
+        "\"camera\":%d,\"stored\":%d,\"alive\":%d,\"matched\":%llu,\"added\":%llu,\"dropped\":%llu,"
+        "\"resets\":%llu,\"pick\":%d,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
+        s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
+        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick,
+        s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
+        scc_log_json(out, cap);
+}
+
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
  * and the seam expansion of opaque 3D polygons (0 off, 1 = 1 output px

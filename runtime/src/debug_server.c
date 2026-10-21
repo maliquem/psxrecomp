@@ -8667,6 +8667,16 @@ static void handle_extra_shader(int id, const char *json)
 
 /* post_uniform: {"cmd":"post_uniform","uniform":"u_x","v":"a b c d"} sets a
  * file-chain uniform live (1..4 floats; every pass that declares it). */
+/* shadow_cache: the shadow casters' world-space store (gl_renderer_shadow_camera);
+ * {"clear":1} empties it first. */
+static void handle_shadow_cache(int id, const char *json)
+{
+    if (json_get_int(json, "clear", 0)) gl_renderer_shadow_cache_clear();
+    char body[2048];
+    gl_renderer_shadow_cache_stats(body, (int)sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 static void handle_post_uniform(int id, const char *json)
 {
     char name[64], vals[128];
@@ -16048,6 +16058,7 @@ static const CmdEntry s_commands[] = {
     { "post_aa",           handle_post_aa },
     { "post_shader",       handle_post_shader },
     { "post_uniform",      handle_post_uniform },
+    { "shadow_cache",      handle_shadow_cache },
     { "extra_shader",      handle_extra_shader },
     { "fmv_chroma",        handle_fmv_chroma },
     { "texture_lod",       handle_texture_lod },

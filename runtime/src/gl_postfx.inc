@@ -499,7 +499,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     int n = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
     const ScSlot *sc = sc_presented();
-    if (H > 0.0f && ll > 1e-6f && sc && s_sm_prog) {
+    const int use_store = s_cam_ok && s_scc_alive > 0;
+    if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
         L[0] /= ll; L[1] /= ll; L[2] /= ll;
         /* a: across the light, level in view space when it can be */
         a[0] = L[2]; a[1] = 0.0f; a[2] = -L[0];
@@ -507,7 +508,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         if (la < 1e-4f) { a[0] = 1.0f; a[2] = 0.0f; la = 1.0f; }
         a[0] /= la; a[2] /= la;
         b[0] = L[1] * a[2] - L[2] * a[1]; b[1] = L[2] * a[0] - L[0] * a[2]; b[2] = L[0] * a[1] - L[1] * a[0];
-        n = sc->n * 3;
+        n = use_store ? s_scc_alive * 3 : sc->n * 3;
         if (n > s_sm_cap) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
@@ -515,19 +516,35 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         const float k = 1.0f / H;
         const float hw = 120.0f * aspect * 1.05f, hh = 120.0f * 1.05f;   /* the picture, native px */
         float sx0 = 1e30f, sx1 = -1e30f, sy0 = 1e30f, sy1 = -1e30f;
+        int ci = 0;   /* store entry; each gives 3 vertices */
         for (int i = 0; i < n; i++) {
-            const float *v = sc->v + (size_t)i * SC_V;
-            const float z = v[2];
-            const float P[3] = {(v[0] - s_sc_cx) * z * k, -(v[1] - s_sc_cy) * z * k, z};
+            float P[3], scr[2];
             float *o = s_sm_buf + (size_t)i * SC_V;
-            memcpy(o + 3, v + 3, (SC_V - 3) * sizeof(float));
+            if (use_store) {
+                while (!s_scc[ci].alive) ci++;
+                const ScCached *c = &s_scc[ci];
+                const int j = i % 3;
+                float V[3]; scc_view(c->w + j * 3, V);
+                if (V[2] < 1.0f) V[2] = 1.0f;
+                P[0] = V[0]; P[1] = -V[1]; P[2] = V[2];
+                scr[0] = s_cam_h * V[0] / V[2]; scr[1] = s_cam_h * V[1] / V[2];
+                o[3] = c->t[j * 2]; o[4] = c->t[j * 2 + 1];
+                memcpy(o + 5, c->t + 6, 6 * sizeof(float));
+                if (j == 2) ci++;
+            } else {
+                const float *v = sc->v + (size_t)i * SC_V;
+                const float z = v[2];
+                P[0] = (v[0] - s_sc_cx) * z * k; P[1] = -(v[1] - s_sc_cy) * z * k; P[2] = z;
+                scr[0] = v[0] - s_sc_cx; scr[1] = v[1] - s_sc_cy;
+                memcpy(o + 3, v + 3, (SC_V - 3) * sizeof(float));
+            }
             o[0] = P[0] * a[0] + P[1] * a[1] + P[2] * a[2];
             o[1] = P[0] * b[0] + P[1] * b[1] + P[2] * b[2];
             o[2] = P[0] * L[0] + P[1] * L[1] + P[2] * L[2];
             if (o[0] < x0) x0 = o[0]; if (o[0] > x1) x1 = o[0];
             if (o[1] < y0) y0 = o[1]; if (o[1] > y1) y1 = o[1];
             if (o[2] < d0) d0 = o[2]; if (o[2] > d1) d1 = o[2];
-            if (fabsf(v[0] - s_sc_cx) <= hw && fabsf(v[1] - s_sc_cy) <= hh) {
+            if (fabsf(scr[0]) <= hw && fabsf(scr[1]) <= hh) {
                 if (o[0] < sx0) sx0 = o[0]; if (o[0] > sx1) sx1 = o[0];
                 if (o[1] < sy0) sy0 = o[1]; if (o[1] > sy1) sy1 = o[1];
             }
