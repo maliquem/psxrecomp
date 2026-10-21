@@ -420,7 +420,9 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
  * projection distance). The casters (sc_add_tri) are rebuilt the way readers
  * of `depth` rebuild a pixel: X = dx SZ / H, Y = -dy SZ / H, Z = SZ, with
  * (dx, dy) the native px from the displayed picture's centre. The map is an
- * orthographic depth render along the light over the casters' bounds; the
+ * orthographic depth render along the light over the bounds of the casters
+ * on screen (a receiver can only be on screen; a caster off screen still
+ * lands in those bounds when it shades one), all of them in depth; the
  * pass also gets u_smx = (a, x0), u_smy = (b, y0), u_smz = (L, d1) and
  * u_sms = (1/(x1-x0), 1/(y1-y0), 1/(d1-d0), map size): a point P is at map uv
  * ((dot(P,a)-x0) sms.x, (dot(P,b)-y0) sms.y), depth (d1 - dot(P,L)) sms.z
@@ -434,7 +436,7 @@ static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
     for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
     return NULL;
 }
-static void pfx_shadow_build(const PfxPass *ps) {
+static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     if (!s_sm_tex) {
         glGenTextures(1, &s_sm_tex);
         glBindTexture(GL_TEXTURE_2D, s_sm_tex);
@@ -511,6 +513,8 @@ static void pfx_shadow_build(const PfxPass *ps) {
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
         }
         const float k = 1.0f / H;
+        const float hw = 120.0f * aspect * 1.05f, hh = 120.0f * 1.05f;   /* the picture, native px */
+        float sx0 = 1e30f, sx1 = -1e30f, sy0 = 1e30f, sy1 = -1e30f;
         for (int i = 0; i < n; i++) {
             const float *v = sc->v + (size_t)i * SC_V;
             const float z = v[2];
@@ -523,6 +527,15 @@ static void pfx_shadow_build(const PfxPass *ps) {
             if (o[0] < x0) x0 = o[0]; if (o[0] > x1) x1 = o[0];
             if (o[1] < y0) y0 = o[1]; if (o[1] > y1) y1 = o[1];
             if (o[2] < d0) d0 = o[2]; if (o[2] > d1) d1 = o[2];
+            if (fabsf(v[0] - s_sc_cx) <= hw && fabsf(v[1] - s_sc_cy) <= hh) {
+                if (o[0] < sx0) sx0 = o[0]; if (o[0] > sx1) sx1 = o[0];
+                if (o[1] < sy0) sy0 = o[1]; if (o[1] > sy1) sy1 = o[1];
+            }
+        }
+        if (sx1 > sx0 && sy1 > sy0) {   /* the on-screen part, a small margin round it */
+            const float mx = (sx1 - sx0) * 0.03f, my = (sy1 - sy0) * 0.03f;
+            x0 = fmaxf(x0, sx0 - mx); x1 = fminf(x1, sx1 + mx);
+            y0 = fmaxf(y0, sy0 - my); y1 = fminf(y1, sy1 + my);
         }
     }
     GLboolean dmask = GL_TRUE;
@@ -616,7 +629,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         int reads_shadow = 0;
         for (int k = 0; k < ps->ninputs; k++)
             if (ps->in[k].from == PFX_IN_SHADOW) reads_shadow = 1;
-        if (reads_shadow) pfx_shadow_build(ps);
+        if (reads_shadow) pfx_shadow_build(ps, (float)lw / (float)lh);
         for (int k = 0; k < ps->ninputs; k++) {
             if (ps->in[k].from == PFX_IN_SOURCE && !copied) {
                 post_copy_bind(lw, lh);
