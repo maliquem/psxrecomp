@@ -792,12 +792,14 @@ static float   s_pz[3];
  * drawing area (a double-buffered game draws one buffer while the other is
  * shown). A list starts over when its area's depth buffer is cleared for a
  * new frame (drawing area change, fill, config: not the in-frame threshold
- * or the per-present clears, so a 30 Hz frame drawn across two presents
- * stays whole); the present uses the list whose area holds the picture. */
+ * or the per-present clears) and on the first triangle drawn into it after
+ * its picture was presented (a game that never clears or moves its drawing
+ * area would otherwise pile up every frame's triangles); the present uses
+ * the list whose area holds the picture. */
 static int     s_sc_on = 0;
 static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
 enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
-typedef struct { int area[4]; int n, cap; unsigned use; float *v; } ScSlot;
+typedef struct { int area[4]; int n, cap, shown; unsigned use; float *v; } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
 static ScSlot *sc_slot(const int area[4], int make) {
@@ -818,7 +820,9 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
     if (!s_sc_on || !s_pz_valid || !s_pc_valid) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
-    if (!sl || sl->n >= SC_MAX_TRIS) return;
+    if (!sl) return;
+    if (sl->shown) { sl->shown = 0; sl->n = 0; }   /* a new frame into a shown picture */
+    if (sl->n >= SC_MAX_TRIS) return;
     if (sl->n == sl->cap) {
         float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
         if (!p) return;
@@ -841,7 +845,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
 static void sc_area_reset(int x1, int y1, int x2, int y2) {
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 0);
-    if (sl) sl->n = 0;
+    if (sl) { sl->n = 0; sl->shown = 0; }
 }
 /* The casters of the picture on screen: the list whose area holds its centre. */
 static const ScSlot *sc_presented(void) {
@@ -853,6 +857,11 @@ static const ScSlot *sc_presented(void) {
         if (!best || sl->use > best->use) best = sl;
     }
     return best;
+}
+/* A real present showed this picture: the next triangle into it starts the next frame. */
+static void sc_mark_shown(void) {
+    ScSlot *sl = (ScSlot *)sc_presented();
+    if (sl) sl->shown = 1;
 }
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,

@@ -728,6 +728,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
     const int src_fresh = fresh;
     if (!s_ctx) { s_mask_src_valid = 0; return; }
     if (!post_clip_rect(&lx, &ly, &lw, &lh, 8)) { s_mask_src_valid = 0; return; }
+    const int mark_shown = fresh && s_sc_on;   /* after this present's shadow map */
     PfxGlState saved;
     pfx_state_save(&saved);
     glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
@@ -787,6 +788,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if (i == PFX_STAGE_AA || i == PFX_STAGE_HQ) s_paa_passes++;
     }
     s_mask_src_valid = 0; s_mask_ctr_valid = 0;
+    if (mark_shown) sc_mark_shown();
     pfx_state_restore(&saved);
 }
 
