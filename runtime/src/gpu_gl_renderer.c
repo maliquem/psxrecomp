@@ -466,7 +466,7 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_FCAM
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -1155,13 +1155,30 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     return k;
 }
 int gl_renderer_shadow_wanted(void) { return s_sc_on; }
-void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
-    GL_RT_SYNC("shadow_frame_camera");
-    s_fcam_ok = rot != NULL;
+/* c: r[9], t[3], of[2], h; NULL = no camera. */
+static void fcam_apply(const float *c) {
+    s_fcam_ok = c != NULL;
     if (++s_fcam_ver == 0) s_fcam_ver = 1;
-    if (!rot) return;
-    memcpy(s_fcam.r, rot, sizeof s_fcam.r); memcpy(s_fcam.t, tr, sizeof s_fcam.t);
-    s_fcam.of[0] = ofx; s_fcam.of[1] = ofy; s_fcam.h = h > 0.0f ? h : 1024.0f;
+    if (!c) return;
+    memcpy(s_fcam.r, c, sizeof s_fcam.r); memcpy(s_fcam.t, c + 9, sizeof s_fcam.t);
+    s_fcam.of[0] = c[12]; s_fcam.of[1] = c[13]; s_fcam.h = c[14] > 0.0f ? c[14] : 1024.0f;
+}
+/* Recorded with the drawing on a render thread (RTH_FCAM), so the triangles
+ * after it get it and the emulation thread never waits. */
+void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
+    float c[15] = {0};
+    if (rot) {
+        memcpy(c, rot, 9 * sizeof(float)); memcpy(c + 9, tr, 3 * sizeof(float));
+        c[12] = ofx; c[13] = ofy; c[14] = h;
+    }
+    if (rth_record_mode()) {
+        int32_t v[16];
+        v[0] = rot != NULL;
+        memcpy(&v[1], c, sizeof c);
+        if (rth_rec_ints(RTH_FCAM, 0, 16, v)) return;
+        gl_rth_acquire("shadow_frame_camera");
+    }
+    fcam_apply(rot ? c : NULL);
 }
 void gl_renderer_shadow_world(const float *w9, int n) {
     GL_RT_SYNC("shadow_world");
@@ -14377,6 +14394,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         float z[3];
         memcpy(z, &v[1], sizeof z);
         glb_set_depth_triangle(v[0], z[0], z[1], z[2]);
+        break;
+    }
+    case RTH_FCAM: {
+        float c[15];
+        memcpy(c, &v[1], sizeof c);
+        fcam_apply(v[0] ? c : NULL);
         break;
     }
     case RTH_FILL:      glb_fill_rect(v[0], v[1], v[2], v[3], (uint16_t)v[4]); break;
