@@ -800,9 +800,16 @@ static float   s_pz[3];
 static int     s_sc_on = 0;
 static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
 enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
-typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; } ScSlot;   /* conv: taken into the world store */
+/* A camera: V = R W + T, screen = of + h V.xy / V.z. */
+typedef struct { float r[9], t[3], of[2], h; } ScCam;
+/* conv: taken into the world store; cam (cam_ok): the frame camera when its
+ * triangles were drawn (gl_renderer_shadow_frame_camera), cam_ver its version */
+typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver; } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
+static ScCam    s_fcam;                /* the camera of the triangles being drawn */
+static int      s_fcam_ok = 0;
+static unsigned s_fcam_ver = 0;
 static ScSlot *sc_slot(const int area[4], int make) {
     ScSlot *lru = &s_sc[0];
     for (int i = 0; i < SC_SLOTS; i++) {
@@ -823,6 +830,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
     if (sl->shown) { sl->shown = 0; sl->n = 0; sl->conv = 0; }   /* a new frame into a shown picture */
+    if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
     if (sl->n >= SC_MAX_TRIS) return;
     if (sl->n == sl->cap) {
         float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
@@ -894,7 +902,6 @@ static int       s_scc_front = 0;   /* the winding the game draws: +1 / -1, 0 = 
  * from the last three VBlank reads: the game often leaves the next frame's
  * camera in the GTE before the VBlank, so the read that matches the store
  * best is the one the frame was drawn with. */
-typedef struct { float r[9], t[3], of[2], h; } ScCam;
 static int       s_cam_ok = 0, s_cam_ring_n = 0, s_cam_pick = 1;
 static ScCam     s_cam_ring[3];   /* [0] newest */
 static float     s_cam_r[9], s_cam_t[3], s_cam_of[2], s_cam_h = 1024.0f;
@@ -1145,6 +1152,14 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     return k;
 }
 int gl_renderer_shadow_wanted(void) { return s_sc_on; }
+void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
+    GL_RT_SYNC("shadow_frame_camera");
+    s_fcam_ok = rot != NULL;
+    if (++s_fcam_ver == 0) s_fcam_ver = 1;
+    if (!rot) return;
+    memcpy(s_fcam.r, rot, sizeof s_fcam.r); memcpy(s_fcam.t, tr, sizeof s_fcam.t);
+    s_fcam.of[0] = ofx; s_fcam.of[1] = ofy; s_fcam.h = h > 0.0f ? h : 1024.0f;
+}
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();

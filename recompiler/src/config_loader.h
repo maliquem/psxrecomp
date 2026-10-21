@@ -483,7 +483,10 @@ struct RuntimeConfig {
     // geometry kept past the picture's edges meanwhile ([widescreen.cull]
     // auto_screen_x funnels); scene_keys = ["0xADDR:size", ...] guest RAM whose
     // change means a new scene (the remembered scenery starts over).
+    // camera = "ram:0xADDR" (2): the game's camera MATRIX in RAM (9 x s16 R,
+    // pad, 3 x s32 T), taken with the frame whose projections use it.
     int                   video_shadow_camera = 0;
+    uint32_t              video_shadow_camera_addr = 0;
     int                   video_shadow_overdraw_x = 0, video_shadow_overdraw_y = 0;
     std::vector<uint32_t> video_shadow_key_addr;
     std::vector<uint32_t> video_shadow_key_size;

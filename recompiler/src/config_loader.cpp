@@ -809,8 +809,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 const auto c = toml::find<std::string>(sh, "camera");
                 if (c == "gte") rt.video_shadow_camera = 1;
                 else if (c == "none") rt.video_shadow_camera = 0;
+                else if (c.rfind("ram:", 0) == 0) {
+                    rt.video_shadow_camera = 2;
+                    rt.video_shadow_camera_addr = (uint32_t)std::stoul(c.substr(4), nullptr, 0);
+                }
                 else throw std::runtime_error(fmt::format(
-                    "[video.shadow] camera must be \"gte\" or \"none\": {}", c));
+                    "[video.shadow] camera must be \"gte\", \"ram:0xADDR\" or \"none\": {}", c));
             }
             if (sh.contains("overdraw")) {
                 const auto od = toml::find<std::vector<int>>(sh, "overdraw");

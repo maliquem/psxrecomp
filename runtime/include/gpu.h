@@ -438,6 +438,8 @@ int  psx_overdraw_axis(int axis);   /* 0 = X, 1 = Y (overlay callback) */
  * overdraw while shadows are on, scene keys (guest RAM, 1/2/4 bytes). */
 void psx_shadow_configure(int camera, int od_x, int od_y, const uint32_t *addr,
                           const uint32_t *size, int nkeys);
+/* camera 2 ("ram:ADDR"): the game's camera MATRIX (9 x s16, pad, 3 x s32). */
+void psx_shadow_camera_ram(uint32_t addr);
 int  psx_shadow_state(char *out, int cap);   /* JSON fields for TCP shadow_cache */
 /* [video.shadow] hide_textures: textured polygons (page 9 bits + CLUT) not
  * drawn while the shadow map is in use (a game's own blob shadows). */

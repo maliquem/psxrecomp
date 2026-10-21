@@ -745,6 +745,7 @@ static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_overdraw_x; }
 static int      sh_camera = 0, sh_od_x = 0, sh_od_y = 0, sh_nkeys = 0, sh_od_on = 0;
 static uint32_t sh_key_addr[8], sh_key_size[8], sh_key_last = 0xFFFFFFFFu;
 static uint32_t sh_fed = 0, sh_rejected = 0;   /* VBlank reads handed over / not a rotation */
+static uint32_t sh_cam_taken = 0;                /* camera ram: matches with the GTE */
 /* [video.shadow] hide_textures: the game's own blob shadows (a dark disc
  * under characters and objects), as texture page (9 bits) + CLUT (0xFFFF =
  * any: some games animate the shadow's palette) of the
@@ -768,8 +769,9 @@ static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
 static float    sh_last_bad[10];
 int psx_shadow_state(char *out, int cap) {
     return snprintf(out, (size_t)cap, "\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
-                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected,
+                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,"
+                    "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
+                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -786,6 +788,44 @@ int psx_shadow_backfaces_on(void) { return sh_bf_on; }
  * as the running build lays it out. */
 extern int psx_mod_gte_rotation(int16_t out[9]);
 extern int psx_mod_gte_projection(int32_t out[6]);
+/* camera = "ram:ADDR" (2): the game's camera MATRIX in RAM names which of the
+ * matrices passing through the GTE is the camera. Before each projection, a
+ * rotation + translation not met yet is compared with it; equal, it is the
+ * camera the frame being built uses, handed to the renderer right then: the
+ * triangles the GPU draws from that point on (this frame's, when its list is
+ * sent) carry it, so a picture is lit with its own camera, not the next
+ * frame's. When no projection used it for a few VBlanks (a battle, a map
+ * screen: another camera, or none) the renderer is told there is none. */
+static uint32_t sh_cam_addr = 0;
+static int16_t  sh_cam_r[2][9];     /* [0] the camera, [1] the last matrix that was not it */
+static int32_t  sh_cam_t[2][3];
+static int      sh_cam_have[2] = {0, 0};
+static float    sh_cam_last[15];    /* r, t, of, h of the camera */
+static int      sh_cam_met = 0, sh_cam_age = 99;   /* used since the last VBlank; VBlanks since */
+void psx_shadow_camera_ram(uint32_t addr) { sh_cam_addr = addr; }
+static void shadow_camera_note(void) {
+    int16_t ri[9];
+    int32_t pj[6];
+    if (!psx_mod_gte_rotation(ri) || !psx_mod_gte_projection(pj)) return;
+    for (int k = 0; k < 2; k++)
+        if (sh_cam_have[k] && !memcmp(ri, sh_cam_r[k], sizeof ri) && !memcmp(pj, sh_cam_t[k], sizeof sh_cam_t[k])) {
+            if (k == 0) sh_cam_met = 1;
+            return;   /* the camera again, or the matrix just found not to be it */
+        }
+    int same = pj[5] > 0;
+    for (int i = 0; i < 9 && same; i++) same = (int16_t)psx_read_half(sh_cam_addr + 2u * (uint32_t)i) == ri[i];
+    for (int i = 0; i < 3 && same; i++) same = (int32_t)psx_read_word(sh_cam_addr + 20u + 4u * (uint32_t)i) == pj[i];
+    const int k = same ? 0 : 1;
+    memcpy(sh_cam_r[k], ri, sizeof ri); memcpy(sh_cam_t[k], pj, sizeof sh_cam_t[k]); sh_cam_have[k] = 1;
+    if (!same) return;
+    for (int i = 0; i < 9; i++) sh_cam_last[i] = (float)ri[i] * (1.0f / 4096.0f);
+    for (int i = 0; i < 3; i++) sh_cam_last[9 + i] = (float)pj[i];
+    sh_cam_last[12] = (float)pj[3] / 65536.0f; sh_cam_last[13] = (float)pj[4] / 65536.0f;
+    sh_cam_last[14] = (float)pj[5];
+    sh_cam_met = 1;
+    sh_cam_taken++;
+    gl_renderer_shadow_frame_camera(sh_cam_last, sh_cam_last + 9, sh_cam_last[12], sh_cam_last[13], sh_cam_last[14]);
+}
 static void shadow_vblank(void) {
     const int wanted = gl_renderer_shadow_wanted();
     sh_hide_on = wanted && sh_hide_n > 0;
@@ -805,6 +845,17 @@ static void shadow_vblank(void) {
         key = key * 2654435761u ^ v;
     }
     if (sh_nkeys && key != sh_key_last) { sh_key_last = key; gl_renderer_shadow_cache_clear(); }
+    if (sh_camera == 2) {   /* the camera met lately (a 30 fps game projects every other VBlank) */
+        sh_cam_age = sh_cam_met ? 0 : sh_cam_age < 99 ? sh_cam_age + 1 : 99;
+        sh_cam_met = 0;
+        if (sh_cam_have[0] && sh_cam_age <= 2) {
+            gl_renderer_shadow_camera(sh_cam_last, sh_cam_last + 9, sh_cam_last[12], sh_cam_last[13], sh_cam_last[14]);
+        } else if (sh_cam_have[0]) {   /* gone: none until the camera is met again */
+            sh_cam_have[0] = 0;
+            gl_renderer_shadow_frame_camera(NULL, NULL, 0.0f, 0.0f, 0.0f);
+        }
+        return;
+    }
     int16_t ri[9];
     int32_t pj[6];
     if (!psx_mod_gte_rotation(ri) || !psx_mod_gte_projection(pj)) return;
@@ -3674,6 +3725,7 @@ static void sh_bf_take(const uint32_t *d) {
     psx_shadow_backface(sxy, sz);
 }
 static void shadow_note_projection(int nverts) {
+    if (sh_bf_on && sh_camera == 2) shadow_camera_note();   /* the matrix this projection uses */
     const int prev = sh_bf_prev;
     sh_bf_prev = nverts;
     if (!sh_bf_on || !prev) return;
