@@ -92,6 +92,57 @@ Bloom uses the mask at both ends: only lit pixels feed its bright pass, and
 only lit pixels take the glow back. HUD pixels are therefore never changed,
 even next to a lamp.
 
+## The shadow input and `[video.shadow]`
+
+`shadow` is a 2048² depth map of the scene seen from a light the reading pass
+gives (`u_sun` azimuth/elevation in degrees, or `u_shadowdir`). A pass that
+reads it also gets `u_smx`, `u_smy`, `u_smz`, `u_sms` (where a view-space
+point lands in the map) and, when the camera is known, `u_world`,
+`u_worldup` and `u_shadowdir` (the world's axes and the light in view space,
+so the light stays fixed in the world when the camera turns). Nothing of this
+runs unless an active chain reads `shadow`.
+
+The casters, best source first:
+
+1. **The scene's own geometry** (`gl_renderer_shadow_world`, world-space
+   triangles a game mod reads from the game's map data) plus the picture's
+   own triangles, placed with the camera that picture was drawn with. Nothing
+   is guessed: the whole map casts, on screen or not, and a still picture
+   gives the same map every frame.
+2. **The scenery memory**: each frame's opaque PGXP triangles taken to world
+   space and kept per scene (static ones only off screen), when the camera
+   is known but no geometry is given.
+3. **The frame's own triangles** only.
+
+Faces the game culls (back-facing after RTPT) are kept as shadow-only casters
+in 2 and 3, so a closed object casts a whole shadow.
+
+```toml
+[video.shadow]
+camera = "ram:0x801381BC"   # the game's camera MATRIX (9 x s16 R, pad, 3 x s32 T);
+                            # "gte" = the GTE at VBlank (a guess), "none" = a mod feeds it
+overdraw = [64, 64]         # px past the picture the game's screen culls keep (memory only)
+scene_keys = ["0xADDR:4"]   # guest RAM whose change starts a new scene (memory only)
+hide_textures = ["0x46:0x7c43", "0x149:*"]   # page:CLUT of the game's own blob shadows
+```
+
+With `camera = "ram:..."`, before each projection a GTE rotation +
+translation not met yet is compared with the MATRIX in RAM; equal, it is the
+camera, handed to the renderer at that point, so the triangles the GPU draws
+next (that frame's) carry it. When no projection has used it for a few
+VBlanks (a map screen, a different mode) there is no camera and source 1 is
+not used.
+
+Finding them for a new game (TCP, see TCP_COMMANDS.md): `gte_ring_dump` on a
+full frame groups projections by `ra` and matrix; the matrix most projections
+share is the camera, and searching RAM for its R (9 x s16) and T (3 x s32)
+gives the MATRIX address. `disasm` at the busiest site shows how the vertices
+are built (BoF4: a height grid, see the game's `src/bof4_world.c`).
+
+TCP: `shadow_cache` (state: camera, matches, world triangles, memory),
+`shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
+microseconds per stage and pass).
+
 ## Tests
 
 - `postfx_chain_test`: the format, built-in presets, errors and file import.
