@@ -743,7 +743,34 @@ static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_overdraw_x; }
 static int      sh_camera = 0, sh_od_x = 0, sh_od_y = 0, sh_nkeys = 0, sh_od_on = 0;
 static uint32_t sh_key_addr[8], sh_key_size[8], sh_key_last = 0xFFFFFFFFu;
 static uint32_t sh_fed = 0, sh_rejected = 0;   /* VBlank reads handed over / not a rotation */
+/* [video.shadow] hide_textures: the game's own blob shadows (a dark disc
+ * under characters and objects), as texture page (9 bits) + CLUT (0xFFFF =
+ * any: some games animate the shadow's palette) of the
+ * textured polygons that draw them. While the shadow map is in use they are
+ * not drawn (the polygon still sets the texture page, as the hardware does). */
+static int      sh_hide_n = 0, sh_hide_on = 0;
+static uint16_t sh_hide_tpage[16], sh_hide_clut[16];
+static uint32_t sh_hidden = 0;
+void gpu_set_hidden_textures(const uint32_t *tpage, const uint32_t *clut, int n) {
+    sh_hide_n = n < 0 ? 0 : n > 16 ? 16 : n;
+    for (int i = 0; i < sh_hide_n; i++) { sh_hide_tpage[i] = (uint16_t)(tpage[i] & 0x1FFu); sh_hide_clut[i] = (uint16_t)clut[i]; }
+}
+static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
+    if (!sh_hide_on) return 0;
+    for (int i = 0; i < sh_hide_n; i++)
+        if (sh_hide_tpage[i] == (tpage & 0x1FFu) && (sh_hide_clut[i] == 0xFFFFu || sh_hide_clut[i] == clut)) {
+            sh_hidden++; return 1;
+        }
+    return 0;
+}
 static float    sh_last_bad[10];
+int psx_shadow_state(char *out, int cap) {
+    return snprintf(out, (size_t)cap, "\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
+                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
+                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected,
+                    sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
+                    sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
+}
 void psx_shadow_configure(int camera, int od_x, int od_y, const uint32_t *addr,
                           const uint32_t *size, int nkeys) {
     sh_camera = camera; sh_od_x = od_x; sh_od_y = od_y;
@@ -756,6 +783,7 @@ extern int psx_mod_gte_rotation(int16_t out[9]);
 extern int psx_mod_gte_projection(int32_t out[6]);
 static void shadow_vblank(void) {
     const int wanted = gl_renderer_shadow_wanted();
+    sh_hide_on = wanted && sh_hide_n > 0;
     if (wanted != sh_od_on && (sh_od_x || sh_od_y)) {
         gpu_set_overdraw(wanted ? sh_od_x : 0, wanted ? sh_od_y : 0);
         sh_od_on = wanted;
@@ -5429,6 +5457,9 @@ static int native_wide_projective_draw(void) {
 /* Execute textured triangle (GP0 0x24-0x27) */
 static void gp0_exec_textured_tri(void) {
     if (native_wide_projective_draw()) return;
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+        set_tpage_from_poly((uint16_t)(gp0_cmd_buf[4] >> 16)); return;
+    }
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -5471,6 +5502,9 @@ static void gp0_exec_textured_tri(void) {
 /* Execute textured quad (GP0 0x2C-0x2F) */
 static void gp0_exec_textured_quad(void) {
     if (native_wide_projective_draw()) return;
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+        set_tpage_from_poly((uint16_t)(gp0_cmd_buf[4] >> 16)); return;
+    }
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -5575,6 +5609,9 @@ static void gp0_exec_textured_quad(void) {
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
 static void gp0_exec_shaded_textured_tri(void) {
     if (native_wide_projective_draw()) return;
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+        set_tpage_from_poly((uint16_t)(gp0_cmd_buf[5] >> 16)); return;
+    }
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[3], vy[3];
@@ -5641,6 +5678,9 @@ int psx_mod_texture_banks_supported(void) {
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
 static void gp0_exec_shaded_textured_quad(void) {
     if (native_wide_projective_draw()) return;
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+        set_tpage_from_poly((uint16_t)(gp0_cmd_buf[5] >> 16)); return;
+    }
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[4], vy[4];

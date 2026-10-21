@@ -833,6 +833,19 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 if (rt.video_shadow_key_addr.size() > 8)
                     throw std::runtime_error("[video.shadow] scene_keys: at most 8");
             }
+            if (sh.contains("hide_textures")) {
+                for (const auto& k : toml::find<std::vector<std::string>>(sh, "hide_textures")) {
+                    const auto colon = k.find(':');
+                    if (colon == std::string::npos)
+                        throw std::runtime_error(fmt::format(
+                            "[video.shadow] hide_textures entries are \"0xPAGE:0xCLUT\": {}", k));
+                    rt.video_shadow_hide_tpage.push_back((uint32_t)std::stoul(k.substr(0, colon), nullptr, 0));
+                    const std::string c = k.substr(colon + 1);   // "*" = any palette
+                    rt.video_shadow_hide_clut.push_back(c == "*" ? 0xFFFFu : (uint32_t)std::stoul(c, nullptr, 0));
+                }
+                if (rt.video_shadow_hide_tpage.size() > 16)
+                    throw std::runtime_error("[video.shadow] hide_textures: at most 16");
+            }
         }
         if (video.contains("supersample")) {
             const auto& v = toml::find(video, "supersample");

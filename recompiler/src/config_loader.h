@@ -487,6 +487,10 @@ struct RuntimeConfig {
     int                   video_shadow_overdraw_x = 0, video_shadow_overdraw_y = 0;
     std::vector<uint32_t> video_shadow_key_addr;
     std::vector<uint32_t> video_shadow_key_size;
+    // hide_textures = ["0xPAGE:0xCLUT" or "0xPAGE:*", ...]: the game's own blob shadows,
+    // not drawn while the shadow map is in use.
+    std::vector<uint32_t> video_shadow_hide_tpage;
+    std::vector<uint32_t> video_shadow_hide_clut;
     // supersample: factor on the internal-resolution target (Match display or
     // a line preset), 1.0..4.0, kept in thousandths (internal_resolution.h).
     int                   video_supersample_milli = 1000;
