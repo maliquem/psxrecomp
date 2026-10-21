@@ -875,9 +875,16 @@ static void sc_mark_shown(void) {
  *     picture, in front, facing the camera like the frame's own triangles)
  *     but was not, several frames running, is dropped: it moved or is gone.
  *   - Frames that share almost nothing with the store, three in a row,
- *     are a new scene (a map change, a battle): the store starts over. */
+ *     are a new scene (a map change, a battle): the store starts over.
+ *   - The shadow map takes what the game would draw now (the picture and the
+ *     overdraw band) from this frame only, and from memory only what lies
+ *     outside it and stayed put for SCC_STATIC frames: a moving object (a
+ *     ship under way) never leaves a trail of old positions. */
 enum { SCC_MAX = 65536, SCC_HASH = 1 << 16 };
-typedef struct { float w[9]; float t[12]; int next; unsigned seen; uint8_t miss, alive; } ScCached;
+/* hits: frames seen at this place (capped); SCC_STATIC of them make it
+ * static scenery, the only kind the shadow map takes from memory. */
+enum { SCC_STATIC = 20 };
+typedef struct { float w[9]; float t[12]; int next; unsigned seen; uint8_t miss, alive, hits; } ScCached;
 static ScCached *s_scc = NULL;
 static int       s_scc_n = 0, s_scc_alive = 0, s_scc_head[SCC_HASH];
 static unsigned  s_scc_stamp = 0;
@@ -1038,11 +1045,16 @@ static void scc_ingest(void) {
         for (int j = 0; j < 3; j++) { t[j * 2] = v[j * SC_V + 3]; t[j * 2 + 1] = v[j * SC_V + 4]; }
         for (int k = 0; k < 6; k++) t[6 + k] = v[5 + k];
         int at = scc_find(w, t);
-        if (at >= 0) { s_scc[at].seen = s_scc_stamp; s_scc[at].miss = 0; s_scc_matched++; continue; }
+        if (at >= 0) {
+            ScCached *c = &s_scc[at];
+            if (c->seen != s_scc_stamp && c->hits < 255) c->hits++;
+            c->seen = s_scc_stamp; c->miss = 0; s_scc_matched++;
+            continue;
+        }
         if (s_scc_n == SCC_MAX) { scc_compact(); if (s_scc_n == SCC_MAX) continue; }
         ScCached *c = &s_scc[s_scc_n];
         memcpy(c->w, w, sizeof c->w); memcpy(c->t, t, sizeof c->t);
-        c->seen = s_scc_stamp; c->miss = 0; c->alive = 1;
+        c->seen = s_scc_stamp; c->miss = 0; c->alive = 1; c->hits = 1;
         const int cell = scc_cell(w);
         c->next = s_scc_head[cell]; s_scc_head[cell] = s_scc_n;
         s_scc_n++; s_scc_alive++; s_scc_added++;
@@ -1058,6 +1070,12 @@ static void scc_ingest(void) {
         ScCached *c = &s_scc[i];
         if (!c->alive) { dead++; continue; }
         if (c->seen == s_scc_stamp) continue;
+        /* never confirmed static and long unseen: an old place of something
+         * moving (one seen only a couple of times goes sooner) */
+        const unsigned unseen = s_scc_stamp - c->seen;
+        if (c->hits < SCC_STATIC && (unseen > 60 || (c->hits < 4 && unseen > 8))) {
+            c->alive = 0; s_scc_alive--; s_scc_dropped++; dead++; continue;
+        }
         float sx[3], sy[3]; int ok = 1;
         for (int j = 0; j < 3 && ok; j++) {
             float V[3]; scc_view(c->w + j * 3, V);

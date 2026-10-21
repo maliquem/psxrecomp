@@ -535,7 +535,34 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         if (la < 1e-4f) { a[0] = 1.0f; a[2] = 0.0f; la = 1.0f; }
         a[0] /= la; a[2] /= la;
         b[0] = L[1] * a[2] - L[2] * a[1]; b[1] = L[2] * a[0] - L[0] * a[2]; b[2] = L[0] * a[1] - L[1] * a[0];
-        n = use_store ? s_scc_alive * 3 : sc->n * 3;
+        /* From memory: what this frame drew, plus static scenery outside the
+         * area the game draws (the picture and its overdraw band). */
+        static int *pick = NULL; static int pick_cap = 0;
+        int npick = 0;
+        if (use_store) {
+            if (s_scc_n > pick_cap) {
+                int *p = (int *)realloc(pick, (size_t)s_scc_n * sizeof(int));
+                if (p) { pick = p; pick_cap = s_scc_n; }
+            }
+            const float dw = 120.0f * aspect + (float)psx_overdraw_x() * 0.8f;
+            const float dh = 120.0f + (float)psx_overdraw_y() * 0.8f;
+            for (int e = 0; e < s_scc_n && npick < pick_cap; e++) {
+                const ScCached *c = &s_scc[e];
+                if (!c->alive) continue;
+                if (c->seen != s_scc_stamp) {
+                    if (c->hits < SCC_STATIC) continue;
+                    float V[3], cxs = 0.0f, cys = 0.0f; int behind = 0;
+                    for (int j = 0; j < 3; j++) {
+                        scc_view(c->w + j * 3, V);
+                        if (V[2] < 1.0f) { behind = 1; break; }
+                        cxs += s_cam_h * V[0] / V[2]; cys += s_cam_h * V[1] / V[2];
+                    }
+                    if (!behind && fabsf(cxs / 3.0f) < dw && fabsf(cys / 3.0f) < dh) continue;
+                }
+                pick[npick++] = e;
+            }
+        }
+        n = use_store ? npick * 3 : sc->n * 3;
         if (n > s_sm_cap) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
@@ -548,8 +575,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
             float P[3], scr[2];
             float *o = s_sm_buf + (size_t)i * SC_V;
             if (use_store) {
-                while (!s_scc[ci].alive) ci++;
-                const ScCached *c = &s_scc[ci];
+                const ScCached *c = &s_scc[pick[ci]];
                 const int j = i % 3;
                 float V[3]; scc_view(c->w + j * 3, V);
                 if (V[2] < 1.0f) V[2] = 1.0f;
