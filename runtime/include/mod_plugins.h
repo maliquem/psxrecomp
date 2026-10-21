@@ -153,6 +153,10 @@ void psx_mod_write_word(uint32_t address, uint32_t value);
  * that loads its camera last before VBlank exposes the camera here.
  * Returns 0 before the CPU is bound. */
 int psx_mod_gte_rotation(int16_t out[9]);
+/* The rest of the GTE camera state: out[0..2] translation TRX/TRY/TRZ,
+ * out[3..4] screen offset OFX/OFY (16.16), out[5] projection distance H.
+ * Returns 0 before the CPU is bound. */
+int psx_mod_gte_projection(int32_t out[6]);
 /*
  * Replace one guest instruction and route that address through the runtime's
  * executable-RAM path. Use this instead of psx_mod_write_word for code so a

@@ -199,3 +199,12 @@ int psx_mod_gte_rotation(int16_t out[9]) {
     out[6] = (int16_t)c[3]; out[7] = (int16_t)(c[3] >> 16); out[8] = (int16_t)c[4];
     return 1;
 }
+
+int psx_mod_gte_projection(int32_t out[6]) {
+    const CPUState *cpu = debug_cpu_ptr;
+    if (!cpu || !out) return 0;
+    out[0] = (int32_t)cpu->gte_ctrl[5]; out[1] = (int32_t)cpu->gte_ctrl[6]; out[2] = (int32_t)cpu->gte_ctrl[7];
+    out[3] = (int32_t)cpu->gte_ctrl[24]; out[4] = (int32_t)cpu->gte_ctrl[25];
+    out[5] = (int32_t)(cpu->gte_ctrl[26] & 0xFFFFu);
+    return 1;
+}
