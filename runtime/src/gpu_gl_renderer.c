@@ -787,7 +787,8 @@ static float   s_pz[3];
 /* Shadow casters (the post-effect `shadow` input, gl_postfx.inc): while a
  * chain reads it, every depth-tested triangle (opaque, PGXP-proven 3D) is
  * kept as SC_V floats per vertex: VRAM px (fractional), SZ, then its texture
- * (u, v, page x/y, CLUT x/y, colour depth 0..2 or -1 = untextured, texture
+ * (u, v, page x/y, CLUT x/y, colour depth 0..2, -1 = untextured or -2 = a
+ * face the game culled (gl_renderer_shadow_add_backfaces: casts, never drawn), texture
  * window) so the map skips transparent texels, in a list per
  * drawing area (a double-buffered game draws one buffer while the other is
  * shown). A list starts over when its area's depth buffer is cleared for a
@@ -888,6 +889,7 @@ typedef struct { float w[9]; float t[12]; int next; unsigned seen; uint8_t miss,
 static ScCached *s_scc = NULL;
 static int       s_scc_n = 0, s_scc_alive = 0, s_scc_head[SCC_HASH];
 static unsigned  s_scc_stamp = 0;
+static int       s_scc_front = 0;   /* the winding the game draws: +1 / -1, 0 = not known yet */
 /* The camera of the frame taken in last (scc_view, the shadow map), chosen
  * from the last three VBlank reads: the game often leaves the next frame's
  * camera in the GTE before the VBlank, so the read that matches the store
@@ -1024,6 +1026,7 @@ static void scc_ingest(void) {
                 w[j * 3 + c] = s_cam_r[c] * V[0] + s_cam_r[3 + c] * V[1] + s_cam_r[6 + c] * V[2];
         }
         const float area = (v[SC_V] - v[0]) * (v[2 * SC_V + 1] - v[1]) - (v[2 * SC_V] - v[0]) * (v[SC_V + 1] - v[1]);
+        if (v[9] == -2.0f) continue;   /* culled faces: not the drawn winding */
         if (area > 0.0f) front_pos++; else if (area < 0.0f) front_neg++;
     }
     const int total = n1 - n0;
@@ -1061,8 +1064,10 @@ static void scc_ingest(void) {
     }
     sl->conv = n1;
     /* Gone or moved: should have been drawn this frame (well inside the
-     * picture, in front, facing the camera) and was not, 4 frames running. */
+     * picture, in front, facing the camera) and was not, 4 frames running.
+     * A culled face (t[10] == -2) should have been projected turned away. */
     const int front_sign = front_pos >= front_neg ? 1 : -1;
+    if (front_pos + front_neg >= 64) s_scc_front = front_sign;
     const float hw = (float)(sl->area[2] - sl->area[0] + 1) * 0.5f * 0.85f;
     const float hh = (float)(sl->area[3] - sl->area[1] + 1) * 0.5f * 0.85f;
     int dead = 0;
@@ -1085,11 +1090,35 @@ static void scc_ingest(void) {
         }
         if (!ok) continue;
         const float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-        if ((area > 0.0f ? 1 : -1) != front_sign || fabsf(area) < 4.0f) continue;
+        const int want = c->t[10] == -2.0f ? -front_sign : front_sign;
+        if ((area > 0.0f ? 1 : -1) != want || fabsf(area) < 4.0f) continue;
         if (++c->miss >= 4) { c->alive = 0; s_scc_alive--; s_scc_dropped++; dead++; }
     }
     if (dead > s_scc_n / 2 && dead > 1024) scc_compact();
 }
+/* The faces the game culled this frame (gte.cpp NCLIP via gpu.c): shadow-only
+ * casters appended to the list of the area they belong to (a closed object's
+ * far side, the underside of a hull), so its shadow is whole. */
+void gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n) {
+    GL_RT_SYNC("shadow_backfaces");
+    if (!s_sc_on) return;
+    for (int i = 0; i < n; i++) {
+        ScSlot *sl = sc_slot(area4 + i * 4, 1);
+        if (!sl || sl->n >= SC_MAX_TRIS) continue;
+        if (sl->n == sl->cap) {
+            float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
+            if (!p) continue;
+            sl->v = p; sl->cap *= 2;
+        }
+        float *v = sl->v + (size_t)sl->n * 3 * SC_V;
+        for (int j = 0; j < 3; j++, v += SC_V) {
+            v[0] = v9[i * 9 + j * 3]; v[1] = v9[i * 9 + j * 3 + 1]; v[2] = v9[i * 9 + j * 3 + 2];
+            v[3] = v[4] = v[5] = v[6] = v[7] = v[8] = v[10] = 0.0f; v[9] = -2.0f;
+        }
+        sl->n++;
+    }
+}
+int gl_renderer_shadow_front_sign(void) { return s_scc_front; }
 void gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
     GL_RT_SYNC("shadow_camera");
     if (!rot) { s_cam_ok = 0; s_cam_ring_n = 0; if (s_scc) scc_clear(); return; }   /* off: forget the scenery */

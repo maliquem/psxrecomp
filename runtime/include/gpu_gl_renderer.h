@@ -217,6 +217,10 @@ void  gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx
 int   gl_renderer_shadow_cache_stats(char *out, int cap);
 void  gl_renderer_shadow_cache_clear(void);
 int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
+/* Faces the game culled (NCLIP back-facing), shadow-only casters: n x 9
+ * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
+void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);
+int   gl_renderer_shadow_front_sign(void);
 void  gl_renderer_clear_post_uniforms(void);
 int   gl_renderer_post_shader_loaded(void);
 typedef struct {

@@ -396,7 +396,9 @@ static uint32_t ws_ovh_prev       = 0;  /* final count of last completed frame *
 static uint32_t ws_last_ovh_stamp = (uint32_t)-1000;
 static uint32_t ws_sust_ovh_stamp = (uint32_t)-1000;
 
+static void shadow_note_projection(int nverts);   /* below */
 void psx_ws_note_gte_project(int nverts) {
+    shadow_note_projection(nverts);
     uint32_t f = (uint32_t)s_frame_count;
     if (f != ws_gte_frame) {
         if (f == ws_gte_frame + 1u) ws_gte_prev_verts = ws_gte_count;
@@ -777,6 +779,9 @@ void psx_shadow_configure(int camera, int od_x, int od_y, const uint32_t *addr,
     sh_nkeys = nkeys < 0 ? 0 : nkeys > 8 ? 8 : nkeys;
     for (int i = 0; i < sh_nkeys; i++) { sh_key_addr[i] = addr[i]; sh_key_size[i] = size[i]; }
 }
+static void shadow_backfaces_flush(void);   /* below, after the drawing state */
+static int  sh_bf_on = 0;
+int psx_shadow_backfaces_on(void) { return sh_bf_on; }
 /* Through the mod services (mod_guest_services.c), which see the CPU state
  * as the running build lays it out. */
 extern int psx_mod_gte_rotation(int16_t out[9]);
@@ -788,6 +793,8 @@ static void shadow_vblank(void) {
         gpu_set_overdraw(wanted ? sh_od_x : 0, wanted ? sh_od_y : 0);
         sh_od_on = wanted;
     }
+    sh_bf_on = wanted && sh_camera;
+    if (sh_bf_on) shadow_backfaces_flush();   /* this frame's culled faces, before the camera takes the frame in */
     if (!wanted || !sh_camera) return;
     uint32_t key = 0;
     for (int i = 0; i < sh_nkeys; i++) {
@@ -3632,6 +3639,65 @@ static uint16_t split_recent_display_h = 0;
 
 /* Draw offset (set by GP0(E5h)) */
 static int32_t draw_offset_x, draw_offset_y;
+
+/* Faces the game culls (gte.cpp NCLIP), as shadow-only casters: VRAM px and
+ * SZ per corner, in the drawing area they were meant for. A screen corner
+ * the GTE saturated, or one too near the camera, drops the face. */
+enum { SH_BF_MAX = 16384 };
+static float    sh_bf_v[SH_BF_MAX][9];
+static int      sh_bf_area[SH_BF_MAX][4];
+static int      sh_bf_n = 0;
+void psx_shadow_backface(const int32_t sxy[3], const uint16_t sz[3]) {
+    if (sh_bf_n >= SH_BF_MAX) return;
+    float *v = sh_bf_v[sh_bf_n];
+    for (int i = 0; i < 3; i++) {
+        const int x = (int16_t)(sxy[i] & 0xFFFF), y = (int16_t)(sxy[i] >> 16);
+        if (sz[i] < 1024u || x <= -1024 || x >= 1023 || y <= -1024 || y >= 1023) return;
+        v[i * 3] = (float)(x + draw_offset_x); v[i * 3 + 1] = (float)(y + draw_offset_y); v[i * 3 + 2] = (float)sz[i];
+    }
+    sh_bf_area[sh_bf_n][0] = (int)draw_area_left; sh_bf_area[sh_bf_n][1] = (int)draw_area_top;
+    sh_bf_area[sh_bf_n][2] = (int)draw_area_right; sh_bf_area[sh_bf_n][3] = (int)draw_area_bottom;
+    sh_bf_n++;
+}
+/* Called before every RTPS/RTPT (psx_ws_note_gte_project), when the GTE still
+ * holds the previous projection's results: a triangle an RTPT left whose
+ * winding is not the one the game draws is a face it will cull (its NCLIP
+ * test), and when an RTPS (the 4th corner of a quad) followed it, the FIFO
+ * now holds that quad's second half. Read through the mod services (the
+ * running build's CPU layout). gte.cpp is part of the savestate execution
+ * contract, so the hook lives here. */
+extern int psx_mod_gte_data(uint32_t out[32]);
+static int sh_bf_prev = 0, sh_bf_prev_back = 0;   /* last projection: 3 = RTPT, 1 = RTPS */
+static void sh_bf_take(const uint32_t *d) {
+    const int32_t sxy[3] = {(int32_t)d[12], (int32_t)d[13], (int32_t)d[14]};
+    const uint16_t sz[3] = {(uint16_t)d[17], (uint16_t)d[18], (uint16_t)d[19]};
+    psx_shadow_backface(sxy, sz);
+}
+static void shadow_note_projection(int nverts) {
+    const int prev = sh_bf_prev;
+    sh_bf_prev = nverts;
+    if (!sh_bf_on || !prev) return;
+    uint32_t d[32];
+    if (!psx_mod_gte_data(d)) return;
+    if (prev == 3) {
+        const int front = gl_renderer_shadow_front_sign();
+        const int32_t x0 = (int16_t)d[12], y0 = (int16_t)(d[12] >> 16);
+        const int32_t x1 = (int16_t)d[13], y1 = (int16_t)(d[13] >> 16);
+        const int32_t x2 = (int16_t)d[14], y2 = (int16_t)(d[14] >> 16);
+        const int64_t a = (int64_t)(x1 - x0) * (y2 - y0) - (int64_t)(x2 - x0) * (y1 - y0);
+        sh_bf_prev_back = front != 0 && a != 0 && (a > 0 ? 1 : -1) != front;
+        if (sh_bf_prev_back) sh_bf_take(d);
+    } else if (prev == 1 && sh_bf_prev_back) {
+        sh_bf_take(d);            /* v1 v2 v3 of the culled quad */
+        sh_bf_prev_back = 0;
+    } else {
+        sh_bf_prev_back = 0;
+    }
+}
+static void shadow_backfaces_flush(void) {
+    if (sh_bf_n) gl_renderer_shadow_add_backfaces(&sh_bf_v[0][0], &sh_bf_area[0][0], sh_bf_n);
+    sh_bf_n = 0;
+}
 /* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
  * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
  * bands, the game is drawing different parts of the scene into different display

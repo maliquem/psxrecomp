@@ -162,6 +162,9 @@ int psx_mod_gte_projection(int32_t out[6]);
  * [widescreen.cull]); the picture itself is unchanged. 0, 0 = vanilla. For
  * effects that need the surroundings (shadow casters). */
 void psx_mod_set_overdraw(int x, int y);
+/* The GTE data registers (COP2 0..31) as the guest left them. Read-only;
+ * returns 0 before the CPU is bound. */
+int psx_mod_gte_data(uint32_t out[32]);
 /*
  * Replace one guest instruction and route that address through the runtime's
  * executable-RAM path. Use this instead of psx_mod_write_word for code so a
