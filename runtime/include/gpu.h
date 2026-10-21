@@ -426,6 +426,14 @@ int32_t psx_ws_screen_x_bound(int32_t vanilla);
  * `sltiu rt, sx, 0x140/0x141` through this one helper so every overlay execution
  * path widens identically. Returns the sltiu verdict (1 = keep). 0 at 4:3. */
 int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
+int  psx_ws_cull_sltiu_y(uint32_t sy, uint32_t imm);   /* paired height compare, overdraw only */
+int  psx_ws_is_cull_h_imm(uint32_t imm);
+/* Overdraw guard band (see gpu.c): extra screen px kept past each edge by the
+ * game's per-primitive screen culls. 0 = vanilla. */
+void gpu_set_overdraw(int x, int y);
+int  psx_overdraw_x(void);
+int  psx_overdraw_y(void);
+int  psx_overdraw_axis(int axis);   /* 0 = X, 1 = Y (overlay callback) */
 /* Signed-funnel variants (min/max + center±halfwidth idioms — see
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */

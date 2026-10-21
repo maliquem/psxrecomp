@@ -2536,10 +2536,12 @@ static void init_callbacks(void) {
     {
         extern int  psx_ws_backdrop_x(int x);
         extern int  psx_ws_x_margin(void);
+        extern int  psx_overdraw_axis(int axis);
         extern void psx_ws_sprite_tag(CPUState *cpu);
         extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ABI v4 */
         s_callbacks.ws_backdrop_x    = psx_ws_backdrop_x;
         s_callbacks.ws_x_margin      = psx_ws_x_margin;
+        s_callbacks.overdraw         = psx_overdraw_axis;
         s_callbacks.ws_sprite_tag    = psx_ws_sprite_tag;
         s_callbacks.ws_backdrop_value = psx_ws_backdrop_value;
     }

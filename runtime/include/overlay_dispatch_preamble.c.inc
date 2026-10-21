@@ -191,6 +191,10 @@ int psx_ws_backdrop_x(int x) {
 int psx_ws_x_margin(void) {
     return g_cbs.ws_x_margin ? g_cbs.ws_x_margin() : 0;
 }
+/* Overdraw guard band (ABI v31), added by the screen-cull helpers below only;
+ * same as gpu.c ws_cull_xm / psx_ws_cull_sltiu_y. 0 on an older host. */
+static int ovl_overdraw(int axis) { return g_cbs.overdraw ? g_cbs.overdraw(axis) : 0; }
+static int ovl_cull_xm(void) { return psx_ws_x_margin() + ovl_overdraw(0); }
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x).
  * The recompiler emits `rt = psx_ws_cull_sltiu(sx, imm)` at every width-compare
  * cull site, INCLUDING in overlay-resident code, so the overlay DLL must define
@@ -199,29 +203,34 @@ int psx_ws_x_margin(void) {
  * depends only on psx_ws_x_margin() above. Identity at 4:3 (margin 0). MUST stay
  * byte-for-byte identical to gpu.c psx_ws_cull_sltiu. */
 int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
-    int m = psx_ws_x_margin();
+    int m = ovl_cull_xm();
     return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
+            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
+}
+int psx_ws_cull_sltiu_y(uint32_t sy, uint32_t imm) {
+    const int m = ovl_overdraw(1);
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sy + m)
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
 /* Signed-funnel variants (min/max + center±halfwidth idioms). Same contract:
  * self-contained, identity at margin 0, MUST stay byte-for-byte identical to
  * the gpu.c implementations. */
 int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
-    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)sx < (int32_t)imm + ovl_cull_xm()) ? 1 : 0;
 }
 int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
     int32_t bound = (int32_t)(int16_t)(uint16_t)imm;
     return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
 }
 int psx_ws_cull_bltz(uint32_t v) {
-    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)v < -ovl_cull_xm()) ? 1 : 0;
 }
 /* [widescreen.cull] bgez_sites and clip_edge_x_load_sites. The emitter writes
  * these at a listed address whose instruction matches in overlay code too, so
  * the shard must define them. Same math as gpu.c: both call the pure helpers
  * in ws_cull_edge.h (stdint-only), over psx_ws_x_margin() above. */
 int psx_ws_cull_bgez(uint32_t v) {
-    return psx_ws_cull_bgez_value((int32_t)v, psx_ws_x_margin());
+    return psx_ws_cull_bgez_value((int32_t)v, ovl_cull_xm());
 }
 uint32_t psx_ws_clip_edge_x(uint32_t v, uint32_t w) {
     return psx_ws_clip_edge_x_value(v, w, psx_ws_x_margin());

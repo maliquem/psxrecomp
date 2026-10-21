@@ -124,8 +124,11 @@
  *      entry hooks, guarded pre-instruction callback.
  * v30: the two lines merged. OverlayCallbacks keeps the master layout, which
  *      already holds every release-line callback; shards built against either
- *      v28 or v29 are rejected and recompiled. */
-#define PSX_OVERLAY_ABI_VERSION 30
+ *      v28 or v29 are rejected and recompiled.
+ * v31: overdraw guard band (psx_mod_set_overdraw): the screen-cull helpers in
+ *      the shard add it, and the height compare paired with an auto_screen_x
+ *      width compare is emitted as psx_ws_cull_sltiu_y; callback appended. */
+#define PSX_OVERLAY_ABI_VERSION 31
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
  * record consumes one slot, even when another DLL carries an identical
@@ -387,6 +390,8 @@ typedef struct OverlayCallbacks {
     int32_t (*nclip_exact_sign)(int32_t native_mac0, uint32_t pc);
     /* Guarded pre-instruction mod callback (ABI v27). */
     void (*mod_instruction)(CPUState*, uint32_t, uint32_t);
+    /* Overdraw guard band, screen px (ABI v31): axis 0 = X, 1 = Y. */
+    int (*overdraw)(int axis);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

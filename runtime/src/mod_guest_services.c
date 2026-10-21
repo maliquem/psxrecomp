@@ -208,3 +208,6 @@ int psx_mod_gte_projection(int32_t out[6]) {
     out[5] = (int32_t)(cpu->gte_ctrl[26] & 0xFFFFu);
     return 1;
 }
+
+void psx_mod_set_overdraw(int x, int y) { gpu_set_overdraw(x, y); }
+

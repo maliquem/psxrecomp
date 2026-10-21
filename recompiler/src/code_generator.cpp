@@ -1493,6 +1493,16 @@ std::string CodeGenerator::translate_instruction_core(uint32_t addr, uint32_t in
                                "  /* ws auto screen-x cull (right edge) */{}",
                                reg_name(rt), reg_name(rs), (int)uimm, comment);
         }
+        // The paired height compare (`sltiu rt, SY, H`): widened only by the
+        // runtime overdraw guard band (psx_mod_set_overdraw), identity at 0.
+        if (opcode == 0x0B &&
+            psx_ws_cull_imm_in(uimm, config_.ws_cull_h_imms.data(),
+                               (int)config_.ws_cull_h_imms.size())) {
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            return fmt::format("{} = psx_ws_cull_sltiu_y({}, {});"
+                               "  /* auto screen-y cull (overdraw) */{}",
+                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+        }
     }
     // Explicit signed lower-bound widen (`slti rt, sx, -W`). Unlike the
     // min/max right-edge helper below, this moves the immediate left by one
@@ -3616,6 +3626,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
         ss << "extern int32_t psx_ws_local_viewport_width(int32_t vanilla);  /* netplay unsplit frustum width */\n";
     ss << "extern int32_t psx_ws_screen_x_bound(int32_t vanilla);  /* typed screen-pixel X bound */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_sltiu_y(uint32_t sy, uint32_t imm);  /* auto screen-y cull, overdraw (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";

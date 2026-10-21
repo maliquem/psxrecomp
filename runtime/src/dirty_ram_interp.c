@@ -2198,6 +2198,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         }
         else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
+        else if (psx_ws_auto_cull_on() && psx_ws_is_cull_h_imm(imm) && ws_cull_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu_y(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
         psx_pgxp_alu(cpu, insn, cpu->gpr[rt], 0, 0);

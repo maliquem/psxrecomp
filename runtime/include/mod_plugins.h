@@ -157,6 +157,11 @@ int psx_mod_gte_rotation(int16_t out[9]);
  * out[3..4] screen offset OFX/OFY (16.16), out[5] projection distance H.
  * Returns 0 before the CPU is bound. */
 int psx_mod_gte_projection(int32_t out[6]);
+/* Overdraw guard band: keep geometry up to x / y screen px past the picture's
+ * edges (the game's auto_screen_x culls and their paired height compares, see
+ * [widescreen.cull]); the picture itself is unchanged. 0, 0 = vanilla. For
+ * effects that need the surroundings (shadow casters). */
+void psx_mod_set_overdraw(int x, int y);
 /*
  * Replace one guest instruction and route that address through the runtime's
  * executable-RAM path. Use this instead of psx_mod_write_word for code so a

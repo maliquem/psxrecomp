@@ -716,6 +716,22 @@ int gpu_ws_netplay_local_viewport_width(void) {
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
 static int ws_cull_guard_pixels = 0;
+/* Overdraw (psx_mod_set_overdraw): screen px past each edge that the game's
+ * per-primitive screen culls ([widescreen.cull] auto_screen_x and its paired
+ * height compares, the explicit X sites) still keep, so geometry just off
+ * screen is submitted; the drawing area clips it, so the picture is unchanged.
+ * For effects that need what lies around the picture (shadow casters). Only
+ * the cull compares move: native-wide placement, activation and every other
+ * user of psx_ws_x_margin() keep their value. 0 = vanilla (default). */
+static int ws_overdraw_x = 0, ws_overdraw_y = 0;
+void gpu_set_overdraw(int x, int y) {
+    ws_overdraw_x = x < 0 ? 0 : x > 256 ? 256 : x;
+    ws_overdraw_y = y < 0 ? 0 : y > 256 ? 256 : y;
+}
+int psx_overdraw_x(void) { return ws_overdraw_x; }
+int psx_overdraw_y(void) { return ws_overdraw_y; }
+int psx_overdraw_axis(int axis) { return axis ? ws_overdraw_y : ws_overdraw_x; }
+static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_overdraw_x; }
 static int ws_activation_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
 void gpu_ws_set_cull_guard_pixels(int pixels) {
@@ -931,7 +947,7 @@ uint32_t psx_ws_clip_edge_width(void) { return ws_clip_edge_width; }
 /* [widescreen.cull] bgez_sites: `bgez SX, keep` keeps while SX >= -margin.
  * Returns the branch predicate. Identity at margin 0 (4:3). */
 int psx_ws_cull_bgez(uint32_t v) {
-    return psx_ws_cull_bgez_value((int32_t)v, psx_ws_x_margin());
+    return psx_ws_cull_bgez_value((int32_t)v, ws_cull_xm());
 }
 /* [widescreen.cull] clip_edge_x_load_sites: a loaded clip bound equal to the
  * screen's left edge (0) becomes -margin and one equal to its right edge (w)
@@ -1998,7 +2014,7 @@ int32_t psx_ws_screen_x_bound(int32_t vanilla) {
  * shifts by +margin so BOTH 16:9 margins pass; at 4:3 margin==0 so it reduces
  * bit-for-bit to the vanilla `(uint16)sx < imm`. */
 int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
-    int m = psx_ws_x_margin();
+    int m = ws_cull_xm();
     return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
@@ -2008,7 +2024,7 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
  * bound moves out by ONE margin only. Operand is an already sign-extended /
  * computed 32-bit screen X. Identity at margin 0 (4:3). */
 int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
-    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)sx < (int32_t)imm + ws_cull_xm()) ? 1 : 0;
 }
 
 /* Signed fixed lower-bound widen (`slti v, x, -W`): move the reject edge left
@@ -2022,7 +2038,15 @@ int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
  * when the prim ends left of the REVEALED edge (maxSX < -margin). Returns the
  * branch predicate. Identity at margin 0 (4:3). */
 int psx_ws_cull_bltz(uint32_t v) {
-    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)v < -ws_cull_xm()) ? 1 : 0;
+}
+/* The height compare paired with an auto_screen_x width compare (`sltiu rt,
+ * SY, H`, H from screen_h_imms): widened by the overdraw on both edges only
+ * (widescreen never moves Y). Identity at 0. */
+int psx_ws_cull_sltiu_y(uint32_t sy, uint32_t imm) {
+    const int m = ws_overdraw_y;
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sy + m)
+            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
 int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
     int32_t margin = psx_ws_x_margin();
@@ -2055,6 +2079,9 @@ void gpu_ws_set_cull_imms(const uint32_t *w, int nw, const uint32_t *h, int nh) 
 }
 int psx_ws_is_cull_w_imm(uint32_t imm) {
     return psx_ws_cull_imm_in(imm, ws_cull_w_imms, ws_cull_w_n);
+}
+int psx_ws_is_cull_h_imm(uint32_t imm) {
+    return psx_ws_cull_imm_in(imm, ws_cull_h_imms, ws_cull_h_n);
 }
 
 /* ---- Runtime gates for the pattern-scanned widescreen hooks. The interp
