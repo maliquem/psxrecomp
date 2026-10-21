@@ -784,6 +784,76 @@ static float   s_pq[3];
  * vertex, 1..65535, from validated dataflow shadows. */
 static int     s_pz_valid = 0;
 static float   s_pz[3];
+/* Shadow casters (the post-effect `shadow` input, gl_postfx.inc): while a
+ * chain reads it, every depth-tested triangle (opaque, PGXP-proven 3D) is
+ * kept as SC_V floats per vertex: VRAM px (fractional), SZ, then its texture
+ * (u, v, page x/y, CLUT x/y, colour depth 0..2 or -1 = untextured, texture
+ * window) so the map skips transparent texels, in a list per
+ * drawing area (a double-buffered game draws one buffer while the other is
+ * shown). A list starts over when its area's depth buffer is cleared for a
+ * new frame (drawing area change, fill, config: not the in-frame threshold
+ * or the per-present clears, so a 30 Hz frame drawn across two presents
+ * stays whole); the present uses the list whose area holds the picture. */
+static int     s_sc_on = 0;
+static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
+enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
+typedef struct { int area[4]; int n, cap; unsigned use; float *v; } ScSlot;
+static ScSlot   s_sc[SC_SLOTS];
+static unsigned s_sc_use = 0;
+static ScSlot *sc_slot(const int area[4], int make) {
+    ScSlot *lru = &s_sc[0];
+    for (int i = 0; i < SC_SLOTS; i++) {
+        if (s_sc[i].cap && !memcmp(s_sc[i].area, area, sizeof s_sc[i].area)) return &s_sc[i];
+        if (s_sc[i].use < lru->use) lru = &s_sc[i];
+    }
+    if (!make) return NULL;
+    memcpy(lru->area, area, sizeof lru->area);
+    lru->n = 0;
+    if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
+    return lru->cap ? lru : NULL;
+}
+/* tex: NULL = untextured, else {u0,v0,u1,v1,u2,v2, page x, page y, clut x,
+ * clut y, depth, window}. */
+static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
+    if (!s_sc_on || !s_pz_valid || !s_pc_valid) return;
+    const int area[4] = {x1, y1, x2, y2};
+    ScSlot *sl = sc_slot(area, 1);
+    if (!sl || sl->n >= SC_MAX_TRIS) return;
+    if (sl->n == sl->cap) {
+        float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
+        if (!p) return;
+        sl->v = p; sl->cap *= 2;
+    }
+    float *v = sl->v + (size_t)sl->n * 3 * SC_V;
+    for (int i = 0; i < 3; i++, v += SC_V) {
+        v[0] = s_pc_x[i]; v[1] = s_pc_y[i]; v[2] = s_pz[i];
+        if (tex) {
+            v[3] = tex[i * 2]; v[4] = tex[i * 2 + 1];
+            for (int k = 0; k < 6; k++) v[5 + k] = tex[6 + k];
+        } else {
+            v[3] = v[4] = v[5] = v[6] = v[7] = v[8] = v[10] = 0.0f; v[9] = -1.0f;
+        }
+    }
+    sl->n++;
+    sl->use = ++s_sc_use;
+}
+/* A new frame starts in this area: its list starts over. */
+static void sc_area_reset(int x1, int y1, int x2, int y2) {
+    const int area[4] = {x1, y1, x2, y2};
+    ScSlot *sl = sc_slot(area, 0);
+    if (sl) sl->n = 0;
+}
+/* The casters of the picture on screen: the list whose area holds its centre. */
+static const ScSlot *sc_presented(void) {
+    const ScSlot *best = NULL;
+    for (int i = 0; i < SC_SLOTS; i++) {
+        const ScSlot *sl = &s_sc[i];
+        if (!sl->n || s_sc_cx < (float)sl->area[0] || s_sc_cx > (float)sl->area[2] + 1.0f ||
+            s_sc_cy < (float)sl->area[1] || s_sc_cy > (float)sl->area[3] + 1.0f) continue;
+        if (!best || sl->use > best->use) best = sl;
+    }
+    return best;
+}
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
  * and the seam expansion of opaque 3D polygons (0 off, 1 = 1 output px
@@ -4479,6 +4549,8 @@ static void depth_clear_now(void) {
     flush_flat_batch();
     s_depth_clears++;
     s_depth_clear_reason[s_depth_need_reason]++;
+    if (s_depth_need_reason != DCLR_THRESHOLD && s_depth_need_reason != DCLR_PRESENT)
+        sc_area_reset(s_area_x1, s_area_y1, s_area_x2, s_area_y2);   /* shadow casters: a new frame */
     { FILE *f = pgxp_tri_log(); if (f) fprintf(f, "C\n"); }
 }
 /* Before a depth-tested triangle: clear when the drawing area changed since
@@ -4752,7 +4824,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
 
     int gate = bd_prim_gate(xs, n, 0);
     const int dmode = n == 3 ? pgxp_tri_depth_mode(semi) : 0;
-    if (dmode) depth_before_tri();
+    if (dmode) { depth_before_tri(); sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, NULL); }
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
     const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d();
     if (s_fb_n > 0 && (s_fb_mode != GL_TRIANGLES || s_fb_semi != semi ||
@@ -4901,7 +4973,20 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const int batch_semi = batch_class.key;
         const int isolate = batch_class.isolate;
         const int tdmode = pgxp_tri_depth_mode(semi);
-        if (tdmode) depth_before_tri();
+        if (tdmode) {
+            depth_before_tri();
+            if (s_sc_on) {
+                float t[12];
+                for (int i = 0; i < 3; i++) {
+                    t[i * 2] = s_projected_uv_valid ? s_projected_u[i] : (float)us[i];
+                    t[i * 2 + 1] = s_projected_uv_valid ? s_projected_v[i] : (float)vs[i];
+                }
+                t[6] = (float)base_x; t[7] = (float)base_y; t[8] = (float)clut_x; t[9] = (float)clut_y;
+                t[10] = s_selected_bank_tex ? -1.0f : (float)depth;   /* a mod bank: opaque */
+                t[11] = (float)(twx | (twy << 5) | (tox << 10) | (toy << 15));
+                sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, t);
+            }
+        }
         int reason = -1;
         if (s_tb_n > 0) {
             if (s_tb_bank_tex != s_selected_bank_tex || s_tb_bank_live_clut != s_selected_bank_live_clut || s_tb_hd_tex != hd_tex) reason = 0;
@@ -10307,6 +10392,7 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
         present_target_quad(src_tex, tw, th,
                             src_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
         postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+        s_sc_cx = (float)disp_x + (float)w * 0.5f; s_sc_cy = (float)disp_y + (float)h * 0.5f;
     }
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_VRAM_FBO,
@@ -10482,6 +10568,8 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
     postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
                       0, disp_y, g_wide_w, disp_h);
+    s_sc_cx = (float)disp_x + (float)(g_wide_w - 2 * g_wide_off) * 0.5f;
+    s_sc_cy = (float)disp_y + (float)disp_h * 0.5f;
     if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
         postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
                            present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,

@@ -22,6 +22,8 @@
  * the PS1 SZ is 256 / (1 - d) - 256, and d = 1 where nothing 3D wrote: the
  * cleared background, 2D, sprites and semi-transparent primitives never write
  * depth, so under a sprite it is the scenery behind it; combine with mask3d),
+ * `shadow` (optional: a shadow map of the frame's opaque PGXP triangles
+ * seen from the light the reading pass gives; see pfx_shadow_build),
  * and
  * earlier passes' targets. The executor owns target allocation and lifetime,
  * program build/cache, uniform binding (u_rcp, u_size, u_org and the preset's
@@ -144,9 +146,12 @@ static void pfx_mask_wanted_update(void) {
     int want3d = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_mask3d) want3d = 1;
-    int wantd = 0;
+    int wantd = 0, wants = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
+    for (int i = 0; i < PFX_NSTAGES; i++)
+        if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_shadow) wants = 1;
+    s_sc_on = wants;
     if (want != s_bcls_on || want3d != s_b3d_on || wantd != s_dep_on) {
         s_bcls_on = want; s_b3d_on = want3d; s_dep_on = wantd;
         pgxp_render_wanted_update();
@@ -410,6 +415,158 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
  * size) instead of running. The full-size copy of the image is made only
  * if a pass that runs reads `source`; `source_down` is a blit of the window
  * rect straight to that pass's size. */
+/* The `shadow` input. The reading pass gives the light: uniform u_shadowdir
+ * (xyz: view space toward the light, y up) and u_proj.x = H (the GTE
+ * projection distance). The casters (sc_add_tri) are rebuilt the way readers
+ * of `depth` rebuild a pixel: X = dx SZ / H, Y = -dy SZ / H, Z = SZ, with
+ * (dx, dy) the native px from the displayed picture's centre. The map is an
+ * orthographic depth render along the light over the casters' bounds; the
+ * pass also gets u_smx = (a, x0), u_smy = (b, y0), u_smz = (L, d1) and
+ * u_sms = (1/(x1-x0), 1/(y1-y0), 1/(d1-d0), map size): a point P is at map uv
+ * ((dot(P,a)-x0) sms.x, (dot(P,b)-y0) sms.y), depth (d1 - dot(P,L)) sms.z
+ * there (0 = nearest the light). No casters: the map is cleared (no shadow). */
+enum { SM_SIZE = 2048 };
+static GLuint s_sm_tex = 0, s_sm_fbo = 0, s_sm_prog = 0, s_sm_vao = 0, s_sm_vbo = 0;
+static GLint  s_sm_uvram = -1;
+static float  s_sm_u[4][4];
+static float *s_sm_buf = NULL; static int s_sm_cap = 0;
+static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
+    for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
+    return NULL;
+}
+static void pfx_shadow_build(const PfxPass *ps) {
+    if (!s_sm_tex) {
+        glGenTextures(1, &s_sm_tex);
+        glBindTexture(GL_TEXTURE_2D, s_sm_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
+                     0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glGenFramebuffers(1, &s_sm_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm_tex, 0);
+        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+        /* Transparent texels (raw 0) cast no shadow, as they draw nothing:
+         * the fetch is the textured shader's (page, CLUT, window). */
+        s_sm_prog = build_program(
+            "#version 330\n"
+            "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n"
+            "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n"
+            "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw;\n"
+            "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw);\n"
+            "  gl_Position = vec4(a_p, 1.0); }\n",
+            "#version 330\n"
+            "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; out vec4 o;\n"
+            "uniform usampler2D u_vram;\n"
+            "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n"
+            "void main(){\n"
+            "  o = vec4(1.0);\n"
+            "  if (v_dw.x < 0) return;\n"
+            "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n"
+            "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n"
+            "  if ((tw.x | tw.y) != 0) { u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n"
+            "                            v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8); }\n"
+            "  int raw;\n"
+            "  if (v_dw.x == 0) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 2), v_tc.y + v) >> ((u & 3) * 4)) & 0xF), v_tc.w);\n"
+            "  else if (v_dw.x == 1) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 1), v_tc.y + v) >> ((u & 1) * 8)) & 0xFF), v_tc.w);\n"
+            "  else raw = vram_at(v_tc.x + u, v_tc.y + v);\n"
+            "  if (raw == 0) discard;\n"
+            "}\n");
+        s_sm_uvram = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_vram") : -1;
+        p_glGenVertexArrays(1, &s_sm_vao);
+        p_glGenBuffers(1, &s_sm_vbo);
+        p_glBindVertexArray(s_sm_vao);
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
+        const GLsizei st = SC_V * sizeof(float);
+        p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, st, (void *)0);
+        p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, st, (void *)(3 * sizeof(float)));
+        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, st, (void *)(5 * sizeof(float)));
+        p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, st, (void *)(9 * sizeof(float)));
+        for (GLuint k = 0; k < 4; k++) p_glEnableVertexAttribArray(k);
+        p_glBindVertexArray(0);
+    }
+    memset(s_sm_u, 0, sizeof s_sm_u);
+    s_sm_u[3][3] = (float)SM_SIZE;
+    const float *dir = pfx_pass_uniform(ps, "u_shadowdir"), *proj = pfx_pass_uniform(ps, "u_proj");
+    const float H = proj ? proj[0] : 0.0f;
+    float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
+    const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+    int n = 0;
+    float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
+    const ScSlot *sc = sc_presented();
+    if (H > 0.0f && ll > 1e-6f && sc && s_sm_prog) {
+        L[0] /= ll; L[1] /= ll; L[2] /= ll;
+        /* a: across the light, level in view space when it can be */
+        a[0] = L[2]; a[1] = 0.0f; a[2] = -L[0];
+        float la = sqrtf(a[0] * a[0] + a[2] * a[2]);
+        if (la < 1e-4f) { a[0] = 1.0f; a[2] = 0.0f; la = 1.0f; }
+        a[0] /= la; a[2] /= la;
+        b[0] = L[1] * a[2] - L[2] * a[1]; b[1] = L[2] * a[0] - L[0] * a[2]; b[2] = L[0] * a[1] - L[1] * a[0];
+        n = sc->n * 3;
+        if (n > s_sm_cap) {
+            float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
+            if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
+        }
+        const float k = 1.0f / H;
+        for (int i = 0; i < n; i++) {
+            const float *v = sc->v + (size_t)i * SC_V;
+            const float z = v[2];
+            const float P[3] = {(v[0] - s_sc_cx) * z * k, -(v[1] - s_sc_cy) * z * k, z};
+            float *o = s_sm_buf + (size_t)i * SC_V;
+            memcpy(o + 3, v + 3, (SC_V - 3) * sizeof(float));
+            o[0] = P[0] * a[0] + P[1] * a[1] + P[2] * a[2];
+            o[1] = P[0] * b[0] + P[1] * b[1] + P[2] * b[2];
+            o[2] = P[0] * L[0] + P[1] * L[1] + P[2] * L[2];
+            if (o[0] < x0) x0 = o[0]; if (o[0] > x1) x1 = o[0];
+            if (o[1] < y0) y0 = o[1]; if (o[1] > y1) y1 = o[1];
+            if (o[2] < d0) d0 = o[2]; if (o[2] > d1) d1 = o[2];
+        }
+    }
+    GLboolean dmask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
+    glViewport(0, 0, SM_SIZE, SM_SIZE);
+    glDepthMask(GL_TRUE);
+    glClearDepth(1.0);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    if (n > 0 && x1 > x0 && y1 > y0 && d1 > d0) {
+        const float sx = 1.0f / (x1 - x0), sy = 1.0f / (y1 - y0), sd = 1.0f / (d1 - d0);
+        for (int i = 0; i < n; i++) {
+            float *o = s_sm_buf + (size_t)i * SC_V;
+            o[0] = (o[0] - x0) * sx * 2.0f - 1.0f;
+            o[1] = (o[1] - y0) * sy * 2.0f - 1.0f;
+            o[2] = (d1 - o[2]) * sd * 2.0f - 1.0f;
+        }
+        p_glUseProgram(s_sm_prog);
+        p_glBindVertexArray(s_sm_vao);
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
+        p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * SC_V * sizeof(float)), s_sm_buf, PSXGL_STREAM_DRAW);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+        p_glUniform1i(s_sm_uvram, 0);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDrawArrays(GL_TRIANGLES, 0, n);
+        glDisable(GL_DEPTH_TEST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glBindVertexArray(0);
+        const float u[4][4] = {{a[0], a[1], a[2], x0}, {b[0], b[1], b[2], y0},
+                               {L[0], L[1], L[2], d1}, {sx, sy, sd, (float)SM_SIZE}};
+        memcpy(s_sm_u, u, sizeof s_sm_u);
+    }
+    glDepthMask(dmask);
+}
+static void pfx_shadow_uniforms(GLuint prog) {
+    static const char *const names[4] = {"u_smx", "u_smy", "u_smz", "u_sms"};
+    for (int k = 0; k < 4; k++) {
+        const GLint loc = p_glGetUniformLocation(prog, names[k]);
+        if (loc >= 0) p_glUniform4f(loc, s_sm_u[k][0], s_sm_u[k][1], s_sm_u[k][2], s_sm_u[k][3]);
+    }
+}
+
 static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, int lh) {
     PfxChain *c = &st->chain;
     int copied = 0;
@@ -456,6 +613,10 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             }
         }
         /* The image this pass reads, before its target is bound. */
+        int reads_shadow = 0;
+        for (int k = 0; k < ps->ninputs; k++)
+            if (ps->in[k].from == PFX_IN_SHADOW) reads_shadow = 1;
+        if (reads_shadow) pfx_shadow_build(ps);
         for (int k = 0; k < ps->ninputs; k++) {
             if (ps->in[k].from == PFX_IN_SOURCE && !copied) {
                 post_copy_bind(lw, lh);
@@ -483,12 +644,14 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                            : from == PFX_IN_SOURCE_DOWN ? st->dtex[i]
                            : (from == PFX_IN_MASK || from == PFX_IN_MASK3D) ? s_mask_tex
                            : from == PFX_IN_DEPTH ? s_dep_tex
+                           : from == PFX_IN_SHADOW ? s_sm_tex
                            : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
             glBindTexture(GL_TEXTURE_2D, t);
             p_glUniform1i(L->in[k], k);
         }
         p_glActiveTexture(PSXGL_TEXTURE0);
+        if (reads_shadow) pfx_shadow_uniforms(prog);
         p_glUniform2f(L->fixed[PFX_LOC_RCP], 1.0f / (float)w, 1.0f / (float)h);
         p_glUniform2f(L->fixed[PFX_LOC_SIZE], (float)w, (float)h);
         p_glUniform2i(L->fixed[PFX_LOC_ORG], last ? lx : 0, last ? ly : 0);
