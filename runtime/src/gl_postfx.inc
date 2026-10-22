@@ -609,10 +609,12 @@ static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float na_b,
 /* The frame's 2D pieces standing at its sprites' foot points: the pieces of
  * one sprite (a run drawn together, see below) go to the foot point at their
  * bottom, and each is put on that sprite's upright plane (through the foot
- * point, facing the camera across the floor) along its own view ray. Out: s_spr_n
+ * point, facing the camera across the floor, turned a little toward a light
+ * that comes across the picture) along its own view ray. Out: s_spr_n
  * vertices, as casters in view space (s_spr_cast) and on the picture
  * (s_spr_scr: clip x, y, view z). */
-static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
+#define SPR_LIGHT_MIN 0.7f   /* least cosine between a sprite's plane normal and the level light */
+static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
     s_spr_n = 0; s_spr_nx = 0;
     if (!s_spr_on || !sc || !s_cam_ok || sc->nanc <= 0 || sc->sn <= 0 || s_sm_world[1][3] < 0.5f) return;
     float AP[SC_ANC_MAX][3], AS[SC_ANC_MAX][2];
@@ -629,6 +631,27 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
     float nrm[3] = {-u[0] * u[2], -u[1] * u[2], 1.0f - u[2] * u[2]};   /* forward minus its up part */
     const float nl = sqrtf(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
     if (nl < 1e-3f) { nrm[0] = nrm[1] = 0.0f; nrm[2] = 1.0f; } else for (int i = 0; i < 3; i++) nrm[i] /= nl;
+    {   /* Facing the camera, a sprite casts a line when the light comes across
+         * the picture (in its plane, as in BoF4's battles): the plane turns
+         * about the up axis, just enough that the light's level direction
+         * meets it at SPR_LIGHT_MIN (cosine), so its shadow keeps that much of
+         * its width. The sprite's own depth turns with it (never shading itself). */
+        const float lu = L[0] * u[0] + L[1] * u[1] + L[2] * u[2];
+        float lh[3] = {L[0] - u[0] * lu, L[1] - u[1] * lu, L[2] - u[2] * lu};
+        const float hl = sqrtf(lh[0] * lh[0] + lh[1] * lh[1] + lh[2] * lh[2]);
+        if (hl > 0.1f) {
+            for (int i = 0; i < 3; i++) lh[i] /= hl;
+            const float c = nrm[0] * lh[0] + nrm[1] * lh[1] + nrm[2] * lh[2];
+            if (fabsf(c) < SPR_LIGHT_MIN) {
+                float t[3] = {lh[0] - nrm[0] * c, lh[1] - nrm[1] * c, lh[2] - nrm[2] * c};
+                const float tl = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+                for (int i = 0; i < 3; i++) t[i] /= tl;
+                const float phi = atan2f(tl, c), a = acosf(SPR_LIGHT_MIN);   /* lh = cos(phi) nrm + sin(phi) t */
+                const float th = c >= 0.0f ? phi - a : phi - 3.14159265f + a;
+                for (int i = 0; i < 3; i++) nrm[i] = nrm[i] * cosf(th) + t[i] * sinf(th);
+            }
+        }
+    }
     if (sc->sn * 3 > s_spr_cap) {
         float *c = (float *)realloc(s_spr_cast, (size_t)sc->sn * 3 * SC_V * sizeof(float));
         if (c) s_spr_cast = c;
@@ -978,7 +1001,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             s_sm_world[2][3] = 1.0f;
         }
     }
-    pfx_sprites_stand(sc, aspect);
+    pfx_sprites_stand(sc, aspect, L);
     {   /* u_ss.x 0: sprite shadows off (no casters, no shading; the game's blobs stay) */
         const float *ss = pfx_pass_uniform(ps, "u_ss");
         s_spr_ss = !(ss && ss[0] < 0.5f);
