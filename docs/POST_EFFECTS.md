@@ -134,18 +134,30 @@ one (a part in another page or CLUT) joins a sprite only when it touches one
 of that sprite's runs and its middle is within that sprite's columns, so HUD
 panels and texts above or beside a character never stand there. A sprite is
 stood upright where its lowest drawn pixel meets the floor (a plane facing
-the camera across the floor), each piece along its own view ray. A 3/4
-pose's back foot, drawn higher on the picture, would float on that plane: a
-raised foot (a separate bump of the bottom profile, within its bottom fifth)
-gets its leg bent back, smoothly over the rows above it, to where it meets
-the floor, as extra casters and in the `sprite` depth (so it never shades
-itself). Its cut-out is copied from VRAM as it is drawn (a game may load
-the next animation's pieces before the picture is shown). Translucent pieces
-(dust, glows) neither cast nor take shadows, and the game's own blob (a
-translucent flat quad centred on a foot point) is not drawn. A chain that
-reads `sprite` gets each pixel's sprite view depth (60000 = none), so the
-sprites themselves can be shaded: `sun-out.glsl` gives them, in shadow, the
-darkening the ground takes, and nothing in the sun.
+the camera across the floor), each piece along its own view ray. When the
+light comes across the picture (in that plane, as in BoF4's battles) a
+sprite would cast a line: the plane then turns about the up axis just enough
+that the level light meets it at a cosine of 0.7 (its shadow keeps 70% of
+its width). Feet drawn off that plane (a 3/4 pose's back foot, feet to one
+side of a turned plane) would float or sink: every column whose bottom is a
+foot's (within the bottom fifth, 3 columns wide or more, so not a staff's
+tip) gets its lower pixels bent, smoothly over the rows above, to where that
+bottom meets the floor, as extra casters (a pixel wider each side, no gaps)
+and in the `sprite` depth. Its cut-out is copied from VRAM as it is drawn (a
+game may load the next animation's pieces before the picture is shown).
+Translucent pieces (dust, glows) neither cast nor take shadows. The game's
+own blob is not drawn: a translucent flat quad centred on a foot point, or
+(blobs painted into the sprite's own picture, BoF4's battles) the near-black
+CLUT entry that is a quarter or more of an opaque quad holding a foot point.
+That palette's entry is learnt, and every quad using that palette within the
+band round that sprite's foot rows draws with it see-through (written to 0
+in VRAM for that one draw, then put back), so the feet away from the point
+in an attack pose or a tail lose it too, while eyes higher up keep it. A
+chain that reads `sprite` gets each pixel's sprite view depth (60000 =
+none), so the sprites themselves can be shaded: `sun-out.glsl` gives them,
+in shadow, the darkening the ground takes, and nothing in the sun; they
+take shadow from the scenery only (never from a sprite, their own bent feet
+included).
 
 ```toml
 [video.shadow]
@@ -181,8 +193,9 @@ sprite foot points are the single RTPS with the camera whose `ra` repeats
 once per character (BoF4: two calls per sprite, same point).
 
 TCP: `shadow_cache` (state: camera, matches, world triangles, memory, sprite
-runs: at their foot point / touching one that is / none, `sprite_bent`: raised
-feet bent down), `sprite_dump` (the picture's
+runs: at their foot point / touching one that is / none, `sprite_bent`: sprites
+with feet bent down; `blobs`: blob quads hidden and draws with a blob colour
+see-through), `sprite_dump` (the picture's
 foot points and 2D pieces),
 `shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
 microseconds per stage and pass).
