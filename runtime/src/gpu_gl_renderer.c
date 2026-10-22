@@ -821,6 +821,7 @@ static unsigned s_sc_use = 0;
 /* Sprite shadows (a chain reads `sprite`): the foot points projected since the
  * last frame began, taken by the next frame to start. */
 static int      s_spr_on = 0;
+static int      s_spr_ss = 1;      /* the reading pass's u_ss.x: sprite shadows on (off: the game's own blobs stay) */
 static unsigned s_spr_frames = 0, s_spr_last = 0;   /* frames with sprite casters; pieces in the last one */
 static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, touching one that is, none */
 static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
@@ -1295,7 +1296,7 @@ void gl_renderer_shadow_anchor(const float w[3]) {
     }
     anchor_apply(w);
 }
-int gl_renderer_shadow_sprites_wanted(void) { return s_spr_on; }
+int gl_renderer_shadow_sprites_wanted(void) { return s_spr_on && s_spr_ss; }
 /* Recorded with the drawing on a render thread (RTH_FCAM), so the triangles
  * after it get it and the emulation thread never waits. */
 void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {

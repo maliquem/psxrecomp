@@ -439,6 +439,10 @@ static int s_sm_size = 0;   /* allocated size */
 static GLuint s_sm_tex = 0, s_sm_fbo = 0, s_sm_prog = 0, s_sm_vao = 0, s_sm_vbo = 0;
 static GLint  s_sm_uvram = -1;
 static float  s_sm_u[4][4];
+/* The sprites' own map (`sprshadow`): same light, size and mapping as the
+ * scenery's, so a reader can soften the scenery's shadows and keep the
+ * sprites' pixel-art silhouettes sharp. */
+static GLuint s_sm2_tex = 0, s_sm2_fbo = 0;
 static float  s_sm_world[3][4];   /* u_world, u_worldup, u_shadowdir (view space, y up; w 1 = set) */
 static float *s_sm_buf = NULL; static int s_sm_cap = 0;
 /* Sprites standing in the scene (gl_renderer_shadow_anchor): their pieces as
@@ -856,6 +860,19 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
         p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm_tex, 0);
         glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+        glGenTextures(1, &s_sm2_tex);
+        glBindTexture(GL_TEXTURE_2D, s_sm2_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
+                     0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glGenFramebuffers(1, &s_sm2_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm2_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm2_tex, 0);
+        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
         /* Transparent texels (raw 0) cast no shadow, as they draw nothing:
          * the fetch is the textured shader's (page, CLUT, window). */
 #define SM_VS_HEAD \
@@ -914,9 +931,11 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         int want = SM_SIZE;
         if (rq && rq[0] > 0.0f) { want = 1024; while (want < 8192 && (float)want < rq[0] * 0.75f) want *= 2; }
         if (want != s_sm_size) {
-            glBindTexture(GL_TEXTURE_2D, s_sm_tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, want, want, 0,
-                         0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+            for (int t = 0; t < 2; t++) {
+                glBindTexture(GL_TEXTURE_2D, t ? s_sm2_tex : s_sm_tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, want, want, 0,
+                             0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+            }
             glBindTexture(GL_TEXTURE_2D, 0);
             s_sm_size = want;
         }
@@ -960,6 +979,11 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         }
     }
     pfx_sprites_stand(sc, aspect);
+    {   /* u_ss.x 0: sprite shadows off (no casters, no shading; the game's blobs stay) */
+        const float *ss = pfx_pass_uniform(ps, "u_ss");
+        s_spr_ss = !(ss && ss[0] < 0.5f);
+        if (!s_spr_ss) { s_spr_n = s_spr_nx = 0; }
+    }
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0, nbase_all = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
@@ -1078,10 +1102,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     }
     GLboolean dmask = GL_TRUE;
     glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
     glViewport(0, 0, s_sm_size, s_sm_size);
     glDepthMask(GL_TRUE);
     glClearDepth(1.0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm2_fbo);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
     glClear(GL_DEPTH_BUFFER_BIT);
     if (n > 0 && x1 > x0 && y1 > y0 && d1 > d0) {
         const float sx = 1.0f / (x1 - x0), sy = 1.0f / (y1 - y0), sd = 1.0f / (d1 - d0);
@@ -1104,7 +1130,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         p_glActiveTexture(PSXGL_TEXTURE0);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
-        glDrawArrays(GL_TRIANGLES, 0, n);
+        const int nsc = n < nbase_all ? n : nbase_all;   /* the scenery; then the sprites */
+        if (nsc > 0) glDrawArrays(GL_TRIANGLES, 0, nsc);
+        if (n > nsc) {
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm2_fbo);
+            glDrawArrays(GL_TRIANGLES, nsc, n - nsc);
+        }
         glDisable(GL_DEPTH_TEST);
         p_glActiveTexture(PSXGL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1280,6 +1311,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                            : (from == PFX_IN_MASK || from == PFX_IN_MASK3D) ? s_mask_tex
                            : from == PFX_IN_DEPTH ? s_dep_tex
                            : from == PFX_IN_SHADOW ? s_sm_tex
+                           : from == PFX_IN_SPRSHADOW ? s_sm2_tex
                            : from == PFX_IN_SPRITE ? s_spr_tex
                            : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
