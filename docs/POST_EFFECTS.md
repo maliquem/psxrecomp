@@ -33,7 +33,7 @@ touches.
 pfx 1                              # required first line
 pass <name>                        # the last pass writes the window
   shader <file.glsl|builtin:name>  # file paths resolve next to the preset
-  input <sampler> <source|source_down|mask|previous|<earlier pass>>
+  input <sampler> <source|source_down|mask|mask3d|depth|shadow|sprite|previous|<earlier pass>>   # up to 6
   scale <f>                        # target size as a fraction of the game rect (default 1)
   format rgba8|rgba16f             # default rgba8
   filter linear|nearest            # how later passes sample this target
@@ -94,8 +94,9 @@ even next to a lamp.
 
 ## The shadow input and `[video.shadow]`
 
-`shadow` is a 2048² depth map of the scene seen from a light the reading pass
-gives (`u_sun` azimuth/elevation in degrees, or `u_shadowdir`). A pass that
+`shadow` is a depth map of the scene seen from a light the reading pass
+gives (`u_sun` azimuth/elevation in degrees, or `u_shadowdir`), 2048² or the
+size the pass's `u_smsize` asks (1024..8192, a power of two). A pass that
 reads it also gets `u_smx`, `u_smy`, `u_smz`, `u_sms` (where a view-space
 point lands in the map) and, when the camera is known, `u_world`,
 `u_worldup` and `u_shadowdir` (the world's axes and the light in view space,
@@ -117,6 +118,23 @@ The casters, best source first:
 Faces the game culls (back-facing after RTPT) are kept as shadow-only casters
 in 2 and 3, so a closed object casts a whole shadow.
 
+**Sprites** (with `sprite_anchors` and `camera = "ram:..."`): a 2D game draws
+a character as flat pieces around a foot point it projects with one RTPS.
+The calls that do it are named by their return address; at each one the
+foot point is taken in the view space of the camera projecting it and sent
+in drawing order, so the pieces drawn next (that frame's) stand on it. One
+sprite = its opaque pieces from one texture page and CLUT that touch, in any
+drawing order (games sort by depth, so two sprites' pieces interleave); it
+goes to the foot point at its bottom and is stood upright there (a plane
+through the point facing the camera across the floor), each piece along its
+own view ray. Its cut-out is copied from VRAM as it is drawn (a game may load
+the next animation's pieces before the picture is shown). Translucent pieces
+(dust, glows) neither cast nor take shadows, and the game's own blob (a
+translucent flat quad centred on a foot point) is not drawn. A chain that
+reads `sprite` gets each pixel's sprite view depth (60000 = none), so the
+sprites themselves can be shaded: `sun-out.glsl` gives them, in shadow, the
+darkening the ground takes, and nothing in the sun.
+
 ```toml
 [video.shadow]
 camera = "ram:0x801381BC"   # the game's camera MATRIX (9 x s16 R, pad, 3 x s32 T);
@@ -124,7 +142,12 @@ camera = "ram:0x801381BC"   # the game's camera MATRIX (9 x s16 R, pad, 3 x s32 
 overdraw = [64, 64]         # px past the picture the game's screen culls keep (memory only)
 scene_keys = ["0xADDR:4"]   # guest RAM whose change starts a new scene (memory only)
 hide_textures = ["0x46:0x7c43", "0x149:*"]   # page:CLUT of the game's own blob shadows
+sprite_anchors = ["0x80141FA0", "0x80141FD8"]   # return addresses of the foot-point RTPS calls
 ```
+
+The Sun presets (`shaders/hd2d/sun*.pfx`) differ only in shadow detail:
+`sun-low` (480 lines), `sun` (960 lines), `sun-high` (1.5x the picture, a
+4096 map). A pass may read up to 6 inputs.
 
 With `camera = "ram:..."`, before each projection a GTE rotation +
 translation not met yet is compared with the MATRIX in RAM; equal, it is the
@@ -137,9 +160,13 @@ Finding them for a new game (TCP, see TCP_COMMANDS.md): `gte_ring_dump` on a
 full frame groups projections by `ra` and matrix; the matrix most projections
 share is the camera, and searching RAM for its R (9 x s16) and T (3 x s32)
 gives the MATRIX address. `disasm` at the busiest site shows how the vertices
-are built (BoF4: a height grid, see the game's `src/bof4_world.c`).
+are built (BoF4: a height grid, see the game's `src/bof4_world.c`). The
+sprite foot points are the single RTPS with the camera whose `ra` repeats
+once per character (BoF4: two calls per sprite, same point).
 
-TCP: `shadow_cache` (state: camera, matches, world triangles, memory),
+TCP: `shadow_cache` (state: camera, matches, world triangles, memory, sprite
+runs: at their foot point / by column / none), `sprite_dump` (the picture's
+foot points and 2D pieces),
 `shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
 microseconds per stage and pass).
 
