@@ -106,6 +106,13 @@ runs unless an active chain reads `shadow`. `sprshadow` is the same map
 can soften the scenery's shadow edges and keep the sprites' pixel-art
 silhouettes sharp; the reading pass's `u_ss` x 0 leaves it empty and turns
 sprites off altogether (no casters, no shading, the game's own blobs stay).
+`u_ss` y is the shaders' own: the Sun presets light the scenery at 1 and, at
+0, keep its colours and only darken where a sprite's shadow falls (the
+sprites' shadows alone, a menu's "GI Off, SS On").
+
+While a texture `off_textures` names was drawn in the last few VBlanks (a
+world map's paper or frame: no place under the sun), every stage whose chain
+reads `shadow` is skipped (`gpu_shadow_off_active`), whatever loaded it.
 
 The casters, best source first:
 
@@ -120,7 +127,16 @@ The casters, best source first:
 3. **The frame's own triangles** only.
 
 Faces the game culls (back-facing after RTPT) are kept as shadow-only casters
-in 2 and 3, so a closed object casts a whole shadow.
+with the frame's triangles, so a closed object casts a whole shadow. The
+winding alone says culled, so a routine that draws faces either way round (a
+bush's leaf cards) would cast each card seen from behind whole, over its
+cut-out, and each card it does not draw (off the picture) whole too. The
+faces taken are kept for the last 3 VBlanks that took any, by their GTE
+screen corners and the return address of their projections; a textured
+polygon drawn with all three corners of one marks that routine as drawing
+both windings, and its faces are not taken again (learned for the session;
+`shadow_cache` reports `two_sided`). A closed object's routine never draws
+its far side, so it keeps them.
 
 **Sprites** (with `sprite_anchors` and `camera = "ram:..."`): a 2D game draws
 a character as flat pieces around a foot point it projects with one RTPS.
@@ -129,10 +145,12 @@ foot point is taken in the view space of the camera projecting it and sent
 in drawing order, so the pieces drawn next (that frame's) stand on it. One
 sprite = its opaque pieces from one texture page and CLUT that touch, in any
 drawing order (games sort by depth, so two sprites' pieces interleave); it
-goes to the foot point at its bottom, in its columns. A run that is not at
-one (a part in another page or CLUT) joins a sprite only when it touches one
-of that sprite's runs and its middle is within that sprite's columns, so HUD
-panels and texts above or beside a character never stand there. A sprite is
+goes to the foot point at its bottom, in its columns, near its middle (within
+0.3 of its width + 12 px). A run that is not at one (a part in another page
+or CLUT) joins a sprite only when it touches one of that sprite's runs, its
+middle is within that sprite's columns and it is no wider than the sprite +
+8 px, so HUD panels and texts above or beside a character never stand there.
+Nothing under 12 px tall stands (a world map's markers). A sprite is
 stood upright where its lowest drawn pixel meets the floor (a plane facing
 the camera across the floor), each piece along its own view ray. When the
 light comes across the picture (in that plane, as in BoF4's battles) a
@@ -166,6 +184,7 @@ camera = "ram:0x801381BC"   # the game's camera MATRIX (9 x s16 R, pad, 3 x s32 
 overdraw = [64, 64]         # px past the picture the game's screen culls keep (memory only)
 scene_keys = ["0xADDR:4"]   # guest RAM whose change starts a new scene (memory only)
 hide_textures = ["0x46:0x7c43", "0x149:*"]   # page:CLUT of the game's own blob shadows
+off_textures = ["0x1e:0x3dc0", "*:0x3e00"]   # page:CLUT only a sunless screen draws (no shadow effects)
 sprite_anchors = ["0x80141FA0", "0x80141FD8"]   # return addresses of the foot-point RTPS calls
 ```
 
