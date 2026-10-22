@@ -474,7 +474,7 @@ static int spr_ground(float x, float y, float au, const float *u, float *G) {
     for (int k = 0; k < 3; k++) G[k] = t * d[k];
     return 1;
 }
-enum { SPR_COLS = 136, SPR_ZONE = 64, SPR_FOOT_MIN = 3 };
+enum { SPR_COLS = 136, SPR_ZONE = 64, SPR_FOOT_MIN = 3, SPR_MIN_H = 12 };
 /* A sprite's bottom, from its cut-outs: col, the lowest drawn pixel of each
  * picture column (native px from the centre, below the pixel; X0 the first
  * column, W of them); mask, its drawn pixels in the SPR_ZONE rows above Yb
@@ -684,11 +684,11 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         }
     }
     /* Each run: its box, lowest drawn row and foot point. A run whose bottom
-     * is at a foot point, in its columns, is that sprite's (direct). A run
+     * is at a foot point, near its middle, is that sprite's (direct). A run
      * that is not (a part cut off from its sprite: another page or CLUT)
-     * joins a sprite only when it touches one of its runs and its middle is
-     * within that sprite's columns, so the HUD's panels and texts above or
-     * beside a character never stand there. */
+     * joins a sprite only when it touches one of its runs, its middle is
+     * within that sprite's columns and it is no wider, so the HUD's panels,
+     * texts and labels above or beside a character never stand there. */
     static float rb[SPR_MAXP][5];   /* bx0, bx1, by0, by1, ob */
     static int   rq[SPR_MAXP];      /* foot point, -1 none */
     static uint8_t rdir[SPR_MAXP];  /* 1 = at its foot point */
@@ -711,6 +711,9 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         float bs = 1e30f;
         for (int q = 0; q < na; q++) {
             if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f || b[3] < AS[q][1] - 8.0f || b[3] > AS[q][1] + 20.0f) continue;
+            /* near its middle (a character's feet), not at one end (a route or
+             * a line drawn from the character, as on the world map) */
+            if (fabsf(cx - AS[q][0]) > 0.3f * (b[1] - b[0]) + 12.0f) continue;
             const float s = fabsf(b[3] - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
             if (s < bs) { bs = s; rq[r] = q; }
         }
@@ -732,6 +735,8 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
                 const float *c = rb[o];
                 if (b[0] > c[1] + 2.0f || b[1] < c[0] - 2.0f || b[2] > c[3] + 2.0f || b[3] < c[2] - 2.0f) continue;
                 if (cx < ax[q][0] - 4.0f || cx > ax[q][1] + 4.0f || b[3] > AS[q][1] + 10.0f) continue;
+                /* no wider than that sprite (a name label or balloon over it) */
+                if (b[1] - b[0] > ax[q][1] - ax[q][0] + 8.0f) continue;
                 rq[r] = q; added = 1;
             }
         }
@@ -744,6 +749,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         const int best = rq[r];
         s_spr_runs[best < 0 ? 2 : rdir[r] ? 0 : 1]++;
         if (best < 0) continue;
+        if (by1 - by0 < SPR_MIN_H) continue;   /* a marker or icon (a map's), not a figure */
         /* It stands where its lowest drawn row meets the floor at its foot
          * point's height (a front foot drawn below the foot point would be
          * under the floor on a plane through the point, its shadow lost). */
