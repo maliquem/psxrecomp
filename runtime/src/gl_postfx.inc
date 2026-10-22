@@ -459,6 +459,149 @@ static int spr_root(int *par, int i) {
     while (par[i] != i) i = par[i] = par[par[i]];
     return i;
 }
+/* Where the picture point (x, y) (native px from the centre, y down) meets the
+ * floor at height au along the world up u (view space, y up): 0 if never. */
+static int spr_ground(float x, float y, float au, const float *u, float *G) {
+    const float d[3] = {x / s_cam_h, -y / s_cam_h, 1.0f};
+    const float du = d[0] * u[0] + d[1] * u[1] + d[2] * u[2];
+    if (fabsf(du) < 1e-4f) return 0;
+    const float t = au / du;
+    if (t <= 0.0f) return 0;
+    for (int k = 0; k < 3; k++) G[k] = t * d[k];
+    return 1;
+}
+enum { SPR_COLS = 136, SPR_ZONE = 64 };
+/* A sprite's bottom, from its cut-outs: col, the lowest drawn pixel of each
+ * picture column (native px from the centre, below the pixel; X0 the first
+ * column, W of them); mask, its drawn pixels in the SPR_ZONE rows above Yb
+ * (row k = VRAM row Yb - 1 - k); lo, its lowest; a raised foot (bl..bh, -1 =
+ * none): its columns, rb its bottom, xb its middle. */
+typedef struct { int X0, W, Yb, bl, bh; float lo, rb, xb; float col[SPR_COLS]; uint8_t mask[SPR_ZONE][SPR_COLS]; } SprFoot;
+/* Raised feet bent down to the floor: as casters (s_spr_xc) and on the
+ * picture (s_spr_xs, drawn over the standing pieces' depth: the foot takes
+ * light where its bent copy is, never shading itself). */
+static float *s_spr_xc = NULL, *s_spr_xs = NULL; static int s_spr_nx = 0, s_spr_xcap = 0;
+static float  s_spr_kx = 0.0f, s_spr_ky = 0.0f;
+/* The bottom of sprite r (pieces i with root r) into f, and its raised foot:
+ * the lowest drawn pixel stands on the floor; a raised foot is a separate
+ * bump (a higher column between them) within the bottom fifth, on the side
+ * whose support line from the lowest is flattest (a 3/4 pose's back foot).
+ * 1 = there is one. */
+static int spr_feet(const ScSlot *sc, const int *ids, int *par, int r, int m,
+                    float bx0, float bx1, float by0, float ob, SprFoot *f) {
+    f->bl = f->bh = -1;
+    if (!sc->atl) return 0;
+    const int X0 = (int)floorf(bx0 + s_sc_cx), W = (int)ceilf(bx1 + s_sc_cx) - X0;
+    if (W < 3 || W > SPR_COLS) return 0;
+    float *col = f->col;
+    const int Yb = (int)lroundf(ob + s_sc_cy);
+    f->X0 = X0; f->W = W; f->Yb = Yb;
+    memset(f->mask, 0, sizeof f->mask);
+    for (int x = 0; x < W; x++) col[x] = -1e30f;
+    for (int i = r; i < m; i++) {
+        if (spr_root(par, i) != r) continue;
+        const float *v = sc->sv + (size_t)ids[i] * 3 * SC_V;
+        if (v[9] != 3.0f) continue;
+        const float x0 = v[0], y0 = v[1], x1 = v[SC_V], y1 = v[SC_V + 1], x2 = v[2 * SC_V], y2 = v[2 * SC_V + 1];
+        const float ar = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if (fabsf(ar) < 1e-3f) continue;
+        const int px0 = (int)floorf(fminf(x0, fminf(x1, x2))), px1 = (int)ceilf(fmaxf(x0, fmaxf(x1, x2)));
+        const int py0 = (int)floorf(fminf(y0, fminf(y1, y2))), py1 = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
+        for (int Y = py0; Y < py1; Y++)
+            for (int X = px0; X < px1; X++) {
+                if (X - X0 < 0 || X - X0 >= W) continue;
+                const float px = X + 0.5f, py = Y + 0.5f;
+                const float w1 = ((px - x0) * (y2 - y0) - (x2 - x0) * (py - y0)) / ar;
+                const float w2 = ((x1 - x0) * (py - y0) - (px - x0) * (y1 - y0)) / ar;
+                const float w0 = 1.0f - w1 - w2;
+                if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) continue;
+                const int tu = (int)floorf(w0 * v[3] + w1 * v[SC_V + 3] + w2 * v[2 * SC_V + 3]);
+                const int tv = (int)floorf(w0 * v[4] + w1 * v[SC_V + 4] + w2 * v[2 * SC_V + 4]);
+                if (tu < 0 || tv < 0 || tu >= SC_ATL || tv >= SC_ATL || !sc->atl[(size_t)tv * SC_ATL + tu]) continue;
+                const float b = (float)(Y + 1) - s_sc_cy;
+                if (b > col[X - X0]) col[X - X0] = b;
+                if (Yb - 1 - Y >= 0 && Yb - 1 - Y < SPR_ZONE) f->mask[Yb - 1 - Y][X - X0] = 1;
+            }
+    }
+    float lo = -1e30f;
+    for (int x = 0; x < W; x++) lo = fmaxf(lo, col[x]);
+    if (lo < -1e29f || fabsf(lo - ob) > 4.0f) return 0;
+    f->lo = lo;
+    const float band = fminf(14.0f, fmaxf(3.0f, 0.2f * (lo - by0)));
+    int aL = -1, aR = -1;
+    for (int x = 0; x < W; x++) if (col[x] >= lo - 0.5f) { if (aL < 0) aL = x; aR = x; }
+    float bs = -1e30f; int bx = -1;
+    for (int side = 0; side < 2; side++) {
+        const int a = side ? aR : aL, step = side ? 1 : -1;
+        float dip = 1e30f;   /* highest bottom (smallest) passed since a */
+        for (int x = a + step; x >= 0 && x < W; x += step) {
+            if (col[x] < lo - band || col[x] <= dip + 1.0f) { dip = fminf(dip, col[x]); continue; }
+            const float s = (col[x] - lo) / (float)abs(x - a);
+            if (abs(x - a) >= 2 && s > bs) { bs = s; bx = x; }
+            dip = fminf(dip, col[x]);
+        }
+    }
+    if (bx < 0) return 0;
+    /* the raised foot: the columns of its flat bottom */
+    int l = bx, h = bx;
+    while (l > 0 && fabsf(col[l - 1] - col[bx]) <= 1.0f) l--;
+    while (h < W - 1 && fabsf(col[h + 1] - col[bx]) <= 1.0f) h++;
+    f->bl = l; f->bh = h; f->rb = col[bx];
+    f->xb = (float)X0 + 0.5f * (float)(l + h + 1) - s_sc_cx;
+    return 1;
+}
+/* A raised foot bent down to the floor, as extra casters: its leg's drawn
+ * pixels over the zone above it (its columns, a pixel either side, not the
+ * standing foot's) go back from the sprite's plane (na_d along nrm) toward
+ * one through where the foot meets the floor (na_b), smoothly from none at
+ * the zone's top to all of it at the foot. The leg's shadow stretches to
+ * meet the foot; the sprite's own pieces still cast as they stand. */
+static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float na_b, float height) {
+    const float h = s_cam_h, rise = f->lo - f->rb;
+    if (na_b <= na_d || rise <= 0.0f) return;
+    float hb = fminf(fmaxf(3.0f * rise, 6.0f), 0.4f * height);
+    hb = fminf(hb, (float)SPR_ZONE - rise - 1.0f);
+    if (hb < 2.0f) return;
+    const float top = f->rb - hb;
+    const int c0 = f->bl > 0 ? f->bl - 1 : 0, c1 = f->bh < f->W - 1 ? f->bh + 1 : f->W - 1;
+    for (float y = top; y < f->rb - 0.5f; y += 1.0f) {
+        const int k = f->Yb - 1 - (int)lroundf(y + s_sc_cy);
+        if (k < 0 || k >= SPR_ZONE) continue;
+        for (int x = c0; x <= c1; x++) {
+            if (!f->mask[k][x] || f->col[x] >= f->lo - 0.5f) continue;
+            int e = x;
+            while (e + 1 <= c1 && f->mask[k][e + 1] && f->col[e + 1] < f->lo - 0.5f) e++;
+            if (s_spr_nx + 6 > s_spr_xcap) {
+                const int nc = s_spr_xcap ? s_spr_xcap * 2 : 1536;
+                float *p = (float *)realloc(s_spr_xc, (size_t)nc * SC_V * sizeof(float));
+                if (p) s_spr_xc = p;
+                float *q = (float *)realloc(s_spr_xs, (size_t)nc * SC_V * sizeof(float));
+                if (q) s_spr_xs = q;
+                if (!p || !q) return;
+                s_spr_xcap = nc;
+            }
+            const float xl = (float)(f->X0 + x) - s_sc_cx, xr = (float)(f->X0 + e + 1) - s_sc_cx;
+            const float qx[6] = {xl, xr, xr, xl, xr, xl}, qy[6] = {y, y, y + 1.0f, y, y + 1.0f, y + 1.0f};
+            for (int j = 0; j < 6; j++) {
+                const float d[3] = {qx[j] / h, -qy[j] / h, 1.0f};
+                const float den = nrm[0] * d[0] + nrm[1] * d[1] + nrm[2] * d[2];
+                float t = (qy[j] - top) / hb;
+                t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+                t = t * t * (3.0f - 2.0f * t);
+                const float z = (na_d + (na_b - na_d) * t) / den;
+                float *c = s_spr_xc + (size_t)(s_spr_nx + j) * SC_V;
+                memset(c, 0, SC_V * sizeof(float));
+                c[0] = d[0] * z; c[1] = d[1] * z; c[2] = z; c[9] = -1.0f;   /* solid */
+                float *o = s_spr_xs + (size_t)(s_spr_nx + j) * SC_V;
+                memcpy(o, c, SC_V * sizeof(float));
+                o[0] = qx[j] * s_spr_kx; o[1] = -qy[j] * s_spr_ky;
+            }
+            s_spr_nx += 6;
+            x = e;
+        }
+    }
+    s_spr_bent++;
+}
 /* The frame's 2D pieces standing at its sprites' foot points: the pieces of
  * one sprite (a run drawn together, see below) go to the foot point at their
  * bottom, and each is put on that sprite's upright plane (through the foot
@@ -466,7 +609,7 @@ static int spr_root(int *par, int i) {
  * vertices, as casters in view space (s_spr_cast) and on the picture
  * (s_spr_scr: clip x, y, view z). */
 static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
-    s_spr_n = 0;
+    s_spr_n = 0; s_spr_nx = 0;
     if (!s_spr_on || !sc || !s_cam_ok || sc->nanc <= 0 || sc->sn <= 0 || s_sm_world[1][3] < 0.5f) return;
     float AP[SC_ANC_MAX][3], AS[SC_ANC_MAX][2];
     int na = 0;
@@ -491,6 +634,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
         s_spr_cap = sc->sn * 3;
     }
     const float h = s_cam_h, kx = 1.0f / (120.0f * aspect), ky = 1.0f / 120.0f;
+    s_spr_kx = kx; s_spr_ky = ky;
     /* One sprite = its opaque pieces from one texture page and CLUT that touch
      * one another, in whatever order they were drawn (the game sorts by depth,
      * so two sprites' pieces interleave). Translucent pieces (dust, glows, the
@@ -521,34 +665,81 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
             if (a != c) par[c] = a;
         }
     }
+    /* Each run: its box, lowest drawn row and foot point. A run whose bottom
+     * is at a foot point, in its columns, is that sprite's (direct). A run
+     * that is not (a part cut off from its sprite: another page or CLUT)
+     * joins a sprite only when it touches one of its runs and its middle is
+     * within that sprite's columns, so the HUD's panels and texts above or
+     * beside a character never stand there. */
+    static float rb[SPR_MAXP][5];   /* bx0, bx1, by0, by1, ob */
+    static int   rq[SPR_MAXP];      /* foot point, -1 none */
+    static uint8_t rdir[SPR_MAXP];  /* 1 = at its foot point */
+    float ax[SC_ANC_MAX][2];        /* each foot point's direct runs: columns */
+    for (int q = 0; q < na; q++) { ax[q][0] = 1e30f; ax[q][1] = -1e30f; }
     for (int r = 0; r < m; r++) {
+        rq[r] = -1; rdir[r] = 0;
         if (spr_root(par, r) != r) continue;
-        float bx0 = 1e30f, bx1 = -1e30f, by0 = 1e30f, by1 = -1e30f;
+        float *b = rb[r];
+        b[0] = b[2] = 1e30f; b[1] = b[3] = b[4] = -1e30f;
         for (int i = r; i < m; i++)
             if (spr_root(par, i) == r) {
-                bx0 = fminf(bx0, box[i][0]); bx1 = fmaxf(bx1, box[i][1]);
-                by0 = fminf(by0, box[i][2]); by1 = fmaxf(by1, box[i][3]);
+                b[0] = fminf(b[0], box[i][0]); b[1] = fmaxf(b[1], box[i][1]);
+                b[2] = fminf(b[2], box[i][2]); b[3] = fmaxf(b[3], box[i][3]);
+                if (sc->sb && sc->sb[ids[i]] > -1e29f) b[4] = fmaxf(b[4], sc->sb[ids[i]] - s_sc_cy);
             }
-        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;   /* panels, not a sprite */
-        /* its foot point: at its bottom, in its columns (else, a part cut off
-         * from its sprite: the foot point below it in the same column) */
-        const float cx = 0.5f * (bx0 + bx1);
-        int best = -1; float bs = 1e30f;
+        if (b[4] < -1e29f) b[4] = b[3];   /* its lowest drawn pixel row (else its box) */
+        if (b[1] - b[0] > 128.0f || b[3] - b[2] > 192.0f) continue;   /* panels, not a sprite */
+        const float cx = 0.5f * (b[0] + b[1]);
+        float bs = 1e30f;
         for (int q = 0; q < na; q++) {
-            if (AS[q][0] < bx0 - 8.0f || AS[q][0] > bx1 + 8.0f || by1 < AS[q][1] - 8.0f || by1 > AS[q][1] + 20.0f) continue;
-            const float s = fabsf(by1 - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
-            if (s < bs) { bs = s; best = q; }
+            if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f || b[3] < AS[q][1] - 8.0f || b[3] > AS[q][1] + 20.0f) continue;
+            const float s = fabsf(b[3] - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
+            if (s < bs) { bs = s; rq[r] = q; }
         }
-        s_spr_runs[best < 0 ? 1 : 0]++;
-        if (best < 0)
-            for (int q = 0; q < na; q++) {
-                const float dx = fabsf(cx - AS[q][0]);
-                if (dx > 48.0f || by1 > AS[q][1] + 10.0f || by0 < AS[q][1] - 160.0f) continue;
-                const float s = 1000.0f + dx + 0.25f * fabsf(by1 - AS[q][1]);
-                if (s < bs) { bs = s; best = q; }
+        if (rq[r] >= 0) {
+            rdir[r] = 1;
+            ax[rq[r]][0] = fminf(ax[rq[r]][0], b[0]); ax[rq[r]][1] = fmaxf(ax[rq[r]][1], b[1]);
+        }
+    }
+    for (int pass = 0; pass < 3; pass++) {   /* parts touching parts that joined */
+        int added = 0;
+        for (int r = 0; r < m; r++) {
+            if (spr_root(par, r) != r || rq[r] >= 0) continue;
+            const float *b = rb[r];
+            if (b[1] - b[0] > 128.0f || b[3] - b[2] > 192.0f) continue;
+            const float cx = 0.5f * (b[0] + b[1]);
+            for (int o = 0; o < m && rq[r] < 0; o++) {
+                const int q = rq[o];
+                if (o == r || q < 0 || spr_root(par, o) != o) continue;
+                const float *c = rb[o];
+                if (b[0] > c[1] + 2.0f || b[1] < c[0] - 2.0f || b[2] > c[3] + 2.0f || b[3] < c[2] - 2.0f) continue;
+                if (cx < ax[q][0] - 4.0f || cx > ax[q][1] + 4.0f || b[3] > AS[q][1] + 10.0f) continue;
+                rq[r] = q; added = 1;
             }
-        if (best < 0) { s_spr_runs[2]++; s_spr_runs[1]--; continue; }
-        const float na_d = nrm[0] * AP[best][0] + nrm[1] * AP[best][1] + nrm[2] * AP[best][2];
+        }
+        if (!added) break;
+    }
+    for (int r = 0; r < m; r++) {
+        if (spr_root(par, r) != r) continue;
+        const float bx0 = rb[r][0], bx1 = rb[r][1], by0 = rb[r][2], by1 = rb[r][3], ob = rb[r][4];
+        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;
+        const int best = rq[r];
+        s_spr_runs[best < 0 ? 2 : rdir[r] ? 0 : 1]++;
+        if (best < 0) continue;
+        /* It stands where its lowest drawn row meets the floor at its foot
+         * point's height (a front foot drawn below the foot point would be
+         * under the floor on a plane through the point, its shadow lost). */
+        float na_d = nrm[0] * AP[best][0] + nrm[1] * AP[best][1] + nrm[2] * AP[best][2];
+        const float au = AP[best][0] * u[0] + AP[best][1] * u[1] + AP[best][2] * u[2];
+        float G[3];
+        if (spr_ground(AS[best][0], ob, au, u, G)) {
+            const float g = nrm[0] * G[0] + nrm[1] * G[1] + nrm[2] * G[2];
+            if (fabsf(g - na_d) < 256.0f) na_d = g;
+        }
+        /* a raised foot (a 3/4 pose's back one) bent down to the floor */
+        static SprFoot sf;
+        if (spr_feet(sc, ids, par, r, m, bx0, bx1, by0, ob, &sf) && spr_ground(sf.xb, sf.rb, au, u, G))
+            spr_bend(&sf, nrm, na_d, nrm[0] * G[0] + nrm[1] * G[1] + nrm[2] * G[2], by1 - by0);
         for (int i = r; i < m; i++) {
             if (spr_root(par, i) != r) continue;
             const float *v = sc->sv + (size_t)ids[i] * 3 * SC_V;
@@ -593,6 +784,10 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
         if (pbo) p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, (GLuint)pbo);
     }
 }
+/* Sprite caster vertex k: the standing pieces, then the bent feet. */
+static const float *spr_caster(int k) {
+    return k < s_spr_n ? s_spr_cast + (size_t)k * SC_V : s_spr_xc + (size_t)(k - s_spr_n) * SC_V;
+}
 /* The `sprite` input: the sprites' view depth on the picture, SPR_NONE elsewhere. */
 static void pfx_sprites_depth(int lw, int lh) {
     if (!s_spr_on || !s_spr_prog || lw <= 0 || lh <= 0) return;
@@ -634,6 +829,10 @@ static void pfx_sprites_depth(int lw, int lh) {
         glDrawArrays(GL_TRIANGLES, 0, s_spr_n);
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
         glDisable(GL_BLEND);
+        if (s_spr_nx > 0) {   /* the bent feet over their standing pixels */
+            p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)s_spr_nx * SC_V * sizeof(float)), s_spr_xs, PSXGL_STREAM_DRAW);
+            glDrawArrays(GL_TRIANGLES, 0, s_spr_nx);
+        }
         p_glActiveTexture(PSXGL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, 0);
         p_glActiveTexture(PSXGL_TEXTURE0);
@@ -762,7 +961,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     }
     pfx_sprites_stand(sc, aspect);
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
-    int n = 0;
+    int n = 0, nbase_all = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
     const int use_store = !use_world && s_cam_ok && s_scc_alive > 0;
     if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
@@ -803,7 +1002,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         /* world geometry first (nw vertices), then the frame's own triangles */
         const int nw = use_world ? s_wg_n * 3 : 0;
         const int nbase = use_store ? npick * 3 : nw + sc->n * 3;   /* then the sprites standing */
-        n = nbase + s_spr_n;
+        n = nbase + s_spr_n + s_spr_nx;
+        nbase_all = nbase;
         if (n > s_sm_cap) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
@@ -816,7 +1016,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             float P[3], scr[2];
             float *o = s_sm_buf + (size_t)i * SC_V;
             if (i >= nbase) {
-                const float *c = s_spr_cast + (size_t)(i - nbase) * SC_V;
+                const float *c = spr_caster(i - nbase);
                 P[0] = c[0]; P[1] = c[1]; P[2] = c[2];
                 scr[0] = s_cam_h * P[0] / P[2]; scr[1] = -s_cam_h * P[1] / P[2];
                 memcpy(o + 3, c + 3, (SC_V - 3) * sizeof(float));
@@ -858,6 +1058,22 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             const float mx = (sx1 - sx0) * 0.03f, my = (sy1 - sy0) * 0.03f;
             x0 = fmaxf(x0, sx0 - mx); x1 = fminf(x1, sx1 + mx);
             y0 = fmaxf(y0, sy0 - my); y1 = fminf(y1, sy1 + my);
+        }
+        /* Sprites stand on the floor: moved toward the light by the bias a
+         * floor receiver uses (sun.glsl: (u_shadow.y Z + 2 texel)(1 + 2(1 -
+         * lambert))), so their shadows start at their feet, not that far off.
+         * A sprite pixel's own bias is larger, so a sprite never shades itself. */
+        const float *shb = pfx_pass_uniform(ps, "u_shadow");
+        if (n > nbase && x1 > x0 && s_sm_world[1][3] > 0.5f) {
+            const float texel = (x1 - x0) / (float)s_sm_size;
+            const float *up = s_sm_world[1];
+            const float lam = fmaxf(0.0f, up[0] * L[0] + up[1] * L[1] + up[2] * L[2]);
+            for (int i = nbase; i < n; i++) {
+                float *o = s_sm_buf + (size_t)i * SC_V;
+                const float z = spr_caster(i - nbase)[2];
+                o[2] += ((shb ? shb[1] : 0.002f) * z + 2.0f * texel) * (1.0f + 2.0f * (1.0f - lam));
+                if (o[2] > d1) d1 = o[2];
+            }
         }
     }
     GLboolean dmask = GL_TRUE;

@@ -814,14 +814,16 @@ enum { SC_ANC_MAX = 64 };
 enum { SC_ATL = 512 };
 typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
                  float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
-                 uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky; } ScSlot;
+                 float *sb;   /* per 2D triangle: VRAM y below its lowest drawn texel row, -1e30 = none known */
+                 uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky, atl_klo, atl_khi; } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
 /* Sprite shadows (a chain reads `sprite`): the foot points projected since the
  * last frame began, taken by the next frame to start. */
 static int      s_spr_on = 0;
 static unsigned s_spr_frames = 0, s_spr_last = 0;   /* frames with sprite casters; pieces in the last one */
-static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, by column only, none */
+static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, touching one that is, none */
+static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
 static float    s_anc_pend[SC_ANC_MAX][3];
 static int      s_anc_pend_n = 0;
 static ScCam    s_fcam;                /* the camera of the triangles being drawn */
@@ -865,11 +867,15 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         const int nc = sl->scap ? sl->scap * 2 : 512;
         float *p = (float *)realloc(sl->sv, (size_t)nc * 3 * SC_V * sizeof(float));
         if (!p) return;
-        sl->sv = p; sl->scap = nc;
+        sl->sv = p;
+        float *b = (float *)realloc(sl->sb, (size_t)nc * sizeof(float));
+        if (!b) return;
+        sl->sb = b; sl->scap = nc;
     }
     /* the piece's cut-out as drawn now: its texel box, through its page, CLUT
-     * and texture window, into the slot's atlas (depth 3 = atlas texel) */
-    int ax = -1, ay = 0, u0 = 255, v0 = 255, u1 = 0, w1 = 0;
+     * and texture window, into the slot's atlas (depth 3 = atlas texel); lo/hi:
+     * its first and last texel rows with something drawn (-1: none) */
+    int ax = -1, ay = 0, u0 = 255, v0 = 255, u1 = 0, w1 = 0, lo = -1, hi = -1;
     const int depth = (int)tex6[4];
     if (s_vram && depth >= 0 && depth <= 2) {
         for (int i = 0; i < 3; i++) {
@@ -879,7 +885,9 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         const int px = (int)tex6[0], py = (int)tex6[1], cx = (int)tex6[2], cy = (int)tex6[3], win = (int)tex6[5];
         const int key[10] = {px, py, cx, cy, depth, win, u0, v0, u1, w1};
         const int w = u1 - u0 + 1, hgt = w1 - v0 + 1;
-        if (!memcmp(key, sl->atl_key, sizeof key)) { ax = sl->atl_kx; ay = sl->atl_ky; }   /* the quad's other half */
+        if (!memcmp(key, sl->atl_key, sizeof key)) {   /* the quad's other half */
+            ax = sl->atl_kx; ay = sl->atl_ky; lo = sl->atl_klo; hi = sl->atl_khi;
+        }
         else if (w > 0 && hgt > 0 && w <= 256 && hgt <= 256) {
             if (!sl->atl) sl->atl = (uint8_t *)malloc((size_t)SC_ATL * SC_ATL);
             if (sl->atl_x + w > SC_ATL) { sl->atl_x = 0; sl->atl_y += sl->atl_h; sl->atl_h = 0; }
@@ -896,9 +904,13 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
                         else if (depth == 1) raw = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((px + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
                         else raw = s_vram[row + ((px + u) & 1023)];
                         sl->atl[(size_t)(ay + t) * SC_ATL + ax + s] = raw ? 255 : 0;
+                        /* the row and column past the far edges (v1, u1 themselves)
+                         * are not drawn: the sheet's next picture may be there */
+                        if (raw && (t < hgt - 1 || hgt == 1) && (s < w - 1 || w == 1)) { if (lo < 0) lo = t; hi = t; }
                     }
                 sl->atl_x += w; if (hgt > sl->atl_h) sl->atl_h = hgt;
                 memcpy(sl->atl_key, key, sizeof key); sl->atl_kx = ax; sl->atl_ky = ay;
+                sl->atl_klo = lo; sl->atl_khi = hi;
             }
         }
     }
@@ -911,6 +923,19 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
             v[3] = (float)(ax + us[i] - u0); v[4] = (float)(ay + vs[i] - v0); v[9] = 3.0f;
         }
     }
+    /* how low on the picture it draws something: below its last drawn row
+     * (its first, when the texture runs upward on screen) */
+    float bottom = -1e30f;
+    if (hi >= 0 && w1 > v0) {
+        int ylo = ys[0], yhi = ys[0], yv0 = ys[0];
+        for (int i = 0; i < 3; i++) {
+            ylo = ys[i] < ylo ? ys[i] : ylo; yhi = ys[i] > yhi ? ys[i] : yhi;
+            if (vs[i] == v0) yv0 = ys[i];
+        }
+        const float s = (float)(yhi - ylo) / (float)(w1 - v0);
+        bottom = yv0 <= ylo ? (float)ylo + (float)(hi + 1) * s : (float)yhi - (float)lo * s;
+    }
+    sl->sb[sl->sn] = bottom;
     sl->sn++;
     sl->use = ++s_sc_use;
 }
@@ -1307,9 +1332,9 @@ int gl_renderer_shadow_cache_stats(char *out, int cap) {
     GL_RT_SYNC("shadow_cache_stats");
     return snprintf(out, (size_t)cap,
         "\"camera\":%d,\"stored\":%d,\"alive\":%d,\"matched\":%llu,\"added\":%llu,\"dropped\":%llu,"
-        "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"sprite_frames\":%u,\"sprite_pieces\":%u,\"sprite_runs\":[%u,%u,%u],\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
+        "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"sprite_frames\":%u,\"sprite_pieces\":%u,\"sprite_runs\":[%u,%u,%u],\"sprite_bent\":%u,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
-        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver, s_spr_frames, s_spr_last, s_spr_runs[0], s_spr_runs[1], s_spr_runs[2],
+        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver, s_spr_frames, s_spr_last, s_spr_runs[0], s_spr_runs[1], s_spr_runs[2], s_spr_bent,
         s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
         scc_log_json(out, cap);
 }
@@ -1334,8 +1359,8 @@ int gl_renderer_sprite_dump_json(char *out, int cap) {
             x0 = fminf(x0, v[j * SC_V] - s_sc_cx); x1 = fmaxf(x1, v[j * SC_V] - s_sc_cx);
             y0 = fminf(y0, v[j * SC_V + 1] - s_sc_cy); y1 = fmaxf(y1, v[j * SC_V + 1] - s_sc_cy);
         }
-        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]", t ? "," : "",
-                      x0, y0, x1, y1, v[5], v[6], v[7], v[8], v[2]);
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f]", t ? "," : "",
+                      x0, y0, x1, y1, v[5], v[6], v[7], v[8], v[2], sl->sb && sl->sb[t] > -1e29f ? sl->sb[t] - s_sc_cy : -999.0f);
     }
     return k + snprintf(out + k, (size_t)(cap - k), "]");
 }
