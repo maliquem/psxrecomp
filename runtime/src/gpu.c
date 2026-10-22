@@ -789,11 +789,12 @@ static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
     return 0;
 }
 static float    sh_last_bad[10];
+static int sh_ts_n;   /* routines that draw both windings (below) */
 int psx_shadow_state(char *out, int cap) {
-    return snprintf(out, (size_t)cap, "\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
+    return snprintf(out, (size_t)cap, "\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
                     "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
                     "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
+                    sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -3901,6 +3902,7 @@ static int32_t draw_offset_x, draw_offset_y;
 enum { SH_BF_MAX = 16384 };
 static float    sh_bf_v[SH_BF_MAX][9];
 static int      sh_bf_area[SH_BF_MAX][4];
+static uint32_t sh_bf_vra[SH_BF_MAX];   /* the routine that projected it (below) */
 static int      sh_bf_n = 0;
 void psx_shadow_backface(const int32_t sxy[3], const uint16_t sz[3]) {
     if (sh_bf_n >= SH_BF_MAX) return;
@@ -3912,7 +3914,63 @@ void psx_shadow_backface(const int32_t sxy[3], const uint16_t sz[3]) {
     }
     sh_bf_area[sh_bf_n][0] = (int)draw_area_left; sh_bf_area[sh_bf_n][1] = (int)draw_area_top;
     sh_bf_area[sh_bf_n][2] = (int)draw_area_right; sh_bf_area[sh_bf_n][3] = (int)draw_area_bottom;
+    sh_bf_vra[sh_bf_n] = 0;
     sh_bf_n++;
+}
+/* Routines that draw both windings. The winding alone takes a face as
+ * culled; a routine that draws its faces either way round (a bush's leaf
+ * cards) would then cast each card it shows from behind twice, once cut out
+ * by its texture and once whole, and the whole outline of each card it does
+ * not draw (off the picture). So the faces taken from a routine (the return
+ * address its GTE projections run under) are kept for the last SH_BFM_GEN
+ * VBlanks that took any (a 30 fps game projects a frame, then draws it a
+ * VBlank or two later), by their screen corners (the GTE's own, which the
+ * game copies into its polygons); a textured polygon drawn with all three
+ * corners of one marks its routine as one that does not cull, and no face
+ * of it is taken again (learned for the session). A closed object's routine
+ * never draws its far side, so its faces stay. */
+enum { SH_TS_MAX = 64, SH_BFM_HASH = 2048, SH_BFM_GEN = 3 };
+static uint32_t sh_ts_ra[SH_TS_MAX];
+static int16_t  sh_bfm_xy[SH_BFM_GEN][SH_BF_MAX][6];   /* [cur] the faces of this VBlank, the others of earlier ones */
+static uint32_t sh_bfm_ra[SH_BFM_GEN][SH_BF_MAX];
+static int      sh_bfm_next[SH_BFM_GEN][SH_BF_MAX];
+static int      sh_bfm_head[SH_BFM_GEN][SH_BFM_HASH];
+static int      sh_bfm_n[SH_BFM_GEN], sh_bfm_cur = 0, sh_bfm_init = 0;
+static unsigned sh_bfm_key(int x, int y) { return ((unsigned)x * 73856093u ^ (unsigned)y * 19349663u) & (SH_BFM_HASH - 1); }
+static int sh_ts_has(uint32_t ra) {
+    for (int i = 0; i < sh_ts_n; i++) if (sh_ts_ra[i] == ra) return 1;
+    return 0;
+}
+static void sh_bfm_reset(int l) {
+    for (int b = 0; b < SH_BFM_HASH; b++) sh_bfm_head[l][b] = -1;
+    sh_bfm_n[l] = 0;
+}
+static void sh_bfm_add(const int32_t sxy[3], uint32_t ra) {
+    if (!sh_bfm_init) { for (int l = 0; l < SH_BFM_GEN; l++) sh_bfm_reset(l); sh_bfm_init = 1; }
+    const int l = sh_bfm_cur, k = sh_bfm_n[l];
+    if (k >= SH_BF_MAX) return;
+    for (int i = 0; i < 3; i++) {
+        sh_bfm_xy[l][k][i * 2] = (int16_t)(sxy[i] & 0xFFFF); sh_bfm_xy[l][k][i * 2 + 1] = (int16_t)(sxy[i] >> 16);
+    }
+    sh_bfm_ra[l][k] = ra;
+    const unsigned h = sh_bfm_key(sh_bfm_xy[l][k][0], sh_bfm_xy[l][k][1]);
+    sh_bfm_next[l][k] = sh_bfm_head[l][h]; sh_bfm_head[l][h] = k;
+    sh_bfm_n[l] = k + 1;
+}
+/* A textured polygon the game draws (n corners, before the draw offset). */
+static void shadow_bf_drawn(const int32_t *vx, const int32_t *vy, int n) {
+    if (!sh_bf_on || !sh_bfm_init) return;
+    for (int l = 0; l < SH_BFM_GEN; l++)
+        for (int c = 0; c < n; c++)
+            for (int k = sh_bfm_head[l][sh_bfm_key((int16_t)vx[c], (int16_t)vy[c])]; k >= 0; k = sh_bfm_next[l][k]) {
+                const int16_t *f = sh_bfm_xy[l][k];
+                if (f[0] != (int16_t)vx[c] || f[1] != (int16_t)vy[c]) continue;
+                int m = 1;
+                for (int i = 1; i < 3; i++)
+                    for (int j = 0; j < n; j++)
+                        if (j != c && f[i * 2] == (int16_t)vx[j] && f[i * 2 + 1] == (int16_t)vy[j]) { m++; break; }
+                if (m == 3 && !sh_ts_has(sh_bfm_ra[l][k]) && sh_ts_n < SH_TS_MAX) sh_ts_ra[sh_ts_n++] = sh_bfm_ra[l][k];
+            }
 }
 /* Called before every RTPS/RTPT (psx_ws_note_gte_project), when the GTE still
  * holds the previous projection's results: a triangle an RTPT left whose
@@ -3923,10 +3981,15 @@ void psx_shadow_backface(const int32_t sxy[3], const uint16_t sz[3]) {
  * contract, so the hook lives here. */
 extern int psx_mod_gte_data(uint32_t out[32]);
 static int sh_bf_prev = 0, sh_bf_prev_back = 0;   /* last projection: 3 = RTPT, 1 = RTPS */
-static void sh_bf_take(const uint32_t *d) {
+static uint32_t sh_bf_prev_ra = 0;                /* its return address */
+static void sh_bf_take(const uint32_t *d, uint32_t ra) {
+    if (sh_ts_has(ra)) return;
     const int32_t sxy[3] = {(int32_t)d[12], (int32_t)d[13], (int32_t)d[14]};
     const uint16_t sz[3] = {(uint16_t)d[17], (uint16_t)d[18], (uint16_t)d[19]};
+    const int n0 = sh_bf_n;
     psx_shadow_backface(sxy, sz);
+    if (sh_bf_n > n0) sh_bf_vra[n0] = ra;
+    sh_bfm_add(sxy, ra);
 }
 static void shadow_note_projection(int nverts) {
     if (sh_bf_on && sh_camera == 2) {
@@ -3934,8 +3997,11 @@ static void shadow_note_projection(int nverts) {
         if (nverts == 1 && sh_anc_live) shadow_anchor_note();
     }
     const int prev = sh_bf_prev;
+    const uint32_t pra = sh_bf_prev_ra;
     sh_bf_prev = nverts;
-    if (!sh_bf_on || !prev) return;
+    if (!sh_bf_on) return;
+    sh_bf_prev_ra = psx_mod_cpu_gpr(31);
+    if (!prev) return;
     uint32_t d[32];
     if (!psx_mod_gte_data(d)) return;
     if (prev == 3) {
@@ -3945,17 +4011,27 @@ static void shadow_note_projection(int nverts) {
         const int32_t x2 = (int16_t)d[14], y2 = (int16_t)(d[14] >> 16);
         const int64_t a = (int64_t)(x1 - x0) * (y2 - y0) - (int64_t)(x2 - x0) * (y1 - y0);
         sh_bf_prev_back = front != 0 && a != 0 && (a > 0 ? 1 : -1) != front;
-        if (sh_bf_prev_back) sh_bf_take(d);
+        if (sh_bf_prev_back) sh_bf_take(d, pra);
     } else if (prev == 1 && sh_bf_prev_back) {
-        sh_bf_take(d);            /* v1 v2 v3 of the culled quad */
+        sh_bf_take(d, pra);       /* v1 v2 v3 of the culled quad */
         sh_bf_prev_back = 0;
     } else {
         sh_bf_prev_back = 0;
     }
 }
 static void shadow_backfaces_flush(void) {
-    if (sh_bf_n) gl_renderer_shadow_add_backfaces(&sh_bf_v[0][0], &sh_bf_area[0][0], sh_bf_n);
+    int n = 0;   /* less the faces of a routine learned since they were taken */
+    for (int i = 0; i < sh_bf_n; i++) {
+        if (sh_ts_n && sh_ts_has(sh_bf_vra[i])) continue;
+        if (n != i) {
+            memcpy(sh_bf_v[n], sh_bf_v[i], sizeof sh_bf_v[0]);
+            memcpy(sh_bf_area[n], sh_bf_area[i], sizeof sh_bf_area[0]);
+        }
+        n++;
+    }
+    if (n) gl_renderer_shadow_add_backfaces(&sh_bf_v[0][0], &sh_bf_area[0][0], n);
     sh_bf_n = 0;
+    if (sh_bfm_init && sh_bfm_n[sh_bfm_cur]) { sh_bfm_cur = (sh_bfm_cur + 1) % SH_BFM_GEN; sh_bfm_reset(sh_bfm_cur); }
 }
 /* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
  * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
@@ -5794,6 +5870,7 @@ static void gp0_exec_textured_tri(void) {
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
+    shadow_bf_drawn(vx, vy, 3);   /* a culled-looking face drawn after all */
     u[0] = gp0_cmd_buf[2] & 0xFF;        v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[4] & 0xFF;        v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[6] & 0xFF;        v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
@@ -5841,6 +5918,7 @@ static void gp0_exec_textured_quad(void) {
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[7], &vx[3], &vy[3]);
+    shadow_bf_drawn(vx, vy, 4);   /* a culled-looking face drawn after all */
     u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[4] & 0xFF;  v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[6] & 0xFF;  v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
@@ -5950,6 +6028,7 @@ static void gp0_exec_shaded_textured_tri(void) {
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
+    shadow_bf_drawn(vx, vy, 3);   /* a culled-looking face drawn after all */
     u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[5] & 0xFF;  v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[8] & 0xFF;  v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
@@ -6022,6 +6101,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[10], &vx[3], &vy[3]);
+    shadow_bf_drawn(vx, vy, 4);   /* a culled-looking face drawn after all */
     u[0] = gp0_cmd_buf[2] & 0xFF;   v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[5] & 0xFF;   v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[8] & 0xFF;   v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
