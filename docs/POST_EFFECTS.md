@@ -33,11 +33,11 @@ touches.
 pfx 1                              # required first line
 pass <name>                        # the last pass writes the window
   shader <file.glsl|builtin:name>  # file paths resolve next to the preset
-  input <sampler> <source|source_down|mask|mask3d|depth|shadow|sprite|previous|<earlier pass>>   # up to 6
+  input <sampler> <source|source_down|mask|mask3d|depth|shadow|sprshadow|sprite|previous|<earlier pass>>   # up to 6
   scale <f>                        # target size as a fraction of the game rect (default 1)
   format rgba8|rgba16f             # default rgba8
   filter linear|nearest            # how later passes sample this target
-  uniform <name> <f> [f [f [f]]]   # float .. vec4
+  uniform <name> <f> [f [f [f]]]   # float .. vec4, up to 12 per pass
   blend replace|screen             # last pass: write, or screen o + dst*(1-o)
                                    # onto the window (discard keeps dst exactly)
   generated reuse|run              # Smooth motion generated frames: keep this pass's
@@ -101,7 +101,11 @@ reads it also gets `u_smx`, `u_smy`, `u_smz`, `u_sms` (where a view-space
 point lands in the map) and, when the camera is known, `u_world`,
 `u_worldup` and `u_shadowdir` (the world's axes and the light in view space,
 so the light stays fixed in the world when the camera turns). Nothing of this
-runs unless an active chain reads `shadow`.
+runs unless an active chain reads `shadow`. `sprshadow` is the same map
+(same light, size and mapping) holding only the sprites (below), so a reader
+can soften the scenery's shadow edges and keep the sprites' pixel-art
+silhouettes sharp; the reading pass's `u_ss` x 0 leaves it empty and turns
+sprites off altogether (no casters, no shading, the game's own blobs stay).
 
 The casters, best source first:
 
@@ -125,9 +129,17 @@ foot point is taken in the view space of the camera projecting it and sent
 in drawing order, so the pieces drawn next (that frame's) stand on it. One
 sprite = its opaque pieces from one texture page and CLUT that touch, in any
 drawing order (games sort by depth, so two sprites' pieces interleave); it
-goes to the foot point at its bottom and is stood upright there (a plane
-through the point facing the camera across the floor), each piece along its
-own view ray. Its cut-out is copied from VRAM as it is drawn (a game may load
+goes to the foot point at its bottom, in its columns. A run that is not at
+one (a part in another page or CLUT) joins a sprite only when it touches one
+of that sprite's runs and its middle is within that sprite's columns, so HUD
+panels and texts above or beside a character never stand there. A sprite is
+stood upright where its lowest drawn pixel meets the floor (a plane facing
+the camera across the floor), each piece along its own view ray. A 3/4
+pose's back foot, drawn higher on the picture, would float on that plane: a
+raised foot (a separate bump of the bottom profile, within its bottom fifth)
+gets its leg bent back, smoothly over the rows above it, to where it meets
+the floor, as extra casters and in the `sprite` depth (so it never shades
+itself). Its cut-out is copied from VRAM as it is drawn (a game may load
 the next animation's pieces before the picture is shown). Translucent pieces
 (dust, glows) neither cast nor take shadows, and the game's own blob (a
 translucent flat quad centred on a foot point) is not drawn. A chain that
@@ -147,7 +159,11 @@ sprite_anchors = ["0x80141FA0", "0x80141FD8"]   # return addresses of the foot-p
 
 The Sun presets (`shaders/hd2d/sun*.pfx`) differ only in shadow detail:
 `sun-low` (480 lines), `sun` (960 lines), `sun-high` (1.5x the picture, a
-4096 map). A pass may read up to 6 inputs.
+4096 map). All soften the scenery's shadow edges over `u_soft` x world units
+(5x5 samples, the bias grown with the face's tilt to the light) and keep the
+sprites' sharp (3x3 texels of `sprshadow`). Their faces' normals come from
+two pixels on the side that stays in the pixel's plane (the least bend in
+1/Z), so creases between faces show no seams. A pass may read up to 6 inputs.
 
 With `camera = "ram:..."`, before each projection a GTE rotation +
 translation not met yet is compared with the MATRIX in RAM; equal, it is the
@@ -165,7 +181,8 @@ sprite foot points are the single RTPS with the camera whose `ra` repeats
 once per character (BoF4: two calls per sprite, same point).
 
 TCP: `shadow_cache` (state: camera, matches, world triangles, memory, sprite
-runs: at their foot point / by column / none), `sprite_dump` (the picture's
+runs: at their foot point / touching one that is / none, `sprite_bent`: raised
+feet bent down), `sprite_dump` (the picture's
 foot points and 2D pieces),
 `shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
 microseconds per stage and pass).
