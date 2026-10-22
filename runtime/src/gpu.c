@@ -891,6 +891,123 @@ static int shadow_blob_quad(int semi, uint32_t p0, uint32_t p1, uint32_t p2, uin
     }
     return 0;
 }
+/* A blob painted into a sprite's own picture (BoF4's battle sprites: a
+ * black ellipse under the feet, in one near-black CLUT entry the sprite uses
+ * for nothing else). It is learnt from an opaque 4/8-bit quad holding a foot
+ * point projected in the last few VBlanks, a quarter or more of whose drawn
+ * texels are one near-black entry: that palette's blob colour. From then on
+ * every quad with that palette reaching the ground's band round a foot point
+ * (SH_KEY_ABOVE px above its row to SH_KEY_BELOW below: the feet away from
+ * the point in an attack or victory pose, a monster's tail; not the head,
+ * whose eyes may use the colour) draws it see-through, while the entry
+ * still holds the colour learnt and was confirmed in the last SH_KEY_LIFE
+ * VBlanks. Out: the entry's VRAM place (the caller draws the quad with it
+ * see-through, then puts it back); 0 = none. tc: the 4 texcoord words (the
+ * first with the CLUT, the second the page). */
+enum { SH_KEY_MAX = 64, SH_KEY_LIFE = 3600, SH_KEY_ABOVE = 12, SH_KEY_BELOW = 16 };
+/* a palette's blob colour and the foot points (picture px, the latest first)
+ * of the sprites it was learnt from */
+static struct { uint16_t clut, col; uint8_t idx, npos; int16_t pos[4][2]; uint32_t seen; } sh_key[SH_KEY_MAX];
+static int sh_key_n = 0;
+static int shadow_blob_key(int semi, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, const uint32_t *tc,
+                           int *kx, int *ky) {
+    if (!sh_anc_live || semi) return 0;
+    const uint16_t clut = (uint16_t)(tc[0] >> 16), tpage = (uint16_t)(tc[1] >> 16);
+    const int depth = (tpage >> 7) & 3;
+    if (depth > 1) return 0;
+    const int tx = (tpage & 0xF) * 64, ty = ((tpage >> 4) & 1) * 256;
+    const int cx = (clut & 0x3F) * 16, cy = (clut >> 6) & 0x1FF;
+    const uint32_t now = (uint32_t)s_frame_count;
+    int known = -1;
+    for (int i = 0; i < sh_key_n && known < 0; i++) {
+        if (sh_key[i].clut != clut) continue;
+        if (now - sh_key[i].seen > SH_KEY_LIFE ||
+            vram[(cy & 511) * 1024 + ((cx + sh_key[i].idx) & 1023)] != sh_key[i].col) { sh_key[i] = sh_key[--sh_key_n]; break; }
+        known = i;
+    }
+    const uint32_t p[4] = {p0, p1, p2, p3};
+    int x0 = 99999, x1 = -99999, y0 = 99999, y1 = -99999;
+    for (int i = 0; i < 4; i++) {
+        const int x = ((int)(p[i] & 0x7FFu) ^ 0x400) - 0x400, y = ((int)((p[i] >> 16) & 0x7FFu) ^ 0x400) - 0x400;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    int at = 0, ai = -1;
+    if (x1 - x0 <= 64 && y1 - y0 <= 64 && x1 > x0 && y1 > y0)
+        for (int i = 0; i < SH_ANC_MAX && !at; i++) {
+            if (now - sh_anc_frame[i] > 3u || !sh_anc_frame[i]) continue;
+            at = sh_anc_sxy[i][0] >= x0 && sh_anc_sxy[i][0] <= x1 && sh_anc_sxy[i][1] >= y0 && sh_anc_sxy[i][1] <= y1;
+            if (at) ai = i;
+        }
+    if (at) {   /* (re)learn: the feet's tile */
+        int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+        for (int i = 0; i < 4; i++) {
+            const int u = (int)(tc[i] & 0xFF), v = (int)((tc[i] >> 8) & 0xFF);
+            if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v;
+        }
+        uint16_t n[256];
+        memset(n, 0, sizeof n);
+        int drawn = 0;
+        for (int v = v0; v < v1; v++)
+            for (int u = u0; u < u1; u++) {
+                const uint16_t w = vram[((ty + v) & 511) * 1024 + ((tx + (depth ? u >> 1 : u >> 2)) & 1023)];
+                const int idx = depth ? (w >> ((u & 1) * 8)) & 0xFF : (w >> ((u & 3) * 4)) & 0xF;
+                if (vram[(cy & 511) * 1024 + ((cx + idx) & 1023)]) { n[idx]++; drawn++; }
+            }
+        int best = -1;
+        for (int k = 0; k < (depth ? 256 : 16); k++) {
+            const uint16_t c = vram[(cy & 511) * 1024 + ((cx + k) & 1023)];
+            if (!c || (c & 31) > 3 || ((c >> 5) & 31) > 3 || ((c >> 10) & 31) > 3) continue;
+            if (best < 0 || n[k] > n[best]) best = k;
+        }
+        if (best >= 0 && n[best] >= 12 && n[best] * 4 >= drawn) {
+            if (known < 0) {
+                if (sh_key_n == SH_KEY_MAX) {   /* the least recently confirmed goes */
+                    int o = 0;
+                    for (int i = 1; i < sh_key_n; i++) if (now - sh_key[i].seen > now - sh_key[o].seen) o = i;
+                    sh_key[o] = sh_key[--sh_key_n];
+                }
+                known = sh_key_n++;
+                sh_key[known].npos = 0;
+            }
+            sh_key[known].clut = clut; sh_key[known].idx = (uint8_t)best;
+            sh_key[known].col = vram[(cy & 511) * 1024 + ((cx + best) & 1023)];
+            sh_key[known].seen = now;
+            int16_t (*ps)[2] = sh_key[known].pos;
+            int j = 0;
+            while (j < sh_key[known].npos && (abs(ps[j][0] - sh_anc_sxy[ai][0]) > 2 || abs(ps[j][1] - sh_anc_sxy[ai][1]) > 2)) j++;
+            if (j == sh_key[known].npos && j < 4) sh_key[known].npos++;
+            if (j == 4) j = 3;
+            for (; j > 0; j--) { ps[j][0] = ps[j - 1][0]; ps[j][1] = ps[j - 1][1]; }
+            ps[0][0] = sh_anc_sxy[ai][0]; ps[0][1] = sh_anc_sxy[ai][1];
+        }
+    }
+    if (known < 0) return 0;
+    /* only near the ground: a quad reaching the band round the row of a foot
+     * point of a sprite this palette was learnt from (the colour may also
+     * draw its eyes or outlines higher up; another sprite's feet may be at
+     * that height) */
+    int near = 0;
+    for (int j = 0; j < sh_key[known].npos && !near; j++) {
+        const int16_t *q = sh_key[known].pos[j];
+        near = y1 >= q[1] - SH_KEY_ABOVE && y0 <= q[1] + SH_KEY_BELOW && x1 >= q[0] - 64 && x0 <= q[0] + 64;
+    }
+    if (!near) return 0;
+    *kx = (cx + sh_key[known].idx) & 1023; *ky = cy & 511;
+    sh_blobs++;
+    return 1;
+}
+/* The key entry see-through (0) for one draw, in the guest's VRAM and the
+ * renderer's, in drawing order; shadow_blob_key_put gives it back at once. */
+static uint16_t shadow_blob_key_hide(int x, int y) {
+    const uint16_t c = vram[y * 1024 + x];
+    vram[y * 1024 + x] = 0;
+    gr_vram_write(x, y, 0);
+    return c;
+}
+static void shadow_blob_key_put(int x, int y, uint16_t c) {
+    vram[y * 1024 + x] = c;
+    gr_vram_write(x, y, c);
+}
 static void shadow_vblank(void) {
     const int wanted = gl_renderer_shadow_wanted();
     sh_hide_on = wanted && sh_hide_n > 0;
@@ -7578,9 +7695,17 @@ static void gp0_dispatch_command(uint8_t opcode) {
         case 0x28: case 0x29: case 0x2A: case 0x2B:
             gp0_exec_mono_quad();
             break;
-        case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+        case 0x2C: case 0x2D: case 0x2E: case 0x2F: {
+            /* layout: colour+v0, tc0+clut, v1, tc1+tpage, v2, tc2, v3, tc3 */
+            int kx, ky;
+            const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
+                                            gp0_cmd_buf[7], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[4],
+                                            gp0_cmd_buf[6], gp0_cmd_buf[8]}, &kx, &ky);
+            const uint16_t kc = key ? shadow_blob_key_hide(kx, ky) : 0;
             gp0_exec_textured_quad();
+            if (key) shadow_blob_key_put(kx, ky, kc);
             break;
+        }
         case 0x30: case 0x31: case 0x32: case 0x33:
             gp0_exec_shaded_tri();
             break;
@@ -7590,9 +7715,17 @@ static void gp0_dispatch_command(uint8_t opcode) {
         case 0x38: case 0x39: case 0x3A: case 0x3B:
             gp0_exec_shaded_quad();
             break;
-        case 0x3C: case 0x3D: case 0x3E: case 0x3F:
+        case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
+            /* layout: colour+v0, tc0+clut, c1, v1, tc1+tpage, c2, v2, tc2, c3, v3, tc3 */
+            int kx, ky;
+            const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7],
+                                            gp0_cmd_buf[10], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[5],
+                                            gp0_cmd_buf[8], gp0_cmd_buf[11]}, &kx, &ky);
+            const uint16_t kc = key ? shadow_blob_key_hide(kx, ky) : 0;
             gp0_exec_shaded_textured_quad();
+            if (key) shadow_blob_key_put(kx, ky, kc);
             break;
+        }
 
         /* Lines */
         case 0x40: case 0x41: case 0x42: case 0x43:
