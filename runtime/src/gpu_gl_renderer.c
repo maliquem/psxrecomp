@@ -824,6 +824,11 @@ static int      s_spr_on = 0;
 static int      s_spr_ss = 1;      /* the reading pass's u_ss.x: sprite shadows on (off: the game's own blobs stay) */
 static unsigned s_spr_frames = 0, s_spr_last = 0;   /* frames with sprite casters; pieces in the last one */
 static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, touching one that is, none */
+static int      s_spr_stood[SC_ANC_MAX], s_spr_stood_n = 0;   /* the last build: pieces stood at each foot point */
+static float    s_spr_dbg_anc[SC_ANC_MAX][2];                  /* its foot points (picture px) */
+enum { SPR_DBG_RUNS = 512 };
+static float    s_spr_dbg_run[SPR_DBG_RUNS][7];                /* its runs: box, foot point, at it, CLUT (9: too big) */
+static int      s_spr_dbg_nrun = 0;
 static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
 static float    s_anc_pend[SC_ANC_MAX][3];
 static int      s_anc_pend_n = 0;
@@ -1351,6 +1356,14 @@ int gl_renderer_sprite_dump_json(char *out, int cap) {
         const float *V = sl->anc[q];
         k += snprintf(out + k, (size_t)(cap - k), "%s[%.1f,%.1f]", q ? "," : "",
                       V[2] > 1.0f ? s_cam_h * V[0] / V[2] : 0.0f, V[2] > 1.0f ? s_cam_h * V[1] / V[2] : 0.0f);
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "],\"stood\":[");
+    for (int q = 0; q < s_spr_stood_n && k < cap - 64; q++)
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%d]", q ? "," : "", s_spr_dbg_anc[q][0], s_spr_dbg_anc[q][1], s_spr_stood[q]);
+    k += snprintf(out + k, (size_t)(cap - k), "],\"runs\":[");
+    for (int r = 0; r < s_spr_dbg_nrun && k < cap - 96; r++) {
+        const float *b = s_spr_dbg_run[r];
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]", r ? "," : "", b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
     }
     k += snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[");
     for (int t = 0; t < sl->sn && k < cap - 128; t++) {

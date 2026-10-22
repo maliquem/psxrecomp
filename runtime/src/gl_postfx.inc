@@ -606,7 +606,7 @@ static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float au, c
  * (s_spr_scr: clip x, y, view z). */
 #define SPR_LIGHT_MIN 0.7f   /* least cosine between a sprite's plane normal and the level light */
 static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
-    s_spr_n = 0; s_spr_nx = 0;
+    s_spr_n = 0; s_spr_nx = 0; s_spr_stood_n = 0;
     if (!s_spr_on || !sc || !s_cam_ok || sc->nanc <= 0 || sc->sn <= 0 || s_sm_world[1][3] < 0.5f) return;
     float AP[SC_ANC_MAX][3], AS[SC_ANC_MAX][2];
     int na = 0;
@@ -618,6 +618,8 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         na++;
     }
     if (!na) return;
+    s_spr_stood_n = na; s_spr_dbg_nrun = 0;
+    for (int q = 0; q < na; q++) { s_spr_stood[q] = 0; s_spr_dbg_anc[q][0] = AS[q][0]; s_spr_dbg_anc[q][1] = AS[q][1]; }
     const float *u = s_sm_world[1];   /* world up, view space (y up) */
     float nrm[3] = {-u[0] * u[2], -u[1] * u[2], 1.0f - u[2] * u[2]};   /* forward minus its up part */
     const float nl = sqrtf(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
@@ -679,16 +681,19 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
             if (vi[5] != vj[5] || vi[6] != vj[6] || vi[7] != vj[7] || vi[8] != vj[8]) continue;
             if (box[j][0] > box[i][1] + 2.0f || box[j][1] < box[i][0] - 2.0f ||
                 box[j][2] > box[i][3] + 2.0f || box[j][3] < box[i][2] - 2.0f) continue;
+            /* the root stays the lowest index of its run: the runs are walked from it */
             const int a = spr_root(par, i), c = spr_root(par, j);
-            if (a != c) par[c] = a;
+            if (a < c) par[c] = a; else if (c < a) par[a] = c;
         }
     }
     /* Each run: its box, lowest drawn row and foot point. A run whose bottom
-     * is at a foot point, near its middle, is that sprite's (direct). A run
-     * that is not (a part cut off from its sprite: another page or CLUT)
-     * joins a sprite only when it touches one of its runs, its middle is
-     * within that sprite's columns and it is no wider, so the HUD's panels,
-     * texts and labels above or beside a character never stand there. */
+     * is at a foot point within its columns is that sprite's (direct; a sword
+     * held out puts the point near one end). A run that is not (a part cut
+     * off from its sprite: another texture page) joins a sprite only when it
+     * has that sprite's CLUT, touches one of its runs (or is up to 8 px over
+     * it), its middle is within that sprite's columns and it is no wider, so
+     * the HUD's panels, bars, texts and labels on or beside a character (UI
+     * palettes) never stand there. */
     static float rb[SPR_MAXP][5];   /* bx0, bx1, by0, by1, ob */
     static int   rq[SPR_MAXP];      /* foot point, -1 none */
     static uint8_t rdir[SPR_MAXP];  /* 1 = at its foot point */
@@ -711,9 +716,6 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         float bs = 1e30f;
         for (int q = 0; q < na; q++) {
             if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f || b[3] < AS[q][1] - 8.0f || b[3] > AS[q][1] + 20.0f) continue;
-            /* near its middle (a character's feet), not at one end (a route or
-             * a line drawn from the character, as on the world map) */
-            if (fabsf(cx - AS[q][0]) > 0.3f * (b[1] - b[0]) + 12.0f) continue;
             const float s = fabsf(b[3] - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
             if (s < bs) { bs = s; rq[r] = q; }
         }
@@ -733,7 +735,11 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
                 const int q = rq[o];
                 if (o == r || q < 0 || spr_root(par, o) != o) continue;
                 const float *c = rb[o];
-                if (b[0] > c[1] + 2.0f || b[1] < c[0] - 2.0f || b[2] > c[3] + 2.0f || b[3] < c[2] - 2.0f) continue;
+                const float *vr = sc->sv + (size_t)ids[r] * 3 * SC_V, *vo = sc->sv + (size_t)ids[o] * 3 * SC_V;
+                if (vr[7] != vo[7] || vr[8] != vo[8]) continue;   /* another palette: the UI's, not this sprite's */
+                /* touching it, or just over it (eyes floating over a body, a
+                 * hat bobbing: a few rows apart as the sprite moves) */
+                if (b[0] > c[1] + 2.0f || b[1] < c[0] - 2.0f || b[2] > c[3] + 2.0f || b[3] < c[2] - 8.0f) continue;
                 if (cx < ax[q][0] - 4.0f || cx > ax[q][1] + 4.0f || b[3] > AS[q][1] + 10.0f) continue;
                 /* no wider than that sprite (a name label or balloon over it) */
                 if (b[1] - b[0] > ax[q][1] - ax[q][0] + 8.0f) continue;
@@ -742,27 +748,47 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         }
         if (!added) break;
     }
+    /* Its own runs first (each sprite's plane), then the parts joined to it,
+     * on that same plane (a part's own bottom is no floor: eyes over a body). */
+    float anc_d[SC_ANC_MAX];
+    uint8_t anc_ok[SC_ANC_MAX];
+    memset(anc_ok, 0, sizeof anc_ok);
+    for (int pass = 0; pass < 2; pass++)
     for (int r = 0; r < m; r++) {
-        if (spr_root(par, r) != r) continue;
+        if (spr_root(par, r) != r || (pass == 0) != (rdir[r] != 0)) continue;
         const float bx0 = rb[r][0], bx1 = rb[r][1], by0 = rb[r][2], by1 = rb[r][3], ob = rb[r][4];
-        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;
         const int best = rq[r];
+        if (s_spr_dbg_nrun < SPR_DBG_RUNS) {   /* sprite_dump: every run (9 = too big, then the rest) */
+            float *g = s_spr_dbg_run[s_spr_dbg_nrun++];
+            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r]; g[6] = 9.0f;
+        }
+        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;
+        if (s_spr_dbg_nrun > 0 && s_spr_dbg_run[s_spr_dbg_nrun - 1][6] == 9.0f) s_spr_dbg_nrun--;
         s_spr_runs[best < 0 ? 2 : rdir[r] ? 0 : 1]++;
+        if (s_spr_dbg_nrun < SPR_DBG_RUNS) {
+            float *g = s_spr_dbg_run[s_spr_dbg_nrun++];
+            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r];
+            g[6] = sc->sv[(size_t)ids[r] * 3 * SC_V + 8] * 64.0f + sc->sv[(size_t)ids[r] * 3 * SC_V + 7] / 16.0f;   /* its CLUT */
+        }
         if (best < 0) continue;
-        if (by1 - by0 < SPR_MIN_H) continue;   /* a marker or icon (a map's), not a figure */
+        if (rdir[r] && by1 - by0 < SPR_MIN_H) continue;   /* a marker or icon (a map's), not a figure; a part joined to one may be small (eyes) */
+        if (!rdir[r] && !anc_ok[best]) continue;           /* a part of a sprite that does not stand */
         /* It stands where its lowest drawn row meets the floor at its foot
          * point's height (a front foot drawn below the foot point would be
          * under the floor on a plane through the point, its shadow lost). */
         float na_d = nrm[0] * AP[best][0] + nrm[1] * AP[best][1] + nrm[2] * AP[best][2];
         const float au = AP[best][0] * u[0] + AP[best][1] * u[1] + AP[best][2] * u[2];
+        const int joined = !rdir[r];   /* a joined part: the sprite's plane, as drawn */
         float G[3];
-        if (spr_ground(AS[best][0], ob, au, u, G)) {
+        if (!rdir[r]) na_d = anc_d[best];
+        else if (spr_ground(AS[best][0], ob, au, u, G)) {
             const float g = nrm[0] * G[0] + nrm[1] * G[1] + nrm[2] * G[2];
             if (fabsf(g - na_d) < 256.0f) na_d = g;
         }
+        if (rdir[r] && !anc_ok[best]) { anc_d[best] = na_d; anc_ok[best] = 1; }
         /* its feet bent down to the floor */
         static SprFoot sf;
-        if (spr_feet(sc, ids, par, r, m, bx0, bx1, by0, ob, &sf)) spr_bend(&sf, nrm, na_d, au, u, by1 - by0);
+        if (!joined && spr_feet(sc, ids, par, r, m, bx0, bx1, by0, ob, &sf)) spr_bend(&sf, nrm, na_d, au, u, by1 - by0);
         for (int i = r; i < m; i++) {
             if (spr_root(par, i) != r) continue;
             const float *v = sc->sv + (size_t)ids[i] * 3 * SC_V;
@@ -780,7 +806,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
                 memcpy(c + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
                 memcpy(s + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
             }
-            if (ok) s_spr_n += 3;
+            if (ok) { s_spr_n += 3; s_spr_stood[best]++; }
         }
     }
     if (s_spr_n) s_spr_frames++;
