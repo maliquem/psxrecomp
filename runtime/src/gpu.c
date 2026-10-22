@@ -759,6 +759,27 @@ void gpu_set_hidden_textures(const uint32_t *tpage, const uint32_t *clut, int n)
     sh_hide_n = n < 0 ? 0 : n > 16 ? 16 : n;
     for (int i = 0; i < sh_hide_n; i++) { sh_hide_tpage[i] = (uint16_t)(tpage[i] & 0x1FFu); sh_hide_clut[i] = (uint16_t)clut[i]; }
 }
+/* [video.shadow] off_textures: texture page (9 bits) + CLUT, either 0xFFFF =
+ * any, of what only a screen with no place under the sun draws (a world
+ * map's paper, its frame): while one was drawn in the last few VBlanks the
+ * effects that read the shadow map are skipped (gpu_shadow_off_active). */
+static int      sh_off_n = 0, sh_off_seen = 0;
+static uint16_t sh_off_tpage[16], sh_off_clut[16];
+static uint32_t sh_off_frame = 0;
+void gpu_set_shadow_off_textures(const uint32_t *tpage, const uint32_t *clut, int n) {
+    sh_off_n = n < 0 ? 0 : n > 16 ? 16 : n;
+    for (int i = 0; i < sh_off_n; i++) { sh_off_tpage[i] = (uint16_t)tpage[i]; sh_off_clut[i] = (uint16_t)clut[i]; }
+    sh_off_seen = 0;
+}
+static void shadow_off_note(uint16_t tpage, uint16_t clut) {
+    for (int i = 0; i < sh_off_n; i++)
+        if ((sh_off_tpage[i] == 0xFFFFu || sh_off_tpage[i] == (tpage & 0x1FFu)) &&
+            (sh_off_clut[i] == 0xFFFFu || sh_off_clut[i] == clut)) {
+            sh_off_frame = (uint32_t)s_frame_count; sh_off_seen = 1;
+            return;
+        }
+}
+int gpu_shadow_off_active(void) { return sh_off_seen && (uint32_t)s_frame_count - sh_off_frame <= 4u; }
 static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
     if (!sh_hide_on) return 0;
     for (int i = 0; i < sh_hide_n; i++)
@@ -7690,6 +7711,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_mono_tri();
             break;
         case 0x24: case 0x25: case 0x26: case 0x27:
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
             gp0_exec_textured_tri();
             break;
         case 0x28: case 0x29: case 0x2A: case 0x2B:
@@ -7697,6 +7719,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             break;
         case 0x2C: case 0x2D: case 0x2E: case 0x2F: {
             /* layout: colour+v0, tc0+clut, v1, tc1+tpage, v2, tc2, v3, tc3 */
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
             int kx, ky;
             const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
                                             gp0_cmd_buf[7], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[4],
@@ -7710,6 +7733,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_shaded_tri();
             break;
         case 0x34: case 0x35: case 0x36: case 0x37:
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
             gp0_exec_shaded_textured_tri();
             break;
         case 0x38: case 0x39: case 0x3A: case 0x3B:
@@ -7717,6 +7741,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             break;
         case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
             /* layout: colour+v0, tc0+clut, c1, v1, tc1+tpage, c2, v2, tc2, c3, v3, tc3 */
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
             int kx, ky;
             const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7],
                                             gp0_cmd_buf[10], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[5],
@@ -7742,6 +7767,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_mono_rect();
             break;
         case 0x64: case 0x65: case 0x66: case 0x67:
+            if (sh_off_n) shadow_off_note(current_texpage(), (uint16_t)(gp0_cmd_buf[2] >> 16));   /* the draw mode's page */
             gp0_exec_textured_rect();
             break;
         case 0x68: case 0x69: case 0x6A: case 0x6B:

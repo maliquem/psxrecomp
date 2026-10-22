@@ -446,6 +446,12 @@ int  psx_shadow_state(char *out, int cap);   /* JSON fields for TCP shadow_cache
 /* [video.shadow] hide_textures: textured polygons (page 9 bits + CLUT) not
  * drawn while the shadow map is in use (a game's own blob shadows). */
 void gpu_set_hidden_textures(const uint32_t *tpage, const uint32_t *clut, int n);
+/* [video.shadow] off_textures: textured primitives (page 9 bits + CLUT,
+ * 0xFFFF = any) only a screen with no place under the sun draws (a world
+ * map); while one was drawn in the last few VBlanks, gpu_shadow_off_active
+ * is 1 and the effects that read the shadow map are skipped. */
+void gpu_set_shadow_off_textures(const uint32_t *tpage, const uint32_t *clut, int n);
+int  gpu_shadow_off_active(void);
 /* Signed-funnel variants (min/max + center±halfwidth idioms — see
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */

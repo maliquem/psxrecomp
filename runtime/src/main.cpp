@@ -17677,6 +17677,8 @@ int main(int argc, char** argv) {
                                       (int)gc.runtime.video_shadow_sprite_anchors.size());
             gpu_set_hidden_textures(gc.runtime.video_shadow_hide_tpage.data(), gc.runtime.video_shadow_hide_clut.data(),
                                     (int)gc.runtime.video_shadow_hide_tpage.size());
+            gpu_set_shadow_off_textures(gc.runtime.video_shadow_off_tpage.data(), gc.runtime.video_shadow_off_clut.data(),
+                                        (int)gc.runtime.video_shadow_off_tpage.size());
             g_video_ss_milli   = gc.runtime.video_supersample_milli;
             g_video_texfilter  = gc.runtime.video_texture_filter;
             g_video_fmv_filter = gc.runtime.video_fmv_filter;

@@ -850,6 +850,19 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 if (rt.video_shadow_hide_tpage.size() > 16)
                     throw std::runtime_error("[video.shadow] hide_textures: at most 16");
             }
+            if (sh.contains("off_textures")) {
+                for (const auto& k : toml::find<std::vector<std::string>>(sh, "off_textures")) {
+                    const auto colon = k.find(':');
+                    if (colon == std::string::npos)
+                        throw std::runtime_error(fmt::format(
+                            "[video.shadow] off_textures entries are \"0xPAGE:0xCLUT\" (either may be *): {}", k));
+                    const std::string p = k.substr(0, colon), c = k.substr(colon + 1);
+                    rt.video_shadow_off_tpage.push_back(p == "*" ? 0xFFFFu : (uint32_t)std::stoul(p, nullptr, 0) & 0x1FFu);
+                    rt.video_shadow_off_clut.push_back(c == "*" ? 0xFFFFu : (uint32_t)std::stoul(c, nullptr, 0));
+                }
+                if (rt.video_shadow_off_tpage.size() > 16)
+                    throw std::runtime_error("[video.shadow] off_textures: at most 16");
+            }
             if (sh.contains("sprite_anchors")) {
                 for (const auto& k : toml::find<std::vector<std::string>>(sh, "sprite_anchors"))
                     rt.video_shadow_sprite_anchors.push_back((uint32_t)std::stoul(k, nullptr, 0));

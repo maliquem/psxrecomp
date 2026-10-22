@@ -1409,6 +1409,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if ((i == PFX_STAGE_AA || i == PFX_STAGE_HQ) && !with_aa) continue;
         if (!pfx_stage_load(i)) continue;
         PfxStage *st = &s_pfx[i];
+        if (st->chain.uses_shadow && gpu_shadow_off_active()) continue;   /* no place under the sun (a world map) */
         if (st->chain.uses_mask || st->chain.uses_mask3d) {
             if (!mask_done) { mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1; }
             if (!mask_ok) continue;                  /* no marks yet */

@@ -494,6 +494,11 @@ struct RuntimeConfig {
     // not drawn while the shadow map is in use.
     std::vector<uint32_t> video_shadow_hide_tpage;
     std::vector<uint32_t> video_shadow_hide_clut;
+    // off_textures = ["0xPAGE:0xCLUT", either may be "*", ...]: what only a
+    // screen with no place under the sun draws (a world map's paper, its
+    // frame); while it is drawn the effects that read the shadow map are skipped.
+    std::vector<uint32_t> video_shadow_off_tpage;
+    std::vector<uint32_t> video_shadow_off_clut;
     // sprite_anchors = ["0xRA", ...]: return addresses of the game's calls whose
     // RTPS projects a sprite's foot point (sprite shadows; camera "ram:" only).
     std::vector<uint32_t> video_shadow_sprite_anchors;
