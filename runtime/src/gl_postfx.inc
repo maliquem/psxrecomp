@@ -427,8 +427,11 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
  * pass also gets u_smx = (a, x0), u_smy = (b, y0), u_smz = (L, d1) and
  * u_sms = (1/(x1-x0), 1/(y1-y0), 1/(d1-d0), map size): a point P is at map uv
  * ((dot(P,a)-x0) sms.x, (dot(P,b)-y0) sms.y), depth (d1 - dot(P,L)) sms.z
- * there (0 = nearest the light). No casters: the map is cleared (no shadow). */
+ * there (0 = nearest the light). No casters: the map is cleared (no shadow).
+ * The map is SM_SIZE texels square, or what the pass's uniform u_smsize asks
+ * (1024..8192, rounded to a power of two). */
 enum { SM_SIZE = 2048 };
+static int s_sm_size = 0;   /* allocated size */
 static GLuint s_sm_tex = 0, s_sm_fbo = 0, s_sm_prog = 0, s_sm_vao = 0, s_sm_vbo = 0;
 static GLint  s_sm_uvram = -1;
 static float  s_sm_u[4][4];
@@ -444,6 +447,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         glBindTexture(GL_TEXTURE_2D, s_sm_tex);
         glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
                      0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+        s_sm_size = SM_SIZE;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -493,7 +497,19 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         p_glBindVertexArray(0);
     }
     memset(s_sm_u, 0, sizeof s_sm_u);
-    s_sm_u[3][3] = (float)SM_SIZE;
+    {   /* the size the pass asks for */
+        const float *rq = pfx_pass_uniform(ps, "u_smsize");
+        int want = SM_SIZE;
+        if (rq && rq[0] > 0.0f) { want = 1024; while (want < 8192 && (float)want < rq[0] * 0.75f) want *= 2; }
+        if (want != s_sm_size) {
+            glBindTexture(GL_TEXTURE_2D, s_sm_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, want, want, 0,
+                         0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            s_sm_size = want;
+        }
+    }
+    s_sm_u[3][3] = (float)s_sm_size;
     const float *dir = pfx_pass_uniform(ps, "u_shadowdir"), *proj = pfx_pass_uniform(ps, "u_proj");
     const float *sun = pfx_pass_uniform(ps, "u_sun");
     const float H = proj ? proj[0] : 0.0f;
@@ -627,7 +643,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
     GLboolean dmask = GL_TRUE;
     glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
-    glViewport(0, 0, SM_SIZE, SM_SIZE);
+    glViewport(0, 0, s_sm_size, s_sm_size);
     glDepthMask(GL_TRUE);
     glClearDepth(1.0);
     glClear(GL_DEPTH_BUFFER_BIT);
@@ -653,7 +669,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         glBindTexture(GL_TEXTURE_2D, 0);
         p_glBindVertexArray(0);
         const float u[4][4] = {{a[0], a[1], a[2], x0}, {b[0], b[1], b[2], y0},
-                               {L[0], L[1], L[2], d1}, {sx, sy, sd, (float)SM_SIZE}};
+                               {L[0], L[1], L[2], d1}, {sx, sy, sd, (float)s_sm_size}};
         memcpy(s_sm_u, u, sizeof s_sm_u);
     }
     glDepthMask(dmask);
