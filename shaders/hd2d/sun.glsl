@@ -20,6 +20,10 @@
 // u_shadow: x = unused, y = bias (fraction of Z), z = how dark a full shadow
 //           is (0..1), w = 0
 // u_smx..u_sms: the framework's shadow map mapping (gl_postfx.inc)
+// u_soft:   x = how far the scenery's shadow edges spread (world units each
+//           way; 0 = a texel); the sprites' stay sharp
+// u_ssm:    the sprites' shadow map (framework `sprshadow`, mapped as u_sm);
+//           u_ss.x 0 (framework) leaves it empty: no sprite shadows
 // u_proj:   x = H, y = native height (240), z = internal scale (depth grid)
 // u_spr:    the sprites standing in the scene (framework `sprite` input): view
 //           depth of the sprite drawn at each pixel, >= 50000 = none; with
@@ -35,6 +39,7 @@ uniform vec4 u_shadow;
 uniform vec4 u_shadowdir;
 uniform vec4 u_smx, u_smy, u_smz, u_sms;
 uniform vec4 u_proj;
+uniform vec4 u_soft;
 
 vec2 g_grid;
 vec2 g_nat;
@@ -50,21 +55,55 @@ float sz_at(vec2 uv)
 vec3 pos_at(vec2 uv, float z) { return vec3((uv - 0.5) * g_nat * z / u_proj.x, z); }
 vec2 uv_of(vec3 p) { return p.xy * u_proj.x / (p.z * g_nat) + 0.5; }
 
-// Shadow at P: is something nearer the light in the shadow map? 3x3 samples
-// (soft edge). 1 = lit, down to 1 - u_shadow.z.
-float shadow_at(vec3 P, float bias)
+// Shadow at P: is something nearer the light in the shadow maps? The
+// sprites' map (u_ssm) with 3x3 samples a texel apart (sharp pixel-art
+// silhouettes); the scenery's (u_sm) with 5x5 over u_soft.x world units each
+// way (soft edges; 0 = 3x3 texels), its bias grown with the receiver's tilt
+// to the light (tilt = tan of the angle) across that spread. 1 = lit, down
+// to 1 - u_shadow.z.
+bool sm_in(vec2 q) { return all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(1.0))); }
+float shadow_at(vec3 P, float bias, float tilt)
 {
     if (u_sms.w <= 0.0 || u_sms.z <= 0.0) return 1.0;
     vec2 suv = vec2((dot(P, u_smx.xyz) - u_smx.w) * u_sms.x, (dot(P, u_smy.xyz) - u_smy.w) * u_sms.y);
     float own = (u_smz.w - dot(P, u_smz.xyz) - bias) * u_sms.z;
-    float block = 0.0;
+    float bs = 0.0;
     for (int j = -1; j <= 1; j++)
         for (int i = -1; i <= 1; i++) {
             vec2 q = suv + vec2(i, j) / u_sms.w;
-            if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) continue;
-            block += texture(u_sm, q).r < own ? 1.0 : 0.0;
+            if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
         }
-    return 1.0 - (block / 9.0) * u_shadow.z;
+    bs /= 9.0;
+    float bw = 0.0;
+    if (u_soft.x > 0.0) {
+        vec2 st = 0.5 * u_soft.x * u_sms.xy;   // uv per tap
+        float ownw = own - u_soft.x * min(tilt, 3.0) * u_sms.z;
+        for (int j = -2; j <= 2; j++)
+            for (int i = -2; i <= 2; i++) {
+                vec2 q = suv + vec2(i, j) * st;
+                if (sm_in(q)) bw += texture(u_sm, q).r < ownw ? 1.0 : 0.0;
+            }
+        bw /= 25.0;
+    } else {
+        for (int j = -1; j <= 1; j++)
+            for (int i = -1; i <= 1; i++) {
+                vec2 q = suv + vec2(i, j) / u_sms.w;
+                if (sm_in(q)) bw += texture(u_sm, q).r < own ? 1.0 : 0.0;
+            }
+        bw /= 9.0;
+    }
+    return 1.0 - max(bs, bw) * u_shadow.z;
+}
+
+// Two pixels along +d from P on its own face (see main), as a step forward.
+vec3 face_step(vec2 uv0, vec3 P, float z, vec2 d)
+{
+    float f1 = sz_at(uv0 + d), f2 = sz_at(uv0 + 2.0 * d);
+    float b1 = sz_at(uv0 - d), b2 = sz_at(uv0 - 2.0 * d);
+    float ef = (f1 > 0.0 && f2 > 0.0) ? abs(1.0 / f2 - 2.0 / f1 + 1.0 / z) : 1e9;
+    float eb = (b1 > 0.0 && b2 > 0.0) ? abs(1.0 / b2 - 2.0 / b1 + 1.0 / z) : 1e9;
+    if (ef >= 1e9 && eb >= 1e9) return vec3(d * g_nat * z / u_proj.x * 2.0, 0.0);   // alone: facing the camera
+    return ef <= eb ? pos_at(uv0 + 2.0 * d, f2) - P : P - pos_at(uv0 - 2.0 * d, b2);
 }
 
 void main()
@@ -82,12 +121,15 @@ void main()
            : normalize(up * sin(el) + (right * cos(az) + fwd * sin(az)) * cos(el));
     float texel = u_sms.x > 0.0 ? 1.0 / (u_sms.x * u_sms.w) : 0.0;   // world units per map texel
 
-    // a sprite standing here: its own place on its upright plane, shadow only;
-    // the bias keeps its own cut-out from shading it
+    // a sprite standing here: its own place on its upright plane, shadow only.
+    // The framework moves sprite casters toward the light by a floor's bias
+    // (so their shadows start at their feet); this bias is larger than that,
+    // so its own cut-out never shades it
     float zs = texture(u_spr, v_uv).r;
     if (zs > 0.0 && zs < 50000.0 && texture(u_m, v_uv).g < 0.5) {
         vec3 S = pos_at(v_uv, zs);
-        o = vec4(shadow_at(S, u_shadow.y * zs + 6.0 * texel + 24.0), zs, 0.0, 1.0);
+        float floor_bias = (u_shadow.y * zs + 2.0 * texel) * (1.0 + 2.0 * (1.0 - max(dot(up, L), 0.0)));
+        o = vec4(shadow_at(S, floor_bias + 6.0 * texel + 24.0, 1.0), zs, 0.0, 1.0);
         return;
     }
 
@@ -97,14 +139,13 @@ void main()
     vec3 P = pos_at(uv0, z);
 
     // normal from two native pixels on each side (smoother than the nearest
-    // neighbour on the big flat-shaded PS1 polygons), the closer side at edges
-    vec2 px = 2.0 / g_nat;
-    float zr = sz_at(uv0 + vec2(px.x, 0.0)), zl = sz_at(uv0 - vec2(px.x, 0.0));
-    float zu = sz_at(uv0 + vec2(0.0, px.y)), zd = sz_at(uv0 - vec2(0.0, px.y));
-    vec3 dx = (zr > 0.0 && (abs(zr - z) <= abs(zl - z) || zl <= 0.0))
-            ? pos_at(uv0 + vec2(px.x, 0.0), zr) - P : P - pos_at(uv0 - vec2(px.x, 0.0), zl);
-    vec3 dy = (zu > 0.0 && (abs(zu - z) <= abs(zd - z) || zd <= 0.0))
-            ? pos_at(uv0 + vec2(0.0, px.y), zu) - P : P - pos_at(uv0 - vec2(0.0, px.y), zd);
+    // neighbour on the big flat-shaded PS1 polygons), on the side that goes
+    // on in P's plane: 1/Z runs straight across a plane on the picture, so
+    // the side whose 1/Z bends least (P, one and two pixels on) is P's own
+    // face; at a crease the other side's face would light a thin seam
+    vec2 p1 = 1.0 / g_nat;
+    vec3 dx = face_step(uv0, P, z, vec2(p1.x, 0.0));
+    vec3 dy = face_step(uv0, P, z, vec2(0.0, p1.y));
     vec3 n = normalize(cross(dx, dy) + vec3(0.0, 0.0, -1e-6));
     if (n.z > 0.0) n = -n;
 
@@ -112,6 +153,7 @@ void main()
 
     // the bias grows on faces turned from the light
     float shadow = lambert > 0.0
-        ? shadow_at(P, (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert))) : 1.0;
+        ? shadow_at(P, (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert)),
+                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05)) : 1.0;
     o = vec4(lambert * shadow, z, 0.0, 1.0);
 }
