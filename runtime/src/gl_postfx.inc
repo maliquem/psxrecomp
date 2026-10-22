@@ -819,7 +819,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         s_spr_runs[best < 0 ? 2 : rdir[r] ? 0 : 1]++;
         if (s_spr_dbg_nrun < SPR_DBG_RUNS) {
             float *g = s_spr_dbg_run[s_spr_dbg_nrun++];
-            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r];
+            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r] + 2 * rair[r];
             g[6] = sc->sv[(size_t)ids[r] * 3 * SC_V + 8] * 64.0f + sc->sv[(size_t)ids[r] * 3 * SC_V + 7] / 16.0f;   /* its CLUT */
         }
         if (best < 0) continue;

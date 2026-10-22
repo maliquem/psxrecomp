@@ -827,7 +827,7 @@ static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foo
 static int      s_spr_stood[SC_ANC_MAX], s_spr_stood_n = 0;   /* the last build: pieces stood at each foot point */
 static float    s_spr_dbg_anc[SC_ANC_MAX][2];                  /* its foot points (picture px) */
 enum { SPR_DBG_RUNS = 512 };
-static float    s_spr_dbg_run[SPR_DBG_RUNS][7];                /* its runs: box, foot point, at it, CLUT (9: too big) */
+static float    s_spr_dbg_run[SPR_DBG_RUNS][7];                /* its runs: box, foot point, at it (+2 over it), CLUT (9: too big) */
 static int      s_spr_dbg_nrun = 0;
 static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
 static float    s_anc_pend[SC_ANC_MAX][3];
