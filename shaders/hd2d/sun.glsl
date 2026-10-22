@@ -21,7 +21,11 @@
 //           is (0..1), w = 0
 // u_smx..u_sms: the framework's shadow map mapping (gl_postfx.inc)
 // u_soft:   x = how far the scenery's shadow edges spread (world units each
-//           way; 0 = a texel); the sprites' stay sharp
+//           way; 0 = a texel); the sprites' stay sharp. y > 0: the spread
+//           grows with the distance to what casts it, y world units per unit
+//           (the sun's size, as in percentage-closer soft shadows, Fernando
+//           2005), from a texel up to x: a bush's leaves sharp at its foot,
+//           a cliff's far edge soft; 0 = always x
 // u_ssm:    the sprites' shadow map (framework `sprshadow`, mapped as u_sm);
 //           u_ss.x 0 (framework) leaves it empty: no sprite shadows; u_ss.y
 //           0: the sprites' shadows only, no sun on the scenery (no facing,
@@ -61,7 +65,8 @@ vec2 uv_of(vec3 p) { return p.xy * u_proj.x / (p.z * g_nat) + 0.5; }
 // Shadow at P: is something nearer the light in the shadow maps? The
 // sprites' map (u_ssm) with 3x3 samples a texel apart (sharp pixel-art
 // silhouettes); the scenery's (u_sm) with 5x5 over u_soft.x world units each
-// way (soft edges; 0 = 3x3 texels), its bias grown with the receiver's tilt
+// way (soft edges; 0 = 3x3 texels; u_soft.y: over the distance to the
+// blockers found there times y, see above), its bias grown with the receiver's tilt
 // to the light (tilt = tan of the angle) across that spread; sprites (spr 0)
 // only from the scenery's, so no sprite shades itself or another (their feet
 // bent down to the floor sit off their own plane). 1 = lit, down to
@@ -81,8 +86,24 @@ float shadow_at(vec3 P, float bias, float tilt, float spr, float scn)
     bs *= spr / 9.0;
     float bw = 0.0;
     if (u_soft.x > 0.0) {
-        vec2 st = 0.5 * u_soft.x * u_sms.xy;   // uv per tap
-        float ownw = own - u_soft.x * min(tilt, 3.0) * u_sms.z;
+        float w = u_soft.x;
+        float ownw = own - w * min(tilt, 3.0) * u_sms.z;
+        if (u_soft.y > 0.0) {
+            // the blockers over the whole spread: how far above P they are
+            vec2 st0 = 0.5 * w * u_sms.xy;
+            float sum = 0.0, n = 0.0;
+            for (int j = -2; j <= 2; j++)
+                for (int i = -2; i <= 2; i++) {
+                    vec2 q = suv + vec2(i, j) * st0;
+                    float d = sm_in(q) ? texture(u_sm, q).r : 1.0;
+                    if (d < ownw) { sum += d; n += 1.0; }
+                }
+            if (n < 0.5) return 1.0 - bs * u_shadow.z;
+            float texel = 1.0 / (u_sms.x * u_sms.w);   // world units per map texel
+            w = clamp((own - sum / n) / u_sms.z * u_soft.y, texel, u_soft.x);
+            ownw = own - w * min(tilt, 3.0) * u_sms.z;
+        }
+        vec2 st = 0.5 * w * u_sms.xy;   // uv per tap
         for (int j = -2; j <= 2; j++)
             for (int i = -2; i <= 2; i++) {
                 vec2 q = suv + vec2(i, j) * st;
