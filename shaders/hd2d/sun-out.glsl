@@ -8,11 +8,14 @@
 // sun). HUD, menus and scenery behind something see-through are left as
 // they are.
 // u_suncol: rgb = sun tint x level,  u_amb: rgb = ambient tint x level,
-// u_sunview.x = 1 shows the lit term alone.
+// u_sunview.x = 1 shows the lit term alone; u_ss.y 0: the sprites' shadows
+// only (no sun on the scenery): the colour is kept, and darkened where a
+// sprite's shadow falls as a shadow darkens it under the sun (ambient over sun).
 
 uniform vec4 u_suncol;
 uniform vec4 u_amb;
 uniform vec4 u_sunview;
+uniform vec4 u_ss;
 
 // depth-aware upsample of the lit term (as in ao-out.glsl)
 float lit_at(float z)
@@ -49,6 +52,7 @@ void main()
     float z = 256.0 / max(1.0 - d, 1e-7) - 256.0;
     float lit = lit_at(z);
     if (u_sunview.x > 0.5) { o = vec4(vec3(m > 0.5 ? lit : 0.5), 1.0); return; }
-    vec3 shade = mix(u_amb.rgb, u_suncol.rgb, lit);
+    vec3 shade = u_ss.y > 0.5 ? mix(u_amb.rgb, u_suncol.rgb, lit)
+                              : mix(u_amb.rgb / max(u_suncol.rgb, vec3(1e-3)), vec3(1.0), lit);
     o = vec4(src * mix(vec3(1.0), shade, m), 1.0);
 }

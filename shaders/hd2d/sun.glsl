@@ -23,7 +23,9 @@
 // u_soft:   x = how far the scenery's shadow edges spread (world units each
 //           way; 0 = a texel); the sprites' stay sharp
 // u_ssm:    the sprites' shadow map (framework `sprshadow`, mapped as u_sm);
-//           u_ss.x 0 (framework) leaves it empty: no sprite shadows
+//           u_ss.x 0 (framework) leaves it empty: no sprite shadows; u_ss.y
+//           0: the sprites' shadows only, no sun on the scenery (no facing,
+//           no scenery shadows; sprites stay lit)
 // u_proj:   x = H, y = native height (240), z = internal scale (depth grid)
 // u_spr:    the sprites standing in the scene (framework `sprite` input): view
 //           depth of the sprite drawn at each pixel, >= 50000 = none; with
@@ -40,6 +42,7 @@ uniform vec4 u_shadowdir;
 uniform vec4 u_smx, u_smy, u_smz, u_sms;
 uniform vec4 u_proj;
 uniform vec4 u_soft;
+uniform vec4 u_ss;
 
 vec2 g_grid;
 vec2 g_nat;
@@ -64,7 +67,7 @@ vec2 uv_of(vec3 p) { return p.xy * u_proj.x / (p.z * g_nat) + 0.5; }
 // bent down to the floor sit off their own plane). 1 = lit, down to
 // 1 - u_shadow.z.
 bool sm_in(vec2 q) { return all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(1.0))); }
-float shadow_at(vec3 P, float bias, float tilt, float spr)
+float shadow_at(vec3 P, float bias, float tilt, float spr, float scn)
 {
     if (u_sms.w <= 0.0 || u_sms.z <= 0.0) return 1.0;
     vec2 suv = vec2((dot(P, u_smx.xyz) - u_smx.w) * u_sms.x, (dot(P, u_smy.xyz) - u_smy.w) * u_sms.y);
@@ -94,7 +97,7 @@ float shadow_at(vec3 P, float bias, float tilt, float spr)
             }
         bw /= 9.0;
     }
-    return 1.0 - max(bs, bw) * u_shadow.z;
+    return 1.0 - max(bs, bw * scn) * u_shadow.z;
 }
 
 // Two pixels along +d from P on its own face (see main), as a step forward.
@@ -129,9 +132,10 @@ void main()
     // so its own cut-out never shades it
     float zs = texture(u_spr, v_uv).r;
     if (zs > 0.0 && zs < 50000.0 && texture(u_m, v_uv).g < 0.5) {
+        if (u_ss.y < 0.5) { o = vec4(1.0, zs, 0.0, 1.0); return; }   // sprites only: lit
         vec3 S = pos_at(v_uv, zs);
         float floor_bias = (u_shadow.y * zs + 2.0 * texel) * (1.0 + 2.0 * (1.0 - max(dot(up, L), 0.0)));
-        o = vec4(shadow_at(S, floor_bias + 6.0 * texel + 24.0, 1.0, 0.0), zs, 0.0, 1.0);
+        o = vec4(shadow_at(S, floor_bias + 6.0 * texel + 24.0, 1.0, 0.0, 1.0), zs, 0.0, 1.0);
         return;
     }
 
@@ -154,8 +158,9 @@ void main()
     float lambert = clamp(dot(n, L), 0.0, 1.0);
 
     // the bias grows on faces turned from the light
-    float shadow = lambert > 0.0
+    float scn = u_ss.y > 0.5 ? 1.0 : 0.0;   // sprites only: no facing, no scenery shadows
+    float shadow = (lambert > 0.0 || scn < 0.5)
         ? shadow_at(P, (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert)),
-                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0) : 1.0;
-    o = vec4(lambert * shadow, z, 0.0, 1.0);
+                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0, scn) : 1.0;
+    o = vec4(mix(1.0, lambert, scn) * shadow, z, 0.0, 1.0);
 }
