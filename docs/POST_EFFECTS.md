@@ -150,11 +150,16 @@ the point near one end). Grouping keeps each run's root at its lowest piece,
 so a run is walked whole whatever the drawing order. A run that is not at
 one (a part on another texture page) joins a sprite only when it has that
 sprite's CLUT (HUD bars, panels and texts use the UI's palettes), touches one
-of its runs or is up to 8 px over it (eyes floating over a body), its middle
-is within that sprite's columns and it is no wider than the sprite + 8 px.
-A joined part stands on its sprite's plane, as drawn (its own bottom is no
-floor), and may be small; a sprite's own run under 12 px tall does not
-stand (a world map's markers). A sprite is
+of its runs or is up to 64 px over it (eyes floating over a body, a body in
+the air over its feet in a leap), its middle is within that sprite's columns
+and it is at most twice as wide. A joined part stands on its sprite's plane,
+as drawn (its own bottom is no floor), and may be small; a sprite's own run
+under 12 px tall does not stand (a world map's markers) nor keeps its foot
+point. A foot point no run is at takes the run over it (up to 64 px, its
+middle within half its width + 16 px), in a CLUT seen standing on the floor
+in the last 600 builds (a jump, an attack's step; never a UI palette): it
+stands where its lowest row meets the floor, so its shadow stays at its
+feet, its feet not bent. A sprite is
 stood upright where its lowest drawn pixel meets the floor (a plane facing
 the camera across the floor), each piece along its own view ray. When the
 light comes across the picture (in that plane, as in BoF4's battles) a
