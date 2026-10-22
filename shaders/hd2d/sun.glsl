@@ -59,10 +59,12 @@ vec2 uv_of(vec3 p) { return p.xy * u_proj.x / (p.z * g_nat) + 0.5; }
 // sprites' map (u_ssm) with 3x3 samples a texel apart (sharp pixel-art
 // silhouettes); the scenery's (u_sm) with 5x5 over u_soft.x world units each
 // way (soft edges; 0 = 3x3 texels), its bias grown with the receiver's tilt
-// to the light (tilt = tan of the angle) across that spread. 1 = lit, down
-// to 1 - u_shadow.z.
+// to the light (tilt = tan of the angle) across that spread; sprites (spr 0)
+// only from the scenery's, so no sprite shades itself or another (their feet
+// bent down to the floor sit off their own plane). 1 = lit, down to
+// 1 - u_shadow.z.
 bool sm_in(vec2 q) { return all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(1.0))); }
-float shadow_at(vec3 P, float bias, float tilt)
+float shadow_at(vec3 P, float bias, float tilt, float spr)
 {
     if (u_sms.w <= 0.0 || u_sms.z <= 0.0) return 1.0;
     vec2 suv = vec2((dot(P, u_smx.xyz) - u_smx.w) * u_sms.x, (dot(P, u_smy.xyz) - u_smy.w) * u_sms.y);
@@ -73,7 +75,7 @@ float shadow_at(vec3 P, float bias, float tilt)
             vec2 q = suv + vec2(i, j) / u_sms.w;
             if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
         }
-    bs /= 9.0;
+    bs *= spr / 9.0;
     float bw = 0.0;
     if (u_soft.x > 0.0) {
         vec2 st = 0.5 * u_soft.x * u_sms.xy;   // uv per tap
@@ -129,7 +131,7 @@ void main()
     if (zs > 0.0 && zs < 50000.0 && texture(u_m, v_uv).g < 0.5) {
         vec3 S = pos_at(v_uv, zs);
         float floor_bias = (u_shadow.y * zs + 2.0 * texel) * (1.0 + 2.0 * (1.0 - max(dot(up, L), 0.0)));
-        o = vec4(shadow_at(S, floor_bias + 6.0 * texel + 24.0, 1.0), zs, 0.0, 1.0);
+        o = vec4(shadow_at(S, floor_bias + 6.0 * texel + 24.0, 1.0, 0.0), zs, 0.0, 1.0);
         return;
     }
 
@@ -154,6 +156,6 @@ void main()
     // the bias grows on faces turned from the light
     float shadow = lambert > 0.0
         ? shadow_at(P, (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert)),
-                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05)) : 1.0;
+                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0) : 1.0;
     o = vec4(lambert * shadow, z, 0.0, 1.0);
 }
