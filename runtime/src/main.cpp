@@ -17673,6 +17673,8 @@ int main(int argc, char** argv) {
                                  gc.runtime.video_shadow_key_addr.data(), gc.runtime.video_shadow_key_size.data(),
                                  (int)gc.runtime.video_shadow_key_addr.size());
             psx_shadow_camera_ram(gc.runtime.video_shadow_camera_addr);
+            psx_shadow_sprite_anchors(gc.runtime.video_shadow_sprite_anchors.data(),
+                                      (int)gc.runtime.video_shadow_sprite_anchors.size());
             gpu_set_hidden_textures(gc.runtime.video_shadow_hide_tpage.data(), gc.runtime.video_shadow_hide_clut.data(),
                                     (int)gc.runtime.video_shadow_hide_tpage.size());
             g_video_ss_milli   = gc.runtime.video_supersample_milli;

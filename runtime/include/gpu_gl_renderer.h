@@ -220,6 +220,11 @@ int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
 /* The camera the triangles drawn from now on use (gpu.c, camera "ram:"): the
  * picture they make is lit with exactly this camera. */
 void  gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h);
+/* A sprite's foot point (gpu.c, sprite_anchors) in the view space of the camera
+ * that projected it (GTE axes), in stream order: the 2D pieces of the next frame
+ * drawn around it stand there. */
+void  gl_renderer_shadow_anchor(const float v[3]);
+int   gl_renderer_shadow_sprites_wanted(void);   /* a chain reads `sprite` */
 /* The scene's static geometry in world space (a game mod reads it from the
  * game's own map data): n triangles x 9 floats (x, y, z per corner, the
  * coordinates the game feeds the GTE). While set, and the picture's camera is

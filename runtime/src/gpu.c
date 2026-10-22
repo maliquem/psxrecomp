@@ -746,6 +746,7 @@ static int      sh_camera = 0, sh_od_x = 0, sh_od_y = 0, sh_nkeys = 0, sh_od_on 
 static uint32_t sh_key_addr[8], sh_key_size[8], sh_key_last = 0xFFFFFFFFu;
 static uint32_t sh_fed = 0, sh_rejected = 0;   /* VBlank reads handed over / not a rotation */
 static uint32_t sh_cam_taken = 0;                /* camera ram: matches with the GTE */
+static uint32_t sh_anc_taken = 0, sh_blobs = 0;   /* sprite foot points; game blobs not drawn */
 /* [video.shadow] hide_textures: the game's own blob shadows (a dark disc
  * under characters and objects), as texture page (9 bits) + CLUT (0xFFFF =
  * any: some games animate the shadow's palette) of the
@@ -769,9 +770,9 @@ static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
 static float    sh_last_bad[10];
 int psx_shadow_state(char *out, int cap) {
     return snprintf(out, (size_t)cap, "\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
-                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,"
+                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
                     "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken,
+                    sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -826,6 +827,70 @@ static void shadow_camera_note(void) {
     sh_cam_taken++;
     gl_renderer_shadow_frame_camera(sh_cam_last, sh_cam_last + 9, sh_cam_last[12], sh_cam_last[13], sh_cam_last[14]);
 }
+/* [video.shadow] sprite_anchors: the return addresses of the game's calls that
+ * project a sprite's foot point (an RTPS with the camera; BoF4: characters and
+ * monsters). Each one is handed to the renderer in stream order, in the view space
+ * of the camera that projects it (the one its 2D pieces are drawn with), so the 2D
+ * pieces drawn around it that frame are known to stand there (sprite shadows,
+ * gl_postfx.inc), and the game's own blob under it, a translucent flat textured
+ * quad centred on the point, is not drawn while sprites cast real shadows. */
+extern uint32_t psx_mod_cpu_gpr(int r);
+extern int psx_mod_gte_data(uint32_t out[32]);
+enum { SH_ANC_MAX = 64 };
+static uint32_t sh_anc_ra[8];
+static int      sh_anc_n = 0, sh_anc_live = 0;
+static int16_t  sh_anc_sxy[SH_ANC_MAX][2];
+static uint32_t sh_anc_frame[SH_ANC_MAX];
+static int      sh_anc_at = 0;
+void psx_shadow_sprite_anchors(const uint32_t *ra, int n) {
+    sh_anc_n = n < 0 ? 0 : n > 8 ? 8 : n;
+    for (int i = 0; i < sh_anc_n; i++) sh_anc_ra[i] = ra[i];
+}
+static void shadow_anchor_note(void) {
+    const uint32_t ra = psx_mod_cpu_gpr(31);
+    int k = 0;
+    while (k < sh_anc_n && sh_anc_ra[k] != ra) k++;
+    if (k == sh_anc_n) return;
+    int16_t ri[9];
+    int32_t pj[6];
+    uint32_t d[32];
+    if (!psx_mod_gte_rotation(ri) || !psx_mod_gte_projection(pj) || !psx_mod_gte_data(d)) return;
+    if (!sh_cam_have[0] || memcmp(ri, sh_cam_r[0], sizeof ri) || memcmp(pj, sh_cam_t[0], sizeof sh_cam_t[0])) return;
+    const float w[3] = {(float)(int16_t)d[0], (float)(int16_t)(d[0] >> 16), (float)(int16_t)d[1]};
+    float V[3];
+    for (int r = 0; r < 3; r++)
+        V[r] = sh_cam_last[r * 3] * w[0] + sh_cam_last[r * 3 + 1] * w[1] + sh_cam_last[r * 3 + 2] * w[2] + sh_cam_last[9 + r];
+    if (V[2] < 1.0f) return;
+    const int sx = (int)lroundf(sh_cam_last[12] + sh_cam_last[14] * V[0] / V[2]);
+    const int sy = (int)lroundf(sh_cam_last[13] + sh_cam_last[14] * V[1] / V[2]);
+    /* the same point projected again (a second call for the same sprite) */
+    const int last = (sh_anc_at + SH_ANC_MAX - 1) % SH_ANC_MAX;
+    if (sh_anc_frame[last] == (uint32_t)s_frame_count && sh_anc_sxy[last][0] == sx && sh_anc_sxy[last][1] == sy) return;
+    sh_anc_sxy[sh_anc_at][0] = (int16_t)sx; sh_anc_sxy[sh_anc_at][1] = (int16_t)sy;
+    sh_anc_frame[sh_anc_at] = (uint32_t)s_frame_count;
+    sh_anc_at = (sh_anc_at + 1) % SH_ANC_MAX;
+    sh_anc_taken++;
+    gl_renderer_shadow_anchor(V);   /* in this projection's own camera space */
+}
+/* A translucent textured quad, flatter than tall, centred (3 px) on a foot
+ * point projected in the last few VBlanks: the game's blob shadow. */
+static int shadow_blob_quad(int semi, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3) {
+    if (!sh_anc_live || !semi) return 0;
+    const uint32_t p[4] = {p0, p1, p2, p3};
+    int x0 = 99999, x1 = -99999, y0 = 99999, y1 = -99999;
+    for (int i = 0; i < 4; i++) {
+        const int x = ((int)(p[i] & 0x7FFu) ^ 0x400) - 0x400, y = ((int)((p[i] >> 16) & 0x7FFu) ^ 0x400) - 0x400;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    const int w = x1 - x0, h = y1 - y0;
+    if (h <= 0 || w > 128 || w * 10 < h * 13) return 0;
+    const int cx2 = x0 + x1, cy2 = y0 + y1;   /* twice the centre */
+    for (int i = 0; i < SH_ANC_MAX; i++) {
+        if ((uint32_t)s_frame_count - sh_anc_frame[i] > 3u || !sh_anc_frame[i]) continue;
+        if (abs(cx2 - 2 * sh_anc_sxy[i][0]) <= 6 && abs(cy2 - 2 * sh_anc_sxy[i][1]) <= 6) { sh_blobs++; return 1; }
+    }
+    return 0;
+}
 static void shadow_vblank(void) {
     const int wanted = gl_renderer_shadow_wanted();
     sh_hide_on = wanted && sh_hide_n > 0;
@@ -834,6 +899,7 @@ static void shadow_vblank(void) {
         sh_od_on = wanted;
     }
     sh_bf_on = wanted && sh_camera;
+    sh_anc_live = wanted && sh_camera == 2 && sh_anc_n > 0 && gl_renderer_shadow_sprites_wanted();
     if (sh_bf_on) shadow_backfaces_flush();   /* this frame's culled faces, before the camera takes the frame in */
     if (!wanted || !sh_camera) return;
     uint32_t key = 0;
@@ -3725,7 +3791,10 @@ static void sh_bf_take(const uint32_t *d) {
     psx_shadow_backface(sxy, sz);
 }
 static void shadow_note_projection(int nverts) {
-    if (sh_bf_on && sh_camera == 2) shadow_camera_note();   /* the matrix this projection uses */
+    if (sh_bf_on && sh_camera == 2) {
+        shadow_camera_note();   /* the matrix this projection uses */
+        if (nverts == 1 && sh_anc_live) shadow_anchor_note();
+    }
     const int prev = sh_bf_prev;
     sh_bf_prev = nverts;
     if (!sh_bf_on || !prev) return;
@@ -5620,7 +5689,8 @@ static void gp0_exec_textured_tri(void) {
 /* Execute textured quad (GP0 0x2C-0x2F) */
 static void gp0_exec_textured_quad(void) {
     if (native_wide_projective_draw()) return;
-    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16)) ||
+        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5], gp0_cmd_buf[7])) {
         set_tpage_from_poly((uint16_t)(gp0_cmd_buf[4] >> 16)); return;
     }
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
@@ -5796,7 +5866,8 @@ int psx_mod_texture_banks_supported(void) {
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
 static void gp0_exec_shaded_textured_quad(void) {
     if (native_wide_projective_draw()) return;
-    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16))) {
+    if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16)) ||
+        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7], gp0_cmd_buf[10])) {
         set_tpage_from_poly((uint16_t)(gp0_cmd_buf[5] >> 16)); return;
     }
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;

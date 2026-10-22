@@ -850,6 +850,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 if (rt.video_shadow_hide_tpage.size() > 16)
                     throw std::runtime_error("[video.shadow] hide_textures: at most 16");
             }
+            if (sh.contains("sprite_anchors")) {
+                for (const auto& k : toml::find<std::vector<std::string>>(sh, "sprite_anchors"))
+                    rt.video_shadow_sprite_anchors.push_back((uint32_t)std::stoul(k, nullptr, 0));
+                if (rt.video_shadow_sprite_anchors.size() > 8)
+                    throw std::runtime_error("[video.shadow] sprite_anchors: at most 8");
+            }
         }
         if (video.contains("supersample")) {
             const auto& v = toml::find(video, "supersample");

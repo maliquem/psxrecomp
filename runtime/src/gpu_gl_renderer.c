@@ -466,7 +466,7 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_FCAM
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_FCAM, RTH_ANCHOR
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -804,9 +804,26 @@ enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
 typedef struct { float r[9], t[3], of[2], h; } ScCam;
 /* conv: taken into the world store; cam (cam_ok): the frame camera when its
  * triangles were drawn (gl_renderer_shadow_frame_camera), cam_ver its version */
-typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver; } ScSlot;
+/* sv/sn: the frame's 2D textured triangles (sprites, HUD; SC_V floats per
+ * vertex, z = 1 when translucent); anc/nanc: the sprite foot points projected
+ * for that frame (gl_renderer_shadow_anchor, view space of their camera). */
+enum { SC_ANC_MAX = 64 };
+/* atl: the cut-outs of the frame's sprite pieces (1 = drawn texel), copied from
+ * VRAM as each piece was drawn (the game may load the next animation's pieces
+ * before the picture is shown), packed in rows of SC_ATL x SC_ATL. */
+enum { SC_ATL = 512 };
+typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
+                 float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
+                 uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky; } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
+/* Sprite shadows (a chain reads `sprite`): the foot points projected since the
+ * last frame began, taken by the next frame to start. */
+static int      s_spr_on = 0;
+static unsigned s_spr_frames = 0, s_spr_last = 0;   /* frames with sprite casters; pieces in the last one */
+static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, by column only, none */
+static float    s_anc_pend[SC_ANC_MAX][3];
+static int      s_anc_pend_n = 0;
 static ScCam    s_fcam;                /* the camera of the triangles being drawn */
 static int      s_fcam_ok = 0;
 static unsigned s_fcam_ver = 0;
@@ -821,10 +838,84 @@ static ScSlot *sc_slot(const int area[4], int make) {
     }
     if (!make) return NULL;
     memcpy(lru->area, area, sizeof lru->area);
-    lru->n = 0; lru->conv = 0; lru->shown = 0;
+    lru->n = 0; lru->conv = 0; lru->shown = 0; lru->sn = 0; lru->nanc = 0;
+    lru->atl_x = lru->atl_y = lru->atl_h = 0; lru->atl_key[0] = -1;
     if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
     return lru->cap ? lru : NULL;
 }
+/* A new frame in this list: it starts over and takes the foot points. */
+static void sc_restart(ScSlot *sl) {
+    sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0;
+    sl->atl_x = sl->atl_y = sl->atl_h = 0; sl->atl_key[0] = -1;
+    memcpy(sl->anc, s_anc_pend, (size_t)s_anc_pend_n * sizeof s_anc_pend[0]);
+    sl->nanc = s_anc_pend_n;
+    s_anc_pend_n = 0;
+}
+/* A 2D textured triangle (not proven 3D): kept while sprites cast, so the
+ * pieces drawn around a foot point can stand there in the shadow map. */
+static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, const int *ys,
+                              const int *us, const int *vs, const float *tex6, int semi) {
+    if (!s_spr_on) return;
+    const int area[4] = {x1, y1, x2, y2};
+    ScSlot *sl = sc_slot(area, 1);
+    if (!sl) return;
+    if (sl->shown) sc_restart(sl);
+    if (sl->sn >= 8192) return;
+    if (sl->sn == sl->scap) {
+        const int nc = sl->scap ? sl->scap * 2 : 512;
+        float *p = (float *)realloc(sl->sv, (size_t)nc * 3 * SC_V * sizeof(float));
+        if (!p) return;
+        sl->sv = p; sl->scap = nc;
+    }
+    /* the piece's cut-out as drawn now: its texel box, through its page, CLUT
+     * and texture window, into the slot's atlas (depth 3 = atlas texel) */
+    int ax = -1, ay = 0, u0 = 255, v0 = 255, u1 = 0, w1 = 0;
+    const int depth = (int)tex6[4];
+    if (s_vram && depth >= 0 && depth <= 2) {
+        for (int i = 0; i < 3; i++) {
+            u0 = us[i] < u0 ? us[i] : u0; u1 = us[i] > u1 ? us[i] : u1;
+            v0 = vs[i] < v0 ? vs[i] : v0; w1 = vs[i] > w1 ? vs[i] : w1;
+        }
+        const int px = (int)tex6[0], py = (int)tex6[1], cx = (int)tex6[2], cy = (int)tex6[3], win = (int)tex6[5];
+        const int key[10] = {px, py, cx, cy, depth, win, u0, v0, u1, w1};
+        const int w = u1 - u0 + 1, hgt = w1 - v0 + 1;
+        if (!memcmp(key, sl->atl_key, sizeof key)) { ax = sl->atl_kx; ay = sl->atl_ky; }   /* the quad's other half */
+        else if (w > 0 && hgt > 0 && w <= 256 && hgt <= 256) {
+            if (!sl->atl) sl->atl = (uint8_t *)malloc((size_t)SC_ATL * SC_ATL);
+            if (sl->atl_x + w > SC_ATL) { sl->atl_x = 0; sl->atl_y += sl->atl_h; sl->atl_h = 0; }
+            if (sl->atl && sl->atl_y + hgt <= SC_ATL) {
+                ax = sl->atl_x; ay = sl->atl_y;
+                const int twx = win & 31, twy = (win >> 5) & 31, tox = (win >> 10) & 31, toy = (win >> 15) & 31;
+                for (int t = 0; t < hgt; t++)
+                    for (int s = 0; s < w; s++) {
+                        int u = (u0 + s) & 255, vv = (v0 + t) & 255;
+                        if (twx | twy) { u = (u & ~(twx * 8)) | ((tox & twx) * 8); vv = (vv & ~(twy * 8)) | ((toy & twy) * 8); }
+                        const int row = ((py + vv) & 511) * 1024;
+                        uint16_t raw;
+                        if (depth == 0) raw = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((px + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+                        else if (depth == 1) raw = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((px + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+                        else raw = s_vram[row + ((px + u) & 1023)];
+                        sl->atl[(size_t)(ay + t) * SC_ATL + ax + s] = raw ? 255 : 0;
+                    }
+                sl->atl_x += w; if (hgt > sl->atl_h) sl->atl_h = hgt;
+                memcpy(sl->atl_key, key, sizeof key); sl->atl_kx = ax; sl->atl_ky = ay;
+            }
+        }
+    }
+    float *v = sl->sv + (size_t)sl->sn * 3 * SC_V;
+    for (int i = 0; i < 3; i++, v += SC_V) {
+        v[0] = (float)xs[i]; v[1] = (float)ys[i]; v[2] = semi >= 0 ? 1.0f : 0.0f;
+        v[3] = (float)us[i]; v[4] = (float)vs[i];
+        for (int k = 0; k < 6; k++) v[5 + k] = tex6[k];
+        if (ax >= 0) {   /* atlas texel coordinates; page/CLUT kept to tell sprites apart */
+            v[3] = (float)(ax + us[i] - u0); v[4] = (float)(ay + vs[i] - v0); v[9] = 3.0f;
+        }
+    }
+    sl->sn++;
+    sl->use = ++s_sc_use;
+}
+/* The atlas of this slot's sprite pieces, rows in use (0 = none). */
+static int sc_atlas_rows(const ScSlot *sl) { return sl && sl->atl ? sl->atl_y + sl->atl_h : 0; }
 /* tex: NULL = untextured, else {u0,v0,u1,v1,u2,v2, page x, page y, clut x,
  * clut y, depth, window}. */
 static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
@@ -832,7 +923,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
-    if (sl->shown) { sl->shown = 0; sl->n = 0; sl->conv = 0; }   /* a new frame into a shown picture */
+    if (sl->shown) sc_restart(sl);   /* a new frame into a shown picture */
     if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
     if (sl->n >= SC_MAX_TRIS) return;
     if (sl->n == sl->cap) {
@@ -857,7 +948,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
 static void sc_area_reset(int x1, int y1, int x2, int y2) {
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 0);
-    if (sl) { sl->n = 0; sl->shown = 0; sl->conv = 0; }
+    if (sl) sc_restart(sl);
 }
 /* The casters of the picture on screen: the list whose area holds its centre. */
 static const ScSlot *sc_presented(void) {
@@ -1163,6 +1254,23 @@ static void fcam_apply(const float *c) {
     memcpy(s_fcam.r, c, sizeof s_fcam.r); memcpy(s_fcam.t, c + 9, sizeof s_fcam.t);
     s_fcam.of[0] = c[12]; s_fcam.of[1] = c[13]; s_fcam.h = c[14] > 0.0f ? c[14] : 1024.0f;
 }
+static void anchor_apply(const float *w) {
+    if (s_anc_pend_n >= SC_ANC_MAX) return;
+    memcpy(s_anc_pend[s_anc_pend_n++], w, sizeof s_anc_pend[0]);
+}
+/* A sprite's foot point (gpu.c, sprite_anchors) in the view space of the camera
+ * that projected it (GTE: y down), in stream order like the camera: the next
+ * frame to start takes it. */
+void gl_renderer_shadow_anchor(const float w[3]) {
+    if (rth_record_mode()) {
+        int32_t v[3];
+        memcpy(v, w, sizeof v);
+        if (rth_rec_ints(RTH_ANCHOR, 0, 3, v)) return;
+        gl_rth_acquire("shadow_anchor");
+    }
+    anchor_apply(w);
+}
+int gl_renderer_shadow_sprites_wanted(void) { return s_spr_on; }
 /* Recorded with the drawing on a render thread (RTH_FCAM), so the triangles
  * after it get it and the emulation thread never waits. */
 void gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
@@ -1199,11 +1307,37 @@ int gl_renderer_shadow_cache_stats(char *out, int cap) {
     GL_RT_SYNC("shadow_cache_stats");
     return snprintf(out, (size_t)cap,
         "\"camera\":%d,\"stored\":%d,\"alive\":%d,\"matched\":%llu,\"added\":%llu,\"dropped\":%llu,"
-        "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
+        "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"sprite_frames\":%u,\"sprite_pieces\":%u,\"sprite_runs\":[%u,%u,%u],\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
-        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver,
+        (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver, s_spr_frames, s_spr_last, s_spr_runs[0], s_spr_runs[1], s_spr_runs[2],
         s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
         scc_log_json(out, cap);
+}
+/* TCP sprite_dump: the picture on screen's foot points and 2D pieces, on the
+ * picture (native px from its centre): pieces as [x0, y0, x1, y1, page x,
+ * page y, CLUT x, CLUT y, translucent], in drawing order. */
+int gl_renderer_sprite_dump_json(char *out, int cap) {
+    GL_RT_SYNC("sprite_dump");
+    const ScSlot *sl = sc_presented();
+    int k = snprintf(out, (size_t)cap, "\"anchors\":[");
+    if (!sl) return k + snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[]");
+    for (int q = 0; q < sl->nanc && k < cap - 64; q++) {
+        const float *V = sl->anc[q];
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.1f,%.1f]", q ? "," : "",
+                      V[2] > 1.0f ? s_cam_h * V[0] / V[2] : 0.0f, V[2] > 1.0f ? s_cam_h * V[1] / V[2] : 0.0f);
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[");
+    for (int t = 0; t < sl->sn && k < cap - 128; t++) {
+        const float *v = sl->sv + (size_t)t * 3 * SC_V;
+        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+        for (int j = 0; j < 3; j++) {
+            x0 = fminf(x0, v[j * SC_V] - s_sc_cx); x1 = fmaxf(x1, v[j * SC_V] - s_sc_cx);
+            y0 = fminf(y0, v[j * SC_V + 1] - s_sc_cy); y1 = fmaxf(y1, v[j * SC_V + 1] - s_sc_cy);
+        }
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]", t ? "," : "",
+                      x0, y0, x1, y1, v[5], v[6], v[7], v[8], v[2]);
+    }
+    return k + snprintf(out + k, (size_t)(cap - k), "]");
 }
 
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
@@ -5338,6 +5472,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                 t[11] = (float)(twx | (twy << 5) | (tox << 10) | (toy << 15));
                 sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, t);
             }
+        } else if (s_spr_on) {
+            const float t6[6] = {(float)base_x, (float)base_y, (float)clut_x, (float)clut_y,
+                                 s_selected_bank_tex ? -1.0f : (float)depth,
+                                 (float)(twx | (twy << 5) | (tox << 10) | (toy << 15))};
+            sc_add_sprite_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, us, vs, t6, semi);
         }
         int reason = -1;
         if (s_tb_n > 0) {
@@ -14400,6 +14539,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         float c[15];
         memcpy(c, &v[1], sizeof c);
         fcam_apply(v[0] ? c : NULL);
+        break;
+    }
+    case RTH_ANCHOR: {
+        float w[3];
+        memcpy(w, v, sizeof w);
+        anchor_apply(w);
         break;
     }
     case RTH_FILL:      glb_fill_rect(v[0], v[1], v[2], v[3], (uint16_t)v[4]); break;

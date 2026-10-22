@@ -494,6 +494,9 @@ struct RuntimeConfig {
     // not drawn while the shadow map is in use.
     std::vector<uint32_t> video_shadow_hide_tpage;
     std::vector<uint32_t> video_shadow_hide_clut;
+    // sprite_anchors = ["0xRA", ...]: return addresses of the game's calls whose
+    // RTPS projects a sprite's foot point (sprite shadows; camera "ram:" only).
+    std::vector<uint32_t> video_shadow_sprite_anchors;
     // supersample: factor on the internal-resolution target (Match display or
     // a line preset), 1.0..4.0, kept in thousandths (internal_resolution.h).
     int                   video_supersample_milli = 1000;

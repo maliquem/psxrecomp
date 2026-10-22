@@ -8679,6 +8679,17 @@ static void handle_shadow_cache(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+/* sprite_dump: the foot points and 2D pieces of the picture on screen
+ * (sprite shadows, gl_renderer_sprite_dump_json). */
+static void handle_sprite_dump(int id, const char *json)
+{
+    (void)json;
+    extern int gl_renderer_sprite_dump_json(char *out, int cap);
+    static char body[65536];
+    gl_renderer_sprite_dump_json(body, (int)sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 /* postfx_timing: {"on":1,"reset":1} starts measuring; {} reads the means
  * (GPU microseconds per stage and pass of the post-effect chains). */
 /* shadow_hide: {"list":"0x46:0x7c43,0x149:0x6480"} sets [video.shadow]
@@ -16091,6 +16102,7 @@ static const CmdEntry s_commands[] = {
     { "post_shader",       handle_post_shader },
     { "post_uniform",      handle_post_uniform },
     { "shadow_cache",      handle_shadow_cache },
+    { "sprite_dump",       handle_sprite_dump },
     { "postfx_timing",     handle_postfx_timing },
     { "shadow_hide",       handle_shadow_hide },
     { "extra_shader",      handle_extra_shader },

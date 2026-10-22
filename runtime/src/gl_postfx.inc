@@ -151,6 +151,10 @@ static void pfx_mask_wanted_update(void) {
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_shadow) wants = 1;
+    int wspr = 0;
+    for (int i = 0; i < PFX_NSTAGES; i++)
+        if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_sprite) wspr = 1;
+    s_spr_on = wspr;
     if (wants && !s_sc_on) gl_renderer_shadow_cache_clear();   /* switched on: a fresh memory */
     s_sc_on = wants;
     if (want != s_bcls_on || want3d != s_b3d_on || wantd != s_dep_on) {
@@ -437,11 +441,207 @@ static GLint  s_sm_uvram = -1;
 static float  s_sm_u[4][4];
 static float  s_sm_world[3][4];   /* u_world, u_worldup, u_shadowdir (view space, y up; w 1 = set) */
 static float *s_sm_buf = NULL; static int s_sm_cap = 0;
+/* Sprites standing in the scene (gl_renderer_shadow_anchor): their pieces as
+ * casters (view space) and their view depth on the picture (`sprite`, R32F,
+ * SPR_NONE where no sprite is). */
+enum { SPR_NONE = 60000 };
+static GLuint s_spr_tex = 0, s_spr_fbo = 0, s_spr_prog = 0;
+static GLint  s_spr_uvram = -1, s_sm_uatl = -1, s_spr_uatl = -1;
+static GLuint s_spr_atl_tex = 0;   /* the presented slot's sprite cut-outs (R8, SC_ATL square) */
+static int    s_spr_w = 0, s_spr_h = 0, s_spr_n = 0;
+static float *s_spr_cast = NULL, *s_spr_scr = NULL; static int s_spr_cap = 0;
 static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
     for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
     return NULL;
 }
-static void pfx_shadow_build(const PfxPass *ps, float aspect) {
+/* Union-find root of piece i (path halving). */
+static int spr_root(int *par, int i) {
+    while (par[i] != i) i = par[i] = par[par[i]];
+    return i;
+}
+/* The frame's 2D pieces standing at its sprites' foot points: the pieces of
+ * one sprite (a run drawn together, see below) go to the foot point at their
+ * bottom, and each is put on that sprite's upright plane (through the foot
+ * point, facing the camera across the floor) along its own view ray. Out: s_spr_n
+ * vertices, as casters in view space (s_spr_cast) and on the picture
+ * (s_spr_scr: clip x, y, view z). */
+static void pfx_sprites_stand(const ScSlot *sc, float aspect) {
+    s_spr_n = 0;
+    if (!s_spr_on || !sc || !s_cam_ok || sc->nanc <= 0 || sc->sn <= 0 || s_sm_world[1][3] < 0.5f) return;
+    float AP[SC_ANC_MAX][3], AS[SC_ANC_MAX][2];
+    int na = 0;
+    for (int q = 0; q < sc->nanc; q++) {
+        const float *V = sc->anc[q];   /* view space of the camera that drew its pieces */
+        if (V[2] < 16.0f) continue;
+        AP[na][0] = V[0]; AP[na][1] = -V[1]; AP[na][2] = V[2];
+        AS[na][0] = s_cam_h * V[0] / V[2]; AS[na][1] = s_cam_h * V[1] / V[2];
+        na++;
+    }
+    if (!na) return;
+    const float *u = s_sm_world[1];   /* world up, view space (y up) */
+    float nrm[3] = {-u[0] * u[2], -u[1] * u[2], 1.0f - u[2] * u[2]};   /* forward minus its up part */
+    const float nl = sqrtf(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+    if (nl < 1e-3f) { nrm[0] = nrm[1] = 0.0f; nrm[2] = 1.0f; } else for (int i = 0; i < 3; i++) nrm[i] /= nl;
+    if (sc->sn * 3 > s_spr_cap) {
+        float *c = (float *)realloc(s_spr_cast, (size_t)sc->sn * 3 * SC_V * sizeof(float));
+        if (c) s_spr_cast = c;
+        float *s = (float *)realloc(s_spr_scr, (size_t)sc->sn * 3 * SC_V * sizeof(float));
+        if (s) s_spr_scr = s;
+        if (!c || !s) return;
+        s_spr_cap = sc->sn * 3;
+    }
+    const float h = s_cam_h, kx = 1.0f / (120.0f * aspect), ky = 1.0f / 120.0f;
+    /* One sprite = its opaque pieces from one texture page and CLUT that touch
+     * one another, in whatever order they were drawn (the game sorts by depth,
+     * so two sprites' pieces interleave). Translucent pieces (dust, glows, the
+     * game's own blob) neither cast nor take shadows. */
+    enum { SPR_MAXP = 1024 };
+    static int   par[SPR_MAXP], ids[SPR_MAXP];
+    static float box[SPR_MAXP][4];
+    int m = 0;
+    for (int t = 0; t < sc->sn && m < SPR_MAXP; t++) {
+        const float *v = sc->sv + (size_t)t * 3 * SC_V;
+        if (v[2] != 0.0f) continue;   /* translucent */
+        float *b = box[m];
+        b[0] = b[2] = 1e30f; b[1] = b[3] = -1e30f;
+        for (int j = 0; j < 3; j++) {
+            const float x = v[j * SC_V] - s_sc_cx, y = v[j * SC_V + 1] - s_sc_cy;
+            b[0] = fminf(b[0], x); b[1] = fmaxf(b[1], x); b[2] = fminf(b[2], y); b[3] = fmaxf(b[3], y);
+        }
+        ids[m] = t; par[m] = m; m++;
+    }
+    for (int i = 0; i < m; i++) {
+        const float *vi = sc->sv + (size_t)ids[i] * 3 * SC_V;
+        for (int j = i + 1; j < m; j++) {
+            const float *vj = sc->sv + (size_t)ids[j] * 3 * SC_V;
+            if (vi[5] != vj[5] || vi[6] != vj[6] || vi[7] != vj[7] || vi[8] != vj[8]) continue;
+            if (box[j][0] > box[i][1] + 2.0f || box[j][1] < box[i][0] - 2.0f ||
+                box[j][2] > box[i][3] + 2.0f || box[j][3] < box[i][2] - 2.0f) continue;
+            const int a = spr_root(par, i), c = spr_root(par, j);
+            if (a != c) par[c] = a;
+        }
+    }
+    for (int r = 0; r < m; r++) {
+        if (spr_root(par, r) != r) continue;
+        float bx0 = 1e30f, bx1 = -1e30f, by0 = 1e30f, by1 = -1e30f;
+        for (int i = r; i < m; i++)
+            if (spr_root(par, i) == r) {
+                bx0 = fminf(bx0, box[i][0]); bx1 = fmaxf(bx1, box[i][1]);
+                by0 = fminf(by0, box[i][2]); by1 = fmaxf(by1, box[i][3]);
+            }
+        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;   /* panels, not a sprite */
+        /* its foot point: at its bottom, in its columns (else, a part cut off
+         * from its sprite: the foot point below it in the same column) */
+        const float cx = 0.5f * (bx0 + bx1);
+        int best = -1; float bs = 1e30f;
+        for (int q = 0; q < na; q++) {
+            if (AS[q][0] < bx0 - 8.0f || AS[q][0] > bx1 + 8.0f || by1 < AS[q][1] - 8.0f || by1 > AS[q][1] + 20.0f) continue;
+            const float s = fabsf(by1 - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
+            if (s < bs) { bs = s; best = q; }
+        }
+        s_spr_runs[best < 0 ? 1 : 0]++;
+        if (best < 0)
+            for (int q = 0; q < na; q++) {
+                const float dx = fabsf(cx - AS[q][0]);
+                if (dx > 48.0f || by1 > AS[q][1] + 10.0f || by0 < AS[q][1] - 160.0f) continue;
+                const float s = 1000.0f + dx + 0.25f * fabsf(by1 - AS[q][1]);
+                if (s < bs) { bs = s; best = q; }
+            }
+        if (best < 0) { s_spr_runs[2]++; s_spr_runs[1]--; continue; }
+        const float na_d = nrm[0] * AP[best][0] + nrm[1] * AP[best][1] + nrm[2] * AP[best][2];
+        for (int i = r; i < m; i++) {
+            if (spr_root(par, i) != r) continue;
+            const float *v = sc->sv + (size_t)ids[i] * 3 * SC_V;
+            float *oc = s_spr_cast + (size_t)s_spr_n * SC_V, *os = s_spr_scr + (size_t)s_spr_n * SC_V;
+            int ok = 1;
+            for (int j = 0; j < 3 && ok; j++) {
+                const float x = v[j * SC_V] - s_sc_cx, y = v[j * SC_V + 1] - s_sc_cy;
+                const float d[3] = {x / h, -y / h, 1.0f};
+                const float den = nrm[0] * d[0] + nrm[1] * d[1] + nrm[2] * d[2];
+                if (fabsf(den) < 1e-4f) { ok = 0; break; }
+                const float z = na_d / den;
+                float *c = oc + j * SC_V, *s = os + j * SC_V;
+                c[0] = d[0] * z; c[1] = d[1] * z; c[2] = z;
+                s[0] = x * kx; s[1] = -y * ky; s[2] = z;
+                memcpy(c + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
+                memcpy(s + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
+            }
+            if (ok) s_spr_n += 3;
+        }
+    }
+    if (s_spr_n) s_spr_frames++;
+    s_spr_last = (unsigned)s_spr_n / 3u;
+    /* the pieces' cut-outs as they were drawn (sc_add_sprite_tri) */
+    const int rows = sc_atlas_rows(sc);
+    if (s_spr_n && rows > 0) {
+        if (!s_spr_atl_tex) {
+            glGenTextures(1, &s_spr_atl_tex);
+            glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, 0x8229 /*R8*/, SC_ATL, SC_ATL, 0, 0x1903 /*RED*/, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        GLint pbo = 0, rl = 0;
+        glGetIntegerv(0x88EF /*PIXEL_UNPACK_BUFFER_BINDING*/, &pbo);
+        glGetIntegerv(PSXGL_UNPACK_ROW_LENGTH, &rl);
+        if (pbo) p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, 0);
+        if (rl) glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SC_ATL, rows, 0x1903 /*RED*/, GL_UNSIGNED_BYTE, sc->atl);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (rl) glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, rl);
+        if (pbo) p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, (GLuint)pbo);
+    }
+}
+/* The `sprite` input: the sprites' view depth on the picture, SPR_NONE elsewhere. */
+static void pfx_sprites_depth(int lw, int lh) {
+    if (!s_spr_on || !s_spr_prog || lw <= 0 || lh <= 0) return;
+    if (!s_spr_tex || s_spr_w != lw || s_spr_h != lh) {
+        if (!s_spr_tex) { glGenTextures(1, &s_spr_tex); p_glGenFramebuffers(1, &s_spr_fbo); }
+        glBindTexture(GL_TEXTURE_2D, s_spr_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x822E /*R32F*/, lw, lh, 0, 0x1903 /*RED*/, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_spr_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8CE0 /*COLOR_ATTACHMENT0*/, GL_TEXTURE_2D, s_spr_tex, 0);
+        s_spr_w = lw; s_spr_h = lh;
+    }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_spr_fbo);
+    glViewport(0, 0, lw, lh);
+    GLfloat cc[4];
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+    glClearColor((float)SPR_NONE, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(cc[0], cc[1], cc[2], cc[3]);
+    if (s_spr_n > 0) {
+        p_glUseProgram(s_spr_prog);
+        p_glBindVertexArray(s_sm_vao);
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
+        p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)s_spr_n * SC_V * sizeof(float)), s_spr_scr, PSXGL_STREAM_DRAW);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+        p_glUniform1i(s_spr_uvram, 0);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
+        p_glUniform1i(s_spr_uatl, 1);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glEnable(GL_BLEND);
+        p_glBlendEquationSeparate(0x8007 /*MIN*/, 0x8007);
+        glBlendFunc(GL_ONE, GL_ONE);
+        glDrawArrays(GL_TRIANGLES, 0, s_spr_n);
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+        glDisable(GL_BLEND);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glBindVertexArray(0);
+    }
+}
+static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     if (!s_sm_tex) {
         glGenTextures(1, &s_sm_tex);
         glBindTexture(GL_TEXTURE_2D, s_sm_tex);
@@ -459,31 +659,44 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
         /* Transparent texels (raw 0) cast no shadow, as they draw nothing:
          * the fetch is the textured shader's (page, CLUT, window). */
-        s_sm_prog = build_program(
-            "#version 330\n"
-            "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n"
-            "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n"
-            "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw;\n"
-            "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw);\n"
-            "  gl_Position = vec4(a_p, 1.0); }\n",
-            "#version 330\n"
-            "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; out vec4 o;\n"
-            "uniform usampler2D u_vram;\n"
-            "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n"
+#define SM_VS_HEAD \
+            "#version 330\n" \
+            "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n" \
+            "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n" \
+            "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw; out float v_z;\n" \
+            "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw); v_z = a_p.z;\n"
+#define SM_FS_HEAD \
+            "#version 330\n" \
+            "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; in float v_z; out vec4 o;\n" \
+            "uniform usampler2D u_vram; uniform sampler2D u_atl;\n" \
+            "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n" \
             "void main(){\n"
-            "  o = vec4(1.0);\n"
-            "  if (v_dw.x < 0) return;\n"
-            "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n"
-            "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n"
-            "  if ((tw.x | tw.y) != 0) { u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n"
-            "                            v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8); }\n"
-            "  int raw;\n"
-            "  if (v_dw.x == 0) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 2), v_tc.y + v) >> ((u & 3) * 4)) & 0xF), v_tc.w);\n"
-            "  else if (v_dw.x == 1) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 1), v_tc.y + v) >> ((u & 1) * 8)) & 0xFF), v_tc.w);\n"
-            "  else raw = vram_at(v_tc.x + u, v_tc.y + v);\n"
-            "  if (raw == 0) discard;\n"
-            "}\n");
+#define SM_FS_TEXEL \
+            "  if (v_dw.x < 0) return;\n" \
+            "  if (v_dw.x == 3) { if (texelFetch(u_atl, ivec2(floor(v_uv)), 0).r < 0.5) discard; return; }\n" \
+            "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n" \
+            "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n" \
+            "  if ((tw.x | tw.y) != 0) { u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n" \
+            "                            v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8); }\n" \
+            "  int raw;\n" \
+            "  if (v_dw.x == 0) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 2), v_tc.y + v) >> ((u & 3) * 4)) & 0xF), v_tc.w);\n" \
+            "  else if (v_dw.x == 1) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 1), v_tc.y + v) >> ((u & 1) * 8)) & 0xFF), v_tc.w);\n" \
+            "  else raw = vram_at(v_tc.x + u, v_tc.y + v);\n" \
+            "  if (raw == 0) discard;\n" \
+            "}\n"
+        s_sm_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p, 1.0); }\n",
+                                  SM_FS_HEAD "  o = vec4(1.0);\n" SM_FS_TEXEL);
+        /* The sprites' view depth on the picture (the `sprite` input): the
+         * nearest one wins (min blending), transparent texels leave none. */
+        s_spr_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p.xy, 0.0, 1.0); }\n",
+                                   SM_FS_HEAD "  o = vec4(v_z, 0.0, 0.0, 1.0);\n" SM_FS_TEXEL);
+#undef SM_VS_HEAD
+#undef SM_FS_HEAD
+#undef SM_FS_TEXEL
         s_sm_uvram = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_vram") : -1;
+        s_spr_uvram = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_vram") : -1;
+        s_sm_uatl = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_atl") : -1;
+        s_spr_uatl = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_atl") : -1;
         p_glGenVertexArrays(1, &s_sm_vao);
         p_glGenBuffers(1, &s_sm_vbo);
         p_glBindVertexArray(s_sm_vao);
@@ -547,6 +760,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
             s_sm_world[2][3] = 1.0f;
         }
     }
+    pfx_sprites_stand(sc, aspect);
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
@@ -588,7 +802,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         }
         /* world geometry first (nw vertices), then the frame's own triangles */
         const int nw = use_world ? s_wg_n * 3 : 0;
-        n = use_store ? npick * 3 : nw + sc->n * 3;
+        const int nbase = use_store ? npick * 3 : nw + sc->n * 3;   /* then the sprites standing */
+        n = nbase + s_spr_n;
         if (n > s_sm_cap) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
@@ -600,7 +815,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         for (int i = 0; i < n; i++) {
             float P[3], scr[2];
             float *o = s_sm_buf + (size_t)i * SC_V;
-            if (i < nw) {
+            if (i >= nbase) {
+                const float *c = s_spr_cast + (size_t)(i - nbase) * SC_V;
+                P[0] = c[0]; P[1] = c[1]; P[2] = c[2];
+                scr[0] = s_cam_h * P[0] / P[2]; scr[1] = -s_cam_h * P[1] / P[2];
+                memcpy(o + 3, c + 3, (SC_V - 3) * sizeof(float));
+            } else if (i < nw) {
                 float V[3]; scc_view(s_wg + (size_t)i * 3, V);
                 P[0] = V[0]; P[1] = -V[1]; P[2] = V[2];
                 if (V[2] > 1.0f) { scr[0] = s_cam_h * V[0] / V[2]; scr[1] = s_cam_h * V[1] / V[2]; }
@@ -662,10 +882,17 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_raw_tex);
         p_glUniform1i(s_sm_uvram, 0);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
+        p_glUniform1i(s_sm_uatl, 1);
+        p_glActiveTexture(PSXGL_TEXTURE0);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
         glDrawArrays(GL_TRIANGLES, 0, n);
         glDisable(GL_DEPTH_TEST);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, 0);
         p_glBindVertexArray(0);
         const float u[4][4] = {{a[0], a[1], a[2], x0}, {b[0], b[1], b[2], y0},
@@ -673,6 +900,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect) {
         memcpy(s_sm_u, u, sizeof s_sm_u);
     }
     glDepthMask(dmask);
+    pfx_sprites_depth(lw, lh);
 }
 static void pfx_shadow_uniforms(GLuint prog) {
     static const char *const names[4] = {"u_smx", "u_smy", "u_smz", "u_sms"};
@@ -807,7 +1035,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         int reads_shadow = 0;
         for (int k = 0; k < ps->ninputs; k++)
             if (ps->in[k].from == PFX_IN_SHADOW) reads_shadow = 1;
-        if (reads_shadow) pfx_shadow_build(ps, (float)lw / (float)lh);
+        if (reads_shadow) pfx_shadow_build(ps, (float)lw / (float)lh, lw, lh);
         for (int k = 0; k < ps->ninputs; k++) {
             if (ps->in[k].from == PFX_IN_SOURCE && !copied) {
                 post_copy_bind(lw, lh);
@@ -836,6 +1064,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                            : (from == PFX_IN_MASK || from == PFX_IN_MASK3D) ? s_mask_tex
                            : from == PFX_IN_DEPTH ? s_dep_tex
                            : from == PFX_IN_SHADOW ? s_sm_tex
+                           : from == PFX_IN_SPRITE ? s_spr_tex
                            : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
             glBindTexture(GL_TEXTURE_2D, t);
