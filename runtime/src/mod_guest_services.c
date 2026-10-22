@@ -217,3 +217,9 @@ int psx_mod_gte_data(uint32_t out[32]) {
     memcpy(out, cpu->gte_data, 32 * sizeof(uint32_t));
     return 1;
 }
+
+/* A CPU general register (0..31) as the guest left it; 0 before the CPU is bound. */
+uint32_t psx_mod_cpu_gpr(int r) {
+    const CPUState *cpu = debug_cpu_ptr;
+    return cpu && r > 0 && r < 32 ? cpu->gpr[r] : 0u;
+}

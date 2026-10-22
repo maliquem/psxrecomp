@@ -165,6 +165,8 @@ void psx_mod_set_overdraw(int x, int y);
 /* The GTE data registers (COP2 0..31) as the guest left them. Read-only;
  * returns 0 before the CPU is bound. */
 int psx_mod_gte_data(uint32_t out[32]);
+/* A CPU general register (1..31, e.g. 31 = ra) as the guest left it. */
+uint32_t psx_mod_cpu_gpr(int r);
 /*
  * Replace one guest instruction and route that address through the runtime's
  * executable-RAM path. Use this instead of psx_mod_write_word for code so a
