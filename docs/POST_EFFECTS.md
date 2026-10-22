@@ -145,12 +145,16 @@ foot point is taken in the view space of the camera projecting it and sent
 in drawing order, so the pieces drawn next (that frame's) stand on it. One
 sprite = its opaque pieces from one texture page and CLUT that touch, in any
 drawing order (games sort by depth, so two sprites' pieces interleave); it
-goes to the foot point at its bottom, in its columns, near its middle (within
-0.3 of its width + 12 px). A run that is not at one (a part in another page
-or CLUT) joins a sprite only when it touches one of that sprite's runs, its
-middle is within that sprite's columns and it is no wider than the sprite +
-8 px, so HUD panels and texts above or beside a character never stand there.
-Nothing under 12 px tall stands (a world map's markers). A sprite is
+goes to the foot point at its bottom, in its columns (a sword held out puts
+the point near one end). Grouping keeps each run's root at its lowest piece,
+so a run is walked whole whatever the drawing order. A run that is not at
+one (a part on another texture page) joins a sprite only when it has that
+sprite's CLUT (HUD bars, panels and texts use the UI's palettes), touches one
+of its runs or is up to 8 px over it (eyes floating over a body), its middle
+is within that sprite's columns and it is no wider than the sprite + 8 px.
+A joined part stands on its sprite's plane, as drawn (its own bottom is no
+floor), and may be small; a sprite's own run under 12 px tall does not
+stand (a world map's markers). A sprite is
 stood upright where its lowest drawn pixel meets the floor (a plane facing
 the camera across the floor), each piece along its own view ray. When the
 light comes across the picture (in that plane, as in BoF4's battles) a
@@ -191,8 +195,11 @@ sprite_anchors = ["0x80141FA0", "0x80141FD8"]   # return addresses of the foot-p
 The Sun presets (`shaders/hd2d/sun*.pfx`) differ only in shadow detail:
 `sun-low` (480 lines), `sun` (960 lines), `sun-high` (1.5x the picture, a
 4096 map). All soften the scenery's shadow edges over `u_soft` x world units
-(5x5 samples, the bias grown with the face's tilt to the light) and keep the
-sprites' sharp (3x3 texels of `sprshadow`). Their faces' normals come from
+(5x5 samples, the bias grown with the face's tilt to the light), the spread
+growing with the distance to what casts it (`u_soft` y = 0.04 world units per
+unit, percentage-closer soft shadows as in Fernando 2005, from a texel up to
+x): a bush's leaves stay sharp at its foot, a cliff's far edge soft. They keep
+the sprites' sharp (3x3 texels of `sprshadow`). Their faces' normals come from
 two pixels on the side that stays in the pixel's plane (the least bend in
 1/Z), so creases between faces show no seams. A pass may read up to 6 inputs.
 
@@ -215,7 +222,9 @@ TCP: `shadow_cache` (state: camera, matches, world triangles, memory, sprite
 runs: at their foot point / touching one that is / none, `sprite_bent`: sprites
 with feet bent down; `blobs`: blob quads hidden and draws with a blob colour
 see-through), `sprite_dump` (the picture's
-foot points and 2D pieces),
+foot points and 2D pieces; `stood`: the last shadow build's foot points and
+the pieces stood at each; `runs`: its runs [box, foot point, at it, CLUT
+code y*64+x/16; 9 = too big]),
 `shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
 microseconds per stage and pass).
 
