@@ -114,13 +114,16 @@ sprites' shadows alone, a menu's "GI Off, SS On").
 While a texture `off_textures` names was drawn in the last few VBlanks (a
 world map's paper or frame: no place under the sun), every stage whose chain
 reads `shadow` is skipped (`gpu_shadow_off_active`), whatever loaded it.
+Only opaque primitives count: a glow sharing the palette (BoF4's sun glare
+in the dragon's cutscene, CLUT 0x3e00 on an additive page) switched the
+effects off and on every few frames.
 
 The sun can be set per place: `sun_areas = ["0xAREA:az:el", "0xAREA:off"]`
 gives an area its own azimuth and elevation (degrees), over the pass's
 `u_sun`, or no sun at all ("off": a cave; the stages reading `shadow` are
 skipped and the game's own blobs stay). The area is the id a game mod gives
 (`gl_renderer_shadow_area`; BoF4: a hash of the map data, so each screen and
-each battle arena has its own), else a hash of `scene_keys`. `shadow_state`
+each battle arena has its own), else a hash of `scene_keys`. `shadow_cache`
 prints the current one (`scene`) and its sun (`scene_sun`), to fill the list
 as a player goes. The camera and the sprites' foot points are followed in an
 area with no sun too, for the fire lights below.
@@ -194,7 +197,12 @@ CLUT entry that is a quarter or more of an opaque quad holding a foot point.
 That palette's entry is learnt, and every quad using that palette within the
 band round that sprite's foot rows draws with it see-through (written to 0
 in VRAM for that one draw, then put back), so the feet away from the point
-in an attack pose or a tail lose it too, while eyes higher up keep it. A
+in an attack pose or a tail lose it too, while eyes higher up keep it.
+Blobs under anything else (a boat, a dragon) are found by their look: a
+textured quad drawn subtractive (it darkens the floor) whose texture box has
+its four corners transparent and its centre drawn (a disc) is not drawn
+while our sun or a fire casts (each texture box judged once; TCP
+`shadow_cache` `discs`). A
 chain that reads `sprite` gets each pixel's sprite view depth (60000 =
 none), so the sprites themselves can be shaded: `sun-out.glsl` gives them,
 in shadow, the darkening the ground takes, and nothing in the sun; they
@@ -229,7 +237,10 @@ off) fills it, a few steps from a lit point toward the sun over w x the bias,
 shaded where the scenery stands in front of that path (it only adds shadow,
 and only that close). Their faces' normals come from
 two pixels on the side that stays in the pixel's plane (the least bend in
-1/Z), so creases between faces show no seams. A pass may read up to 6 inputs.
+1/Z), so creases between faces show no seams; a normal is turned to face the
+camera along the ray to its point (not by its z: a floor seen almost edge-on,
+a cutscene's camera at the horizon, has z ~ 0 and flipped in zigzag stripes;
+the same in AO and the light passes). A pass may read up to 6 inputs.
 
 With `camera = "ram:..."`, before each projection a GTE rotation +
 translation not met yet is compared with the MATRIX in RAM; equal, it is the

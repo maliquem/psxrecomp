@@ -1,5 +1,18 @@
 # Widescreen support (`feat/widescreen`)
 
+## Cutscene backdrops stretched (`nw_phase_backdrop`, 2026-10-23)
+
+`[widescreen] nw_phase_backdrop = true`: what a frame draws before its 3D
+world (BoF4's cutscenes: a painted sky and mountains, 4:3 wide) is stretched
+to the wide view, so its margins are not black or white. The phase ends at
+the first shaded polygon, except an untextured one from one edge of the
+picture exactly to the other (the backdrop's horizon haze, drawn right after
+it), which is stretched too. Only while the last frames drew a 3D world: a
+2D-only screen (a title card's text on black) stays as it is. While a phase
+backdrop was stretched in the last frames the centre is drawn again, not
+copied from the canonical frame (`gpu_ws_background_requires_full_composite`),
+so the stretched picture has no seam at the 4:3 edges. 4:3 is untouched.
+
 ## Finite 2D backdrop falls back to 4:3 (2026-10-07)
 
 Pre-rendered 2D scenes draw their background as a few large textured
