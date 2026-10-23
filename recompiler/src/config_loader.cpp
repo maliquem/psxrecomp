@@ -955,6 +955,8 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("fmv_chroma_smoothing"))
             rt.video_fmv_chroma_smoothing = toml::find<bool>(video, "fmv_chroma_smoothing");
+        if (video.contains("fmv_enhance"))
+            rt.video_fmv_enhance = toml::find<bool>(video, "fmv_enhance");
         if (video.contains("texture_lod")) {
             const auto mode = toml::find<std::string>(video, "texture_lod");
             if (mode == "off")         rt.video_texture_lod = 0;

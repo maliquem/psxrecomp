@@ -40,6 +40,20 @@ int psx_rewind_overlay_image(const uint32_t** p,int* w,int* h) { return host_osd
 float psx_rewind_slide(void) { return 0; }
 int psx_savestate_menu_overlay_image(const uint32_t** p,int* w,int* h) { return host_osd_image(p,w,h); }
 
+/* the renderer's links to the decoder, the shadow map and telemetry */
+uint32_t mdec_mean_qscale_x16(void) { return 0; }
+int mdec_recently_active(uint32_t within_frames) { (void)within_frames; return 0; }
+int gpu_shadow_off_active(void) { return 0; }
+int gpu_shadow_sun_area(float *az, float *el) { (void)az; (void)el; return 0; }
+int psx_overdraw_x(void) { return 0; }
+int psx_overdraw_y(void) { return 0; }
+void psx_video_telemetry_compose(int renderer, int scale, int source_w, int source_h,
+                                 int drawable_w, int drawable_h, int viewport_w, int viewport_h) {
+    (void)renderer; (void)scale; (void)source_w; (void)source_h;
+    (void)drawable_w; (void)drawable_h; (void)viewport_w; (void)viewport_h;
+}
+void psx_video_telemetry_present(int result) { (void)result; }
+
 static uint8_t *s_cap; static int s_cap_w, s_cap_h, s_cap_n;
 static void cap_hook(int gen) {
     (void)gen;
@@ -124,6 +138,9 @@ int main(void) {
     glb_init(vram); glb_set_scale(1); gl_renderer_set_swap_interval(0);
     if (!gl_renderer_init_context(win)) { fprintf(stderr, "SKIP no GL context\n"); return 77; }
     frame_src();
+    /* the FMV stage (fmv_enhance, on by default) replaces this path; tested
+     * on its own in test_gl_fmv_enhance.c */
+    gl_renderer_set_fmv_enhance(0);
     check(gl_renderer_fmv_chroma_smoothing() == 0, "off by default");
     uint8_t *off = present(1);
     gl_renderer_set_fmv_chroma_smoothing(1);

@@ -8762,6 +8762,23 @@ static void handle_fmv_chroma(int id, const char *json)
              (unsigned long long)gl_renderer_fmv_chroma_frames());
 }
 
+/* fmv_enhance: {"cmd":"fmv_enhance"} reads, {"cmd":"fmv_enhance","on":0|1}
+ * sets [video] fmv_enhance live. Replies the enhanced-present count and the
+ * 8x8 grid phase found in the movie. */
+static void handle_fmv_enhance(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gl_renderer_set_fmv_enhance(on);
+    char dump[256] = {0};
+    (void)json_get_str(json, "dump", dump, sizeof(dump));
+    gl_renderer_fmv_enhance_debug(json_get_int(json, "mask", -1), dump);
+    int phx = 0, phy = 0;
+    gl_renderer_fmv_enhance_phase(&phx, &phy);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"frames\":%llu,\"phase\":[%d,%d]}", id,
+             gl_renderer_fmv_enhance(),
+             (unsigned long long)gl_renderer_fmv_enhance_frames(), phx, phy);
+}
+
 /* texture_lod: {"cmd":"texture_lod"} reads, {"cmd":"texture_lod","mode":0|1,
  * "aniso":1..16} sets [video] texture_lod / anisotropic_filtering live. */
 static void handle_texture_lod(int id, const char *json)
@@ -16111,6 +16128,7 @@ static const CmdEntry s_commands[] = {
     { "shadow_hide",       handle_shadow_hide },
     { "extra_shader",      handle_extra_shader },
     { "fmv_chroma",        handle_fmv_chroma },
+    { "fmv_enhance",       handle_fmv_enhance },
     { "texture_lod",       handle_texture_lod },
     { "accurate_blending", handle_accurate_blending },
 

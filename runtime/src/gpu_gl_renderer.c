@@ -6514,6 +6514,7 @@ static int s_fmv_filter_cfg = 0;          /* VIDEO_FMV_FILTER_NEAREST */
  * 24-bit (MDEC) scanout (main.cpp notes it before gl_renderer_present). */
 static int s_fmv_chroma = 0, s_present_d24 = 0;
 static GLint s_present_uChroma = -1;
+static void fe_release(void);   /* gl_fmv_enhance.inc */
 static uint64_t s_fmv_chroma_frames = 0;
 void gl_renderer_set_fmv_chroma_smoothing(int on) {
     GL_RT_SYNC("fmv_chroma");
@@ -7392,7 +7393,10 @@ void gl_renderer_shutdown(void) {
     s_interp_fbo = 0;   /* died with the context */
     post_aa_release();
     postfx_release();
+    fe_release();
 }
+
+#include "gl_fmv_enhance.inc"
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
  * diagnostic): full-window clear, then a quad into the letterbox rect.
@@ -7454,43 +7458,53 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * bilinear 0.14%/0.930. Bicubic removes two thirds of the staircase while
      * holding gradient at the nearest level; bilinear removes the most but
      * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
-    int filt_mode = linear ? fmv_filter_mode()
-                           : -1;          /* AA off: nearest, no shader work */
-    glViewport(lx, ly, lw, lh);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
-    p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
-    present_set_gamma(s_present_uGamma, 1);
-    present_set_sharp(filt_mode, src_w, src_h, lw, lh);
-    /* CPU present texture holds exactly the display rect, so v_uv spans it and
-     * pitch == display height == src_h. */
-    PRESENT_SCANLINE(src_h, src_h, lh);
-    if (crop) {
-        /* Cropped present keeps left-aligned content; still inset so linear
-         * AA does not blend the cut column with undefined border texels. */
-        float u0 = (src_w > 0) ? (0.5f / (float)src_w) : 0.f;
-        float v0 = (src_h > 0) ? (0.5f / (float)src_h) : 0.f;
-        p_glUniform4f(s_present_uUvRect, u0, v0, uv_x1 - u0, 1.f - v0);
-    } else if (src_w > 0 && src_h > 0) {
-        /* Half-texel UV inset for both nearest and linear. Corner-mapped
-         * UV=1.0 grazes past the last texel (driver-dependent border sample);
-         * with GL_LINEAR that also blends an edge stripe into the image.
-         * Matches present_target_quad / MotK present UV edge-bleed fix. */
-        float u0 = 0.5f / (float)src_w, v0 = 0.5f / (float)src_h;
-        p_glUniform4f(s_present_uUvRect, u0, v0, 1.f - u0, 1.f - v0);
-    } else {
-        p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    /* [video] fmv_enhance: a 24-bit movie frame goes through the FMV stage
+     * (gl_fmv_enhance.inc), which draws the rect itself. */
+    int enhanced = 0;
+    if (s_present_d24 && s_fe_on) {
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        upload_present_tex(pixels, src_w, src_h, 0);
+        enhanced = fe_present(pixels, src_w, src_h, crop ? content_w : src_w, lx, ly, lw, lh);
     }
-    const int chroma = s_fmv_chroma && s_present_d24;
-    if (chroma) {
-        /* present_set_sharp only sets the source size for filtered modes; the
-         * chroma tent needs it in every mode. */
-        p_glUniform1i(s_present_uChroma, 1);
-        if (s_present_uTexSize >= 0) p_glUniform2f(s_present_uTexSize, (float)src_w, (float)src_h);
-        s_fmv_chroma_frames++;
+    if (!enhanced) {
+        int filt_mode = linear ? fmv_filter_mode()
+                               : -1;          /* AA off: nearest, no shader work */
+        glViewport(lx, ly, lw, lh);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
+        p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+        present_set_gamma(s_present_uGamma, 1);
+        present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+        /* CPU present texture holds exactly the display rect, so v_uv spans it and
+         * pitch == display height == src_h. */
+        PRESENT_SCANLINE(src_h, src_h, lh);
+        if (crop) {
+            /* Cropped present keeps left-aligned content; still inset so linear
+             * AA does not blend the cut column with undefined border texels. */
+            float u0 = (src_w > 0) ? (0.5f / (float)src_w) : 0.f;
+            float v0 = (src_h > 0) ? (0.5f / (float)src_h) : 0.f;
+            p_glUniform4f(s_present_uUvRect, u0, v0, uv_x1 - u0, 1.f - v0);
+        } else if (src_w > 0 && src_h > 0) {
+            /* Half-texel UV inset for both nearest and linear. Corner-mapped
+             * UV=1.0 grazes past the last texel (driver-dependent border sample);
+             * with GL_LINEAR that also blends an edge stripe into the image.
+             * Matches present_target_quad / MotK present UV edge-bleed fix. */
+            float u0 = 0.5f / (float)src_w, v0 = 0.5f / (float)src_h;
+            p_glUniform4f(s_present_uUvRect, u0, v0, 1.f - u0, 1.f - v0);
+        } else {
+            p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+        }
+        const int chroma = s_fmv_chroma && s_present_d24;
+        if (chroma) {
+            /* present_set_sharp only sets the source size for filtered modes; the
+             * chroma tent needs it in every mode. */
+            p_glUniform1i(s_present_uChroma, 1);
+            if (s_present_uTexSize >= 0) p_glUniform2f(s_present_uTexSize, (float)src_w, (float)src_h);
+            s_fmv_chroma_frames++;
+        }
+        p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (chroma) p_glUniform1i(s_present_uChroma, 0);
     }
-    p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
-    if (chroma) p_glUniform1i(s_present_uChroma, 0);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     hold_capture_drawable();

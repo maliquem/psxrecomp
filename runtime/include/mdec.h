@@ -26,6 +26,9 @@ int mdec_dma_read_ready(void);
 int mdec_recently_active(uint32_t within_frames);
 /* Guest cycles since last colour decode; UINT64_MAX if never / reset. */
 uint64_t mdec_color_age_cycles(void);
+/* Mean AC quantiser scale of the last colour decode, x16 (0 = none yet):
+ * how coarse the movie is, for the FMV present stage's deblocking. */
+uint32_t mdec_mean_qscale_x16(void);
 
 typedef struct MDECDebugState {
     uint32_t command;

@@ -316,6 +316,17 @@ void gl_renderer_set_fmv_filter(int cfg_value);
 void gl_renderer_set_fmv_chroma_smoothing(int on);
 int  gl_renderer_fmv_chroma_smoothing(void);
 uint64_t gl_renderer_fmv_chroma_frames(void);
+/* [video] fmv_enhance (on by default): 24-bit (MDEC) presents get chroma
+ * rebuilt, 8x8 deblocking and an FSR1 EASU + RCAS upscale to the window
+ * (gl_fmv_enhance.inc). Display only. */
+void gl_renderer_set_fmv_enhance(int on);
+int  gl_renderer_fmv_enhance(void);
+uint64_t gl_renderer_fmv_enhance_frames(void);
+void gl_renderer_fmv_enhance_phase(int *px, int *py);
+/* Debug (TCP only): stage mask (1 chroma, 2 deblock, 4 RCAS, 8 EASU; -1 keeps
+ * it), and a path prefix: the next movie frame is saved through several stage
+ * sets as <prefix>_mNN.bmp. */
+void gl_renderer_fmv_enhance_debug(int mask, const char *dump_prefix);
 void gl_renderer_note_present_depth24(int d24);
 int  gl_renderer_cpu_auth_dual(void);
 

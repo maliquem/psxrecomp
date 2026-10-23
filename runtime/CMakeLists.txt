@@ -454,6 +454,18 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-fmv-chroma-results")
         set_tests_properties(gl_fmv_chroma_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        # [video] fmv_enhance: 24-bit presents get chroma rebuilt, 8x8 blocks
+        # smoothed (grid phase found), FSR1 upscale; 15-bit and off untouched.
+        add_test(NAME gl_fmv_enhance_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_texture_filter.py"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_fmv_enhance.c"
+                --cc "${CMAKE_C_COMPILER}"
+                --sdl-include "$<TARGET_PROPERTY:SDL3::Headers,INTERFACE_INCLUDE_DIRECTORIES>"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3-static>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-fmv-enhance-results")
+        set_tests_properties(gl_fmv_enhance_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
         # Debug present ring: GL names do not outlive a renderer restart.
         add_test(NAME gl_present_ring_restart_test
             COMMAND "${Python3_EXECUTABLE}"

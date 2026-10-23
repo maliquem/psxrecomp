@@ -416,6 +416,13 @@ static void idct_block(int16_t *block)
 }
 #endif
 
+/* Mean AC quantiser scale of the last colour decode, x16 (0 = none yet). A
+ * read-only statistic for the FMV present stage (its deblocking strength); it
+ * changes nothing decoded and is not part of a savestate. */
+static uint32_t s_q_sum = 0, s_q_n = 0;
+static volatile uint32_t g_mdec_mean_q16 = 0;
+uint32_t mdec_mean_qscale_x16(void) { return g_mdec_mean_q16; }
+
 static int decode_rle_block(int16_t *block, const uint8_t *quant,
                             uint32_t *pos, uint32_t end) {
     memset(block, 0, 64 * sizeof(int16_t));
@@ -432,6 +439,7 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
      * nonzero coeff gets the sign-magnitude rounding bias (ci<0 ? +8 : -8) the
      * old +4/÷8 model omitted, and the <<4 domain feeds the >>3 IDCT matrix. */
     uint32_t qscale = (word >> 10) & 0x3Fu;
+    s_q_sum += qscale; s_q_n++;
     uint32_t k = 0;
     int ci = sign_extend_10(word & 0x03FFu);
     int q  = (int)quant[0];
@@ -654,6 +662,7 @@ static void execute_decode(void) {
     uint32_t end = mdec.input_count;
     g_mdec_decode_count++;
     clear_output();
+    s_q_sum = 0; s_q_n = 0;
     mdec.decode_macroblocks = 0;
     mdec.decode_blocks = 0;
     mdec.decode_stop_reason = MDEC_STOP_NONE;
@@ -694,6 +703,7 @@ static void execute_decode(void) {
     /* FMV detector: stamp colour (15/24-bit) decodes only — streamed video.
      * The 4/8-bit luma path above is texture decompression, not video. */
     mdec_last_color_decode_cycle = psx_cycle_count;
+    if (s_q_n) g_mdec_mean_q16 = (s_q_sum * 16u + s_q_n / 2u) / s_q_n;
     trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
 }
 

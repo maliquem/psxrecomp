@@ -623,6 +623,11 @@ struct RuntimeConfig {
     // fmv_chroma_smoothing: on 24-bit (MDEC) presents keep luma and smooth
     // chroma over 3x3 source pixels (hides 4:2:0 colour blocks). OpenGL only.
     bool                  video_fmv_chroma_smoothing = false;
+    // fmv_enhance (default on): 24-bit (MDEC) movie frames are cleaned
+    // (chroma rebuilt between 2x2 blocks, 8x8 deblocking by the movie's
+    // quantiser) and upscaled with FSR1 EASU + RCAS on the GPU. Display only;
+    // false shows them as before. OpenGL only.
+    bool                  video_fmv_enhance = true;
     // texture_lod: "off" (default) or "mipmap" — mip-level emulation for
     // minified 3D world textures (CLUT pages have no GL mip chain; the
     // footprint is box-averaged inside the primitive's UV bounds).
