@@ -1,9 +1,11 @@
 #include "mdec.h"
+#include "mdec_capture.h"
 #include "psx_align.h"
 #include "pst_wire.h"
 #include "psx_cycles.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -200,6 +202,79 @@ static uint8_t input_byte(uint32_t byte_index) {
     uint16_t hw = mdec.input[byte_index >> 1];
     return (byte_index & 1u) ? (uint8_t)(hw >> 8) : (uint8_t)hw;
 }
+
+/* ---- command capture (format in mdec_capture.h) -------------------------- */
+#ifndef PSX_NO_DEBUG_TOOLS
+static FILE *s_capture;
+static int s_capture_env_checked;
+
+int mdec_capture_start(const char *path) {
+    uint8_t hdr[16];
+    PstW w;
+    mdec_capture_stop();
+    s_capture_env_checked = 1;   /* an explicit start wins over the env var */
+    if (!path || !path[0]) return 0;
+    s_capture = fopen(path, "wb");
+    if (!s_capture) {
+        fprintf(stderr, "[mdec] capture: cannot open %s\n", path);
+        return 0;
+    }
+    pst_w_init(&w, hdr, sizeof(hdr));
+    (void)pst_w_bytes(&w, MDEC_CAPTURE_MAGIC, 8u);
+    (void)pst_w_u32(&w, MDEC_CAPTURE_VERSION);
+    (void)pst_w_u32(&w, 0u);
+    if (fwrite(hdr, 1, sizeof(hdr), s_capture) != sizeof(hdr) ||
+        fflush(s_capture) != 0) {
+        fprintf(stderr, "[mdec] capture: cannot write %s\n", path);
+        mdec_capture_stop();
+        return 0;
+    }
+    return 1;
+}
+
+void mdec_capture_stop(void) {
+    if (s_capture) fclose(s_capture);
+    s_capture = NULL;
+}
+
+/* Record the command that just finished. `has_output`: a DECODE that ran, so
+ * mdec.output holds exactly its output. */
+static void capture_command(int has_output) {
+    uint8_t head[20], tail[12];
+    PstW w;
+    uint32_t out_bytes = has_output ? mdec.output_size : 0u;
+    if (!s_capture_env_checked) {
+        const char *path = getenv("PSX_MDEC_CAPTURE");
+        s_capture_env_checked = 1;
+        if (path && path[0]) (void)mdec_capture_start(path);
+    }
+    if (!s_capture) return;
+    pst_w_init(&w, head, sizeof(head));
+    (void)pst_w_u32(&w, MDEC_CAPTURE_RECORD_TAG);
+    (void)pst_w_u32(&w, mdec.command);
+    (void)pst_w_u64(&w, psx_cycle_count);
+    (void)pst_w_u32(&w, mdec.input_count);
+    pst_w_init(&w, tail, sizeof(tail));
+    (void)pst_w_u32(&w, out_bytes);
+    (void)pst_w_u64(&w, mdec_fnv1a64(mdec.output, out_bytes));
+    /* Halfwords go out as stored: the host is little-endian, as
+     * mdec_dma_read_word already assumes. Flushed per record because a
+     * capture run usually ends with the process killed. */
+    if (fwrite(head, 1, sizeof(head), s_capture) != sizeof(head) ||
+        (mdec.input_count &&
+         fwrite(mdec.input, sizeof(uint16_t), mdec.input_count, s_capture) !=
+             mdec.input_count) ||
+        fwrite(tail, 1, sizeof(tail), s_capture) != sizeof(tail) ||
+        fflush(s_capture) != 0) {
+        fprintf(stderr, "[mdec] capture: write failed; capture off\n");
+        mdec_capture_stop();
+    }
+}
+#else
+int mdec_capture_start(const char *path) { (void)path; return 0; }
+void mdec_capture_stop(void) {}
+static void capture_command(int has_output) { (void)has_output; }
+#endif
 
 static void finish_command(void) {
     mdec.expected_halfwords = 0;
@@ -732,6 +807,7 @@ static void execute_command(void) {
         execute_decode();
     }
 
+    capture_command(op == MDEC_CMD_DECODE);
     finish_command();
 }
 
@@ -760,7 +836,10 @@ static void begin_command(uint32_t value) {
             break;
     }
 
-    if (mdec.expected_halfwords == 0 || !ensure_input_capacity(mdec.expected_halfwords)) {
+    if (mdec.expected_halfwords == 0) {
+        capture_command(0);
+        finish_command();
+    } else if (!ensure_input_capacity(mdec.expected_halfwords)) {
         finish_command();
     } else {
         trace_event(MDEC_EVT_CMD_BEGIN, value);

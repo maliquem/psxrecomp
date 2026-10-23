@@ -407,6 +407,15 @@ if(BUILD_TESTING)
     target_include_directories(mdec_busy_drain_test PRIVATE ../runtime/include)
     add_test(NAME mdec_busy_drain_test COMMAND mdec_busy_drain_test)
 
+    # PSX_MDEC_CAPTURE records every MDEC command with its output hash for the
+    # offline decoder replay, and changes nothing the decoder outputs.
+    add_executable(mdec_capture_test
+        ../runtime/tests/test_mdec_capture.c
+        ../runtime/src/mdec.c)
+    target_include_directories(mdec_capture_test PRIVATE ../runtime/include)
+    add_test(NAME mdec_capture_test
+             COMMAND mdec_capture_test ${CMAKE_CURRENT_BINARY_DIR})
+
     add_executable(debug_trace_ranges_test
         ../runtime/tests/test_debug_trace_ranges.c
         ../runtime/src/debug_trace_ranges.c
