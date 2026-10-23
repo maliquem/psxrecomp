@@ -404,7 +404,7 @@ if(BUILD_TESTING)
     add_executable(mdec_busy_drain_test
         ../runtime/tests/test_mdec_busy_drain.c
         ../runtime/src/mdec.c
-        ../runtime/src/mdec_core_legacy.c)
+        ../runtime/src/mdec_core.c)
     target_include_directories(mdec_busy_drain_test PRIVATE ../runtime/include)
     add_test(NAME mdec_busy_drain_test COMMAND mdec_busy_drain_test)
 
@@ -413,7 +413,7 @@ if(BUILD_TESTING)
     add_executable(mdec_capture_test
         ../runtime/tests/test_mdec_capture.c
         ../runtime/src/mdec.c
-        ../runtime/src/mdec_core_legacy.c)
+        ../runtime/src/mdec_core.c)
     target_include_directories(mdec_capture_test PRIVATE ../runtime/include)
     add_test(NAME mdec_capture_test
              COMMAND mdec_capture_test ${CMAKE_CURRENT_BINARY_DIR})
@@ -425,7 +425,7 @@ if(BUILD_TESTING)
     add_executable(mdec_replay
         ../tools/mdec_replay/mdec_replay.c
         ../runtime/src/mdec.c
-        ../runtime/src/mdec_core_legacy.c)
+        ../runtime/src/mdec_core.c)
     target_include_directories(mdec_replay PRIVATE ../runtime/include)
     set(_mdec_synth_cap "${CMAKE_CURRENT_BINARY_DIR}/mdec_replay_synthetic.cap")
     add_test(NAME mdec_replay_synthetic_test
@@ -481,7 +481,7 @@ if(BUILD_TESTING)
         add_executable(mdec_replay_ab
             ../tools/mdec_replay/mdec_replay.c
             ../runtime/src/mdec.c
-            ../runtime/src/mdec_core_legacy.c
+            ../runtime/src/mdec_core.c
             ${_mdec_ref_srcs})
         target_include_directories(mdec_replay_ab PRIVATE
             ../runtime/include ../tools/mdec_replay)
