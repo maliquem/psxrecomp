@@ -9690,10 +9690,10 @@ static void handle_savestate(int id, const char *json)
     extern int psx_netplay_request_load(int slot);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
-    if (slot >= SAVESTATE_SLOTS) {
+    if (slot >= SAVESTATE_ALL_SLOTS) {
         /* Name the real reason: the generic refusal below blamed LLE runs. */
         send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"slot %d out of range (0..%d)\"}",
-                 id, slot, SAVESTATE_SLOTS - 1);
+                 id, slot, SAVESTATE_ALL_SLOTS - 1);
         return;
     }
     char op[16];

@@ -495,7 +495,7 @@ void savestate_get_integrity(uint32_t* bios_checksum, uint32_t* entry_pc) {
 
 int savestate_slot_path(int slot, char* out, size_t cap) {
     if (!s_configured || !out || cap == 0) return 0;
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_ALL_SLOTS) return 0;
     /* Keyed by entry_pc so slots from different games in a shared dir never
      * collide; boot_state_load also rejects a mismatched entry_pc internally. */
     snprintf(out, cap, "%s%sstate_%08X%s_slot%02d.pst",
@@ -506,7 +506,7 @@ int savestate_slot_path(int slot, char* out, size_t cap) {
 
 static int savestate_thumb_path(int slot, char* out, size_t cap) {
     if (!s_configured || !out || cap == 0) return 0;
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_ALL_SLOTS) return 0;
     snprintf(out, cap, "%s%sstate_%08X%s_slot%02d.thumb",
              s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc,
              s_disc_token, slot);
@@ -517,7 +517,7 @@ static int savestate_thumb_path(int slot, char* out, size_t cap) {
  * to the slot, never part of the .pst, so states stay renderer-independent. */
 static int savestate_hd_path(int slot, char* out, size_t cap) {
     if (!s_configured || !out || cap == 0) return 0;
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_ALL_SLOTS) return 0;
     snprintf(out, cap, "%s%sstate_%08X%s_slot%02d.hdres",
              s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc,
              s_disc_token, slot);
@@ -761,7 +761,7 @@ static int request_save_inner(int slot) {
         psx_frontend_on_savestate_refused(0, slot, "Save states are not available yet");
         return 0;
     }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_ALL_SLOTS) return 0;
     s_save_failed = 0;
     s_last_save_pc = 0; /* block netplay transfer until this write stamps a PC */
     s_save_defer_slot = -1;
@@ -779,7 +779,7 @@ static int request_load_inner(int slot) {
         psx_frontend_on_savestate_refused(1, slot, "Save states are not available yet");
         return 0;
     }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_ALL_SLOTS) return 0;
     if (!psx_hle_scheduler_enabled()) {
         /* LLE (host-fiber) mode: the restore longjmp target lives on the
          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */

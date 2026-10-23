@@ -23,6 +23,11 @@ extern "C" {
  */
 
 #define SAVESTATE_SLOTS 12
+/* One more slot past the menu's twelve, for a title's save-and-quit command
+ * (written just before the program closes, to continue from later). The
+ * savestate menu never lists it; the slot API and the TCP command accept it. */
+#define SAVESTATE_QUIT_SLOT 12
+#define SAVESTATE_ALL_SLOTS (SAVESTATE_SLOTS + 1)
 #define SAVESTATE_THUMB_W 128
 #define SAVESTATE_THUMB_H 96
 
