@@ -54,7 +54,7 @@ void main()
     vec3 dy = (zu > 0.0 && (abs(zu - z) <= abs(zd - z) || zd <= 0.0))
             ? pos_at(uv0 + vec2(0.0, px.y), zu, nat) - P : P - pos_at(uv0 - vec2(0.0, px.y), zd, nat);
     vec3 n = normalize(cross(dx, dy));
-    if (n.z > 0.0) n = -n;                      // face the camera
+    if (dot(n, P) > 0.0) n = -n;                // face the camera (along its ray: a floor seen edge-on has n.z ~ 0)
 
     // 12 samples on a spiral, rotated per pixel (4x4 interleaved; the blur removes it)
     ivec2 ip = ivec2(gl_FragCoord.xy) & 3;

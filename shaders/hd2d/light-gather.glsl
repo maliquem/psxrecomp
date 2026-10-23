@@ -53,7 +53,7 @@ void main()
         vec3 dy = (zu > 0.0 && (abs(zu - z) <= abs(zd - z) || zd <= 0.0))
                 ? pos_at(uv0 + vec2(0.0, px.y), zu, nat) - P : P - pos_at(uv0 - vec2(0.0, px.y), zd, nat);
         n = normalize(cross(dx, dy));
-        if (n.z > 0.0) n = -n;
+        if (dot(n, P) > 0.0) n = -n;   // face the camera, along its ray
     }
 
     float rw = u_light.x * z / u_proj.x;        // reach in world units at this depth

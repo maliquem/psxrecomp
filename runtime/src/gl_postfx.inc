@@ -506,8 +506,7 @@ typedef struct { int X0, W, Yb; float lo, band; float col[SPR_COLS]; uint8_t mas
 static int   s_spr_bend_dbg = 0;
 static float s_spr_bend_h = 0.0f;
 /* Feet bent down to the floor: as casters (s_spr_xc) and on the
- * picture (s_spr_xs, drawn over the standing pieces' depth: the foot takes
- * light where its bent copy is, never shading itself). */
+ * picture (s_spr_xs, with the standing pieces' depth, the nearest winning). */
 static float *s_spr_xc = NULL, *s_spr_xs = NULL; static int s_spr_nx = 0, s_spr_xcap = 0;
 static float  s_spr_kx = 0.0f, s_spr_ky = 0.0f;
 /* The bottom of sprite r (pieces i with root r) into f; 0 = not known. */
@@ -964,12 +963,15 @@ static void pfx_sprites_depth(int lw, int lh) {
         p_glBlendEquationSeparate(0x8007 /*MIN*/, 0x8007);
         glBlendFunc(GL_ONE, GL_ONE);
         glDrawArrays(GL_TRIANGLES, 0, s_spr_n);
-        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
-        glDisable(GL_BLEND);
-        if (s_spr_nx > 0) {   /* the bent feet over their standing pixels */
+        /* the bent feet too, the nearest still winning: written over, a
+         * sprite's bent feet behind another (Ryu's behind Nina) gave her
+         * pixels their place, in a shadow she is not in */
+        if (s_spr_nx > 0) {
             p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)s_spr_nx * SC_V * sizeof(float)), s_spr_xs, PSXGL_STREAM_DRAW);
             glDrawArrays(GL_TRIANGLES, 0, s_spr_nx);
         }
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+        glDisable(GL_BLEND);
         p_glActiveTexture(PSXGL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, 0);
         p_glActiveTexture(PSXGL_TEXTURE0);

@@ -43,7 +43,7 @@ void main()
             if (zr <= 0.0 || zu <= 0.0 || abs(zr - z) > 0.05 * z || abs(zu - z) > 0.05 * z) continue;
             vec3 P = pos_at(uv, z);
             vec3 nn = normalize(cross(pos_at(uv + vec2(px.x, 0.0), zr) - P, pos_at(uv + vec2(0.0, px.y), zu) - P));
-            if (nn.z > 0.0) nn = -nn;
+            if (dot(nn, P) > 0.0) nn = -nn;   // face the camera, along its ray
             float w = nn.y > 0.4 ? nn.y * nn.y : 0.0;   // floors, not walls
             s += vec4(nn * w, w);
         }

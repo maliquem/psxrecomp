@@ -112,7 +112,7 @@ void main()
         if (z > 0.0) {
             vec3 P = vec3((v_uv - 0.5) * nat * z / u_proj.x, z);
             vec3 n = is_spr ? vec3(0.0) : normalize(cross(dFdx(P), dFdy(P)));
-            if (!is_spr && n.z > 0.0) n = -n;
+            if (!is_spr && dot(n, P) > 0.0) n = -n;   // face the camera, along its ray
             vec2 f0 = fire_light(P, n, u_fl0, 0, u_flc0.w), f1 = vec2(0.0);
             if (u_flmap.y > 1.0) f1 = fire_light(P, n, u_fl1, 1, u_flc1.w);
             fire = f0 + f1;

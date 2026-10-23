@@ -223,7 +223,10 @@ void main()
     vec3 dx = face_step(uv0, P, z, vec2(p1.x, 0.0));
     vec3 dy = face_step(uv0, P, z, vec2(0.0, p1.y));
     vec3 n = normalize(cross(dx, dy) + vec3(0.0, 0.0, -1e-6));
-    if (n.z > 0.0) n = -n;
+    // face the camera along its ray to P, not by n.z: a floor seen almost
+    // edge-on (a cutscene's camera at the horizon) has n.z ~ 0, and its
+    // sign flipped half the floor upside down in zigzag stripes
+    if (dot(n, P) > 0.0) n = -n;
 
     float lambert = clamp(dot(n, L), 0.0, 1.0);
 

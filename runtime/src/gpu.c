@@ -245,6 +245,8 @@ static WsRadialScreenMaskTag ws_radial_screen_mask_tags[WS_RADIAL_MASK_TAG_COUNT
 static WsRepeatRectTag ws_repeat_rect_tags[WS_REPEAT_RECT_TAG_TABLE_SIZE];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
+static uint32_t ws_phase_stretch_stamp = (uint32_t)-1000; /* frame of newest stretched phase backdrop */
+static int ws_nw_phase_backdrop;   /* [widescreen] nw_phase_backdrop (set below) */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
@@ -258,6 +260,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_x(void);
 static int32_t ws_disp_w(void);
+static void prim_sx_extent(uint8_t op, int32_t *xmin, int32_t *xmax);
 static int32_t ws_disp_h(void);
 static void ws_clear_all_reveal_margins(void);
 
@@ -494,6 +497,7 @@ static void ws_reset_scene_history(void) {
     memset(&ws_scene_latch, 0, sizeof ws_scene_latch);
     ws_bdx_reset(&ws_bdx);
     ws_last_tag_stamp = ws_last_3d_stamp = ws_last_gte_stamp = expired;
+    ws_phase_stretch_stamp = expired;
     ws_last_world3d_stamp = ws_sust_world3d_stamp = expired;
     ws_last_ovh_stamp = ws_sust_ovh_stamp = expired;
     ws_gte_frame = ws_ovh_frame = (uint32_t)-1;
@@ -771,7 +775,12 @@ void gpu_set_shadow_off_textures(const uint32_t *tpage, const uint32_t *clut, in
     for (int i = 0; i < sh_off_n; i++) { sh_off_tpage[i] = (uint16_t)tpage[i]; sh_off_clut[i] = (uint16_t)clut[i]; }
     sh_off_seen = 0;
 }
-static void shadow_off_note(uint16_t tpage, uint16_t clut) {
+/* semi: the primitive is drawn see-through. A screen's paper or frame is
+ * opaque; a glow sharing its palette (BoF4: the sun's glare in the dragon's
+ * cutscene, CLUT 0x3e00 on an additive page) is not a sunless screen, and
+ * counted as one it switched the effects off and on every few frames. */
+static void shadow_off_note(uint16_t tpage, uint16_t clut, int semi) {
+    if (semi) return;
     for (int i = 0; i < sh_off_n; i++)
         if ((sh_off_tpage[i] == 0xFFFFu || sh_off_tpage[i] == (tpage & 0x1FFu)) &&
             (sh_off_clut[i] == 0xFFFFu || sh_off_clut[i] == clut)) {
@@ -812,15 +821,59 @@ static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
         }
     return 0;
 }
+/* The game's blob shadows found by their look, under anything (a boat, a
+ * dragon), not only at a sprite's foot point: a textured quad drawn
+ * subtractive (it darkens the floor) whose texture is a disc (the corners of
+ * its texture box drawn nothing, its centre drawn). Each texture box is
+ * judged once (sh_disc_cache); not drawn while our shadows stand in for them
+ * (sh_disc_on: the sun, or a fire, casting). */
+static int sh_disc_on = 0;
+static uint32_t sh_discs = 0;
+typedef struct { uint32_t key, box; int8_t disc; } ShDisc;
+static ShDisc sh_disc_cache[256];
+static int disc_texel_drawn(uint16_t tpage, uint16_t clut, int u, int v) {
+    const int depth = (tpage >> 7) & 3, bx = (tpage & 15) * 64, by = ((tpage >> 4) & 1) * 256;
+    const int cx = (clut & 63) * 16, cy = (clut >> 6) & 511;
+    u &= 255; v &= 255;
+    uint16_t t;
+    if (depth == 0) t = vram[cy * 1024 + ((cx + ((vram[(by + v) * 1024 + ((bx + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+    else if (depth == 1) t = vram[cy * 1024 + ((cx + ((vram[(by + v) * 1024 + ((bx + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+    else t = vram[(by + v) * 1024 + ((bx + u) & 1023)];
+    return t != 0;
+}
+/* uv: the quad's four uv words (the low 16 bits: u, v) */
+static int shadow_disc_quad(int semi, uint16_t tpage, uint16_t clut, const uint32_t *uv) {
+    if (!sh_disc_on || !semi || ((tpage >> 5) & 3) != 2) return 0;
+    int u0 = 255, v0 = 255, u1 = 0, v1 = 0;
+    for (int i = 0; i < 4; i++) {
+        const int u = (int)(uv[i] & 255), v = (int)((uv[i] >> 8) & 255);
+        if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v;
+    }
+    if (u1 - u0 < 8 || v1 - v0 < 8) return 0;
+    const uint32_t key = (uint32_t)(tpage & 0x1FFu) | (uint32_t)clut << 16;
+    const uint32_t box = (uint32_t)u0 | (uint32_t)v0 << 8 | (uint32_t)u1 << 16 | (uint32_t)v1 << 24;
+    ShDisc *c = &sh_disc_cache[(key * 2654435761u ^ box * 40503u) >> 24];
+    if (c->key != key || c->box != box || !c->disc) {
+        c->key = key; c->box = box;
+        /* the texel inside each corner (the box's last row/column may be the
+         * next tile's), and the centre */
+        const int a = u0 + 1, b = u1 - 2, p = v0 + 1, q = v1 - 2;
+        c->disc = (!disc_texel_drawn(tpage, clut, a, p) && !disc_texel_drawn(tpage, clut, b, p) &&
+                   !disc_texel_drawn(tpage, clut, a, q) && !disc_texel_drawn(tpage, clut, b, q) &&
+                   disc_texel_drawn(tpage, clut, (u0 + u1) / 2, (v0 + v1) / 2)) ? 1 : -1;
+    }
+    if (c->disc > 0) { sh_discs++; return 1; }
+    return 0;
+}
 static float    sh_last_bad[10];
 static int sh_ts_n;   /* routines that draw both windings (below) */
 int psx_shadow_state(char *out, int cap) {
     float saz = 0.0f, sel = 0.0f;
     const int sun = gpu_shadow_sun_area(&saz, &sel);
     return snprintf(out, (size_t)cap, "\"scene\":\"0x%08x\",\"scene_sun\":[%d,%.1f,%.1f],\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
-                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
+                    "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"discs\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
                     "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    (unsigned)sh_area, sun, saz, sel, sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
+                    (unsigned)sh_area, sun, saz, sel, sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_discs, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -1099,6 +1152,7 @@ static void shadow_vblank(void) {
     /* our shadows stand in for the game's blobs: under the sun, or a fire's */
     const int ours = wanted || (track && gl_renderer_fire_casting());
     sh_hide_on = ours && sh_hide_n > 0;
+    sh_disc_on = ours;
     if (wanted != sh_od_on && (sh_od_x || sh_od_y)) {
         gpu_set_overdraw(wanted ? sh_od_x : 0, wanted ? sh_od_y : 0);
         sh_od_on = wanted;
@@ -2985,7 +3039,12 @@ int gpu_ws_background_requires_full_composite(void) {
      * those pixels on screen indefinitely. Conservatively keep full mirroring
      * once a composite has been tagged; GPU reset/snapshot restore clears the
      * latch together with the tags. Never modify the packet freshness guard. */
-    return ws_background_tags_used && ws_native_wide_configured();
+    if (ws_background_tags_used && ws_native_wide_configured()) return 1;
+    /* A stretched phase backdrop (psx_ws_prim_in_backdrop) differs inside the
+     * canonical view too: the centre is drawn again, not copied, so the
+     * stretched picture has no seam at the 4:3 edges. */
+    return ws_nw_phase_backdrop && ws_native_wide_configured() &&
+           (uint32_t)s_frame_count - ws_phase_stretch_stamp <= 2u;
 }
 
 static int ws_nw_explicit_background(void) {
@@ -3316,6 +3375,16 @@ void ws_bg_phase_note(uint32_t op) {
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
     if (op >= 0x30u && op <= 0x3Fu) {
+        /* nw_phase_backdrop: an untextured shaded polygon from one edge of the
+         * picture exactly to the other is the backdrop's own gradient (the
+         * horizon haze under a cutscene's painted mountains), not the world:
+         * it stays in the background phase and is stretched with it. */
+        if (ws_nw_phase_backdrop && !s_bg_phase_over && !(op & 0x04u)) {
+            int32_t xmn, xmx;
+            prim_sx_extent((uint8_t)op, &xmn, &xmx);
+            const int32_t W = ws_disp_w();
+            if (xmn <= 0 && xmn >= -2 && xmx >= W && xmx <= W + 2) return;
+        }
         s_bg_phase_over = 1;   /* shaded = 3D world (within-frame draw order) */
         ws_last_3d_stamp = f;  /* diagnostic only — see ws_2d_only_scene() for
                                   why shaded prims are NOT the scene classifier */
@@ -3346,7 +3415,15 @@ int psx_ws_prim_in_backdrop(void) {
         if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
             return 2; /* GL gate: expand only vertices beyond canonical edges */
     }
-    if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
+    /* [widescreen] nw_phase_backdrop: what a frame draws before its 3D world
+     * (a cutscene's painted sky and mountains) is its backdrop, stretched to
+     * the wide view; only while the last frames drew a 3D world, so a 2D-only
+     * screen (a title card's text on black) is left as it is. */
+    if (ws_nw_phase_backdrop && !ws_bg_phase_over() &&
+        (uint32_t)s_frame_count - ws_last_3d_stamp <= 2u) {
+        ws_phase_stretch_stamp = (uint32_t)s_frame_count;
+        return 1;
+    }
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both
      * the flower grid and the sky band; HUD/characters (tagged but post-3D) and the
@@ -5963,8 +6040,10 @@ static void gp0_exec_textured_tri(void) {
 /* Execute textured quad (GP0 0x2C-0x2F) */
 static void gp0_exec_textured_quad(void) {
     if (native_wide_projective_draw()) return;
+    const uint32_t disc_uv[4] = { gp0_cmd_buf[2], gp0_cmd_buf[4], gp0_cmd_buf[6], gp0_cmd_buf[8] };
     if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16)) ||
-        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5], gp0_cmd_buf[7])) {
+        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5], gp0_cmd_buf[7]) ||
+        shadow_disc_quad((gp0_cmd_buf[0] >> 25) & 1, (uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), disc_uv)) {
         set_tpage_from_poly((uint16_t)(gp0_cmd_buf[4] >> 16)); return;
     }
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
@@ -6142,8 +6221,10 @@ int psx_mod_texture_banks_supported(void) {
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
 static void gp0_exec_shaded_textured_quad(void) {
     if (native_wide_projective_draw()) return;
+    const uint32_t disc_uv[4] = { gp0_cmd_buf[2], gp0_cmd_buf[5], gp0_cmd_buf[8], gp0_cmd_buf[11] };
     if (gp0_tex_hidden((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16)) ||
-        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7], gp0_cmd_buf[10])) {
+        shadow_blob_quad((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7], gp0_cmd_buf[10]) ||
+        shadow_disc_quad((gp0_cmd_buf[0] >> 25) & 1, (uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), disc_uv)) {
         set_tpage_from_poly((uint16_t)(gp0_cmd_buf[5] >> 16)); return;
     }
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
@@ -7850,7 +7931,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_mono_tri();
             break;
         case 0x24: case 0x25: case 0x26: case 0x27:
-            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), (gp0_cmd_buf[0] >> 25) & 1);
             gp0_exec_textured_tri();
             break;
         case 0x28: case 0x29: case 0x2A: case 0x2B:
@@ -7858,7 +7939,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             break;
         case 0x2C: case 0x2D: case 0x2E: case 0x2F: {
             /* layout: colour+v0, tc0+clut, v1, tc1+tpage, v2, tc2, v3, tc3 */
-            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[4] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), (gp0_cmd_buf[0] >> 25) & 1);
             int kx, ky;
             const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
                                             gp0_cmd_buf[7], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[4],
@@ -7872,7 +7953,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_shaded_tri();
             break;
         case 0x34: case 0x35: case 0x36: case 0x37:
-            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), (gp0_cmd_buf[0] >> 25) & 1);
             gp0_exec_shaded_textured_tri();
             break;
         case 0x38: case 0x39: case 0x3A: case 0x3B:
@@ -7880,7 +7961,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             break;
         case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
             /* layout: colour+v0, tc0+clut, c1, v1, tc1+tpage, c2, v2, tc2, c3, v3, tc3 */
-            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16));
+            if (sh_off_n) shadow_off_note((uint16_t)(gp0_cmd_buf[5] >> 16), (uint16_t)(gp0_cmd_buf[2] >> 16), (gp0_cmd_buf[0] >> 25) & 1);
             int kx, ky;
             const int key = shadow_blob_key((gp0_cmd_buf[0] >> 25) & 1, gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7],
                                             gp0_cmd_buf[10], (const uint32_t[4]){gp0_cmd_buf[2], gp0_cmd_buf[5],
@@ -7906,7 +7987,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_mono_rect();
             break;
         case 0x64: case 0x65: case 0x66: case 0x67:
-            if (sh_off_n) shadow_off_note(current_texpage(), (uint16_t)(gp0_cmd_buf[2] >> 16));   /* the draw mode's page */
+            if (sh_off_n) shadow_off_note(current_texpage(), (uint16_t)(gp0_cmd_buf[2] >> 16), (gp0_cmd_buf[0] >> 25) & 1);   /* the draw mode's page */
             gp0_exec_textured_rect();
             break;
         case 0x68: case 0x69: case 0x6A: case 0x6B:
