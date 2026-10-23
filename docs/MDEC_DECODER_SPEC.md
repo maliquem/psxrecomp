@@ -10,11 +10,12 @@ organised.
 
 - Read psx-spx's chapter "Macroblock Decoder (MDEC)"
   (<https://psx-spx.consoledev.net/macroblockdecodermdec/>) and this file.
-- Do not open: any earlier implementation of these functions (the history of
-  `runtime/src/mdec.c`, or a legacy core file if one is present),
-  `tools/mdec_pin/`, `accuracy/axis5_mdec.md`, Beetle PSX / Mednafen /
-  DuckStation sources, or `mdec_ref/` in a build tree (the reference decoder
-  that `mdec_replay_ab` extracts).
+- Do not open the derived material in the history: `runtime/src/mdec.c`
+  before the core split, the removed `runtime/src/mdec_core_legacy.c` and
+  `tools/mdec_pin/`, and `accuracy/axis5_mdec.md` before its 2026-10
+  rewrite. Do not open Beetle PSX / Mednafen / DuckStation sources either, or
+  `mdec_ref/` in a build tree (the reference decoder that `mdec_replay_ab`
+  extracts).
 - The reference decoder is an oracle: run `mdec_replay_ab` and read its
   report, never its source (section 8).
 - The output must be byte-identical to the current decoder's (section 8).
