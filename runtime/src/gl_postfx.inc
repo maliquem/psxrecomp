@@ -474,6 +474,53 @@ static float  s_ss_u[4][4];
  * on the sandflier's deck), hidden in a long shadow but floating under a
  * high sun. s_spr_drop_h: the H the frame's triangles are placed with (0 = off). */
 static float  s_spr_drop_h = 0.0f;
+/* Does the scene's geometry (gl_renderer_shadow_world: a mod's map) lie
+ * under what the picture draws? A cutscene can draw its own floor away from
+ * the map (BoF4's sandflier crash), which then casts shadows nobody sees the
+ * cause of. Up to WG_SAMPLES of the frame's opaque 3D vertices, taken to the
+ * world: how many fall within a world triangle's footprint (across the floor)
+ * and how many of those lie on it (within WG_ON units along up). */
+enum { WG_SAMPLES = 96 };
+#define WG_ON 24.0f
+static int s_wg_in = 0, s_wg_on = 0;
+/* the map is used while at least WG_TRUST_ON of those lie on it; it is set
+ * aside after WG_TRUST_N presents in a row with fewer, back after as many
+ * with enough (no flicker at a cut) */
+enum { WG_TRUST_ON = 3, WG_TRUST_N = 3 };
+static int s_wg_trust = 1, s_wg_run = 0;
+static void wg_agree(const ScSlot *sc, float H) {
+    s_wg_in = s_wg_on = 0;
+    if (!sc || sc->n <= 0 || s_wg_n <= 0 || H <= 0.0f) return;
+    const float *r = s_cam_r, *t = s_cam_t, k = 1.0f / H;
+    const int step = sc->n > WG_SAMPLES ? sc->n / WG_SAMPLES : 1;
+    for (int i = 0; i < sc->n; i += step) {
+        const float *v = sc->v + (size_t)i * 3 * SC_V;
+        if (v[9] == -2.0f) continue;   /* a culled face */
+        const float z = v[2];
+        const float V[3] = {(v[0] - s_sc_cx) * z * k - t[0], (v[1] - s_sc_cy) * z * k - t[1], z - t[2]};   /* GTE view (y down) less T */
+        float w[3];
+        for (int c = 0; c < 3; c++) w[c] = r[c] * V[0] + r[3 + c] * V[1] + r[6 + c] * V[2];
+        int in = 0, on = 0;
+        for (int j = 0; j < s_wg_n && !on; j++) {
+            const float *a = s_wg + (size_t)j * 9, *b = a + 3, *c = a + 6;
+            /* footprint across the floor: world x, z (GTE y is up/down) */
+            const float d = (b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2]);
+            if (fabsf(d) < 1e-3f) continue;
+            const float l1 = ((w[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (w[2] - a[2])) / d;
+            const float l2 = ((b[0] - a[0]) * (w[2] - a[2]) - (w[0] - a[0]) * (b[2] - a[2])) / d;
+            if (l1 < 0.0f || l2 < 0.0f || l1 + l2 > 1.0f) continue;
+            in = 1;
+            const float y = a[1] + l1 * (b[1] - a[1]) + l2 * (c[1] - a[1]);
+            if (fabsf(y - w[1]) < WG_ON) on = 1;
+        }
+        s_wg_in += in; s_wg_on += on;
+    }
+}
+static void wg_trust_update(void) {
+    const int ok = s_wg_on >= WG_TRUST_ON;
+    if (ok == s_wg_trust) { s_wg_run = 0; return; }
+    if (++s_wg_run >= WG_TRUST_N) { s_wg_trust = ok; s_wg_run = 0; }
+}
 static unsigned s_spr_dropped = 0;   /* TCP: foot points dropped */
 /* The nearest surface of the frame's 3D triangles under view-space point A
  * (y up) along -u, from 8 units over it to 128 under: how far down (0 = none). */
@@ -1168,11 +1215,14 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     const ScSlot *sc = sc_presented();
     /* The scene's own geometry (gl_renderer_shadow_world) and the camera the
      * picture on screen was drawn with: the whole scenery, placed exactly. */
-    const int use_world = s_wg_n > 0 && sc && sc->cam_ok;
+    int use_world = s_wg_n > 0 && sc && sc->cam_ok;
     if (use_world) {
         memcpy(s_cam_r, sc->cam.r, sizeof s_cam_r); memcpy(s_cam_t, sc->cam.t, sizeof s_cam_t);
         s_cam_of[0] = sc->cam.of[0]; s_cam_of[1] = sc->cam.of[1]; s_cam_h = sc->cam.h;
         s_cam_ok = 1;
+        wg_agree(sc, H);   /* ... only while the picture's floor lies on it */
+        wg_trust_update();
+        use_world = s_wg_trust;
     }
     memset(s_sm_world, 0, sizeof s_sm_world);
     if (s_cam_ok) {
@@ -1224,7 +1274,11 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
      * sprite vertex's bias (as the scenery's sprites get theirs below) */
     float A2[3] = {0}, B2[3] = {0}, X0 = 1e30f, X1 = -1e30f, Y0 = 1e30f, Y1 = -1e30f, D0 = 1e30f, D1 = -1e30f, sbias = 0.0f, slam = 0.0f;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
-    const int use_store = !use_world && s_cam_ok && s_scc_alive > 0;
+    /* the scenery memory only where no map is given: a map set aside (a
+     * cutscene drawing its own floor, wg_agree) leaves the frame's own
+     * triangles; the memory would keep a moving object (the sandflier in a
+     * chase) at its past places, a trail of shadow behind it */
+    const int use_store = !use_world && s_wg_n <= 0 && s_cam_ok && s_scc_alive > 0;
     if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
         L[0] /= ll; L[1] /= ll; L[2] /= ll;
         /* a: across the light, level in view space when it can be */
@@ -1571,7 +1625,8 @@ int gl_renderer_lights_json(char *out, int cap) {
                       i ? "," : "", L->w[0], L->w[1], L->w[2], L->sx, L->sy, L->z, L->size, L->after,
                       L->c[0], L->c[1], L->c[2], L->hits, L->active);
     }
-    k += snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[");   /* this frame's: x, y, z, area, 3D before it */
+    k += snprintf(out + k, (size_t)(cap - k), "],\"wg_agree\":[%d,%d,%d],\"bdm\":[%u,%u,%u,%d],\"pieces\":[", s_wg_in, s_wg_on, s_wg_trust, s_dbg_bdm[0], s_dbg_bdm[1], s_dbg_bdm[2], s_b3d_on);
+  /* this frame's: x, y, z, area, 3D before it */
     for (int i = 0; sc && i < sc->en && i < 48 && k < cap - 80; i++) {
         const float *e = sc->ev + (size_t)i * SC_EV;
         k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f]", i ? "," : "", e[0], e[1], e[2], e[3], e[4]);
@@ -1673,7 +1728,7 @@ static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
     if (!nl) return;
     /* the casters, in view space (y up) */
     static float *buf = NULL; static int cap = 0;
-    const int use_world = s_wg_n > 0;
+    const int use_world = s_wg_n > 0 && s_wg_trust;   /* the map, while the picture's floor lies on it (wg_agree) */
     const int nw = use_world ? s_wg_n * 3 : 0, nf = sc->n * 3, ns = s_spr_n + s_spr_nx;
     const int n = nw + nf + ns;
     if (n <= 0) { s_fl_n = 0; return; }
