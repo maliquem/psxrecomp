@@ -799,6 +799,44 @@ are never affected. It pairs with the existing `fmv_filter` upscale choice
 `PSX_FMV_CHROMA=0|1` overrides it for one run and the `fmv_chroma` TCP
 command switches it live.
 
+### FMV enhancement (`fmv_enhance`)
+
+```toml
+[video]
+fmv_enhance = true   # default; false shows the movies as before
+```
+
+On by default. Each 24-bit (MDEC) movie frame shown through the OpenGL CPU
+present goes through a GPU stage (`runtime/src/gl_fmv_enhance.inc`) before it
+reaches the window:
+
+1. **Chroma.** MDEC repeats one Cb/Cr pair over each 2x2 pixel block; the
+   pair is recovered from the block's four pixels and interpolated between
+   block centres (MPEG-1 siting), across macroblock edges too. Luma stays per
+   pixel.
+2. **Deblocking.** Horizontal, then vertical: at the 8x8 block edges a small
+   step between two flat sides is spread over three pixels on each side. The
+   threshold grows with the movie's quantiser (mean MDEC qscale of the last
+   decode, `mdec_mean_qscale_x16`), and steps larger than it (real edges) are
+   kept. The grid's phase is measured on the frame (where the excess steps
+   between flat neighbours line up, mod 8), so a movie placed at any offset is
+   handled.
+3. **FSR1 EASU** (AMD FidelityFX Super Resolution 1, MIT) upscales to the
+   window rect, and **RCAS** sharpens it (0.5 stops). Both are applied to
+   luma only: the colour comes from the plain bilinear sample (EASU) or the
+   unsharpened pixel (RCAS), so the half-resolution MDEC chroma never rings.
+4. The usual present program draws the result 1:1 (gamma, scanlines).
+
+Display only: guest RAM, VRAM and the decoder's output are untouched
+(savestates, netplay and VRAM screenshots stay byte-exact); 15-bit frames are
+never affected, and a window no larger than the movie skips the stage. It
+replaces `fmv_filter` / `fmv_chroma_smoothing` for those frames. OpenGL only.
+`PSX_FMV_ENHANCE=0|1` overrides it for one run. The `fmv_enhance` TCP command
+switches it live and reports the frames enhanced and the grid phase found;
+for checks it also takes `mask` (1 chroma, 2 deblock, 4 RCAS, 8 EASU) and
+`dump` (a path prefix: the next movie frame is saved through several stage
+sets as `<prefix>_mNN.bmp`).
+
 ### Texture LOD and anisotropic filtering (`texture_lod`, `anisotropic_filtering`)
 
 ```toml

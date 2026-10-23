@@ -61,6 +61,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `present_shot` | ✓ |   | `path` | PNG of the **composed present surface** — the frame after the backend fits the display buffer to the window, so it carries the presented aspect. ⚠ every other capture resolves the display buffer *before* that fit: on a 508×256 display in a 4:3 window they answer 508×256 while the player sees 640×480. Use this one for anything aspect-shaped (widescreen, letterbox), where a pre-fit buffer would hide the very stage the change touches. Staged and fulfilled on the next present, so the ack means *queued* — poll `present_shot_seq`. Unavailable headless and on the Vulkan backend (its swapchain has no readback hook) |
 | `present_shot_seq` | ✓ |   | — | Completion counter for `present_shot`, plus `wrote` (1 = that completion produced a PNG). Sample before staging, poll until `seq` moves. Advances on success *and* failure, so the poll always terminates |
 | `fmv_chroma` | ✓ |   | `on` (optional: 0/1) | Read or set `[video] fmv_chroma_smoothing` live. Replies `on` and `frames` (24-bit presents smoothed so far) |
+| `fmv_enhance` | ✓ |   | `on` (optional: 0/1), `mask` (optional: 1 chroma, 2 deblock, 4 RCAS, 8 EASU), `dump` (optional: path prefix) | Read or set `[video] fmv_enhance` live. Replies `on`, `frames` (24-bit presents enhanced so far) and `phase` (the 8x8 grid found). `dump` saves the next movie frame through several stage sets as `<prefix>_mNN.bmp` |
 | `texture_lod` | ✓ |   | `mode` (optional: 0 off, 1 mipmap), `aniso` (optional: 1..16) | Read or set `[video] texture_lod` / `anisotropic_filtering` live. Replies `mode`, `aniso` |
 | `bloom` | ✓ |   | `strength` (0..2), `threshold`, `time` (0/1), all optional | Read or set bloom live (`[video] bloom`). Replies the settings, `passes` and, while `time` is on, `us_mean`: the mean `glFinish`-fenced pass time over `timed` passes since the last query |
 | `dithering` | ✓ |   | `mode` (optional: 0 off, 1 on (default, native grid), 2 fine (internal pixels)) | Read or set `[video] dithering` live. Replies `mode` |
@@ -603,6 +604,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `exc_ring` |  | ✓ |  |
 | `first_failure` | ✓ | ✓ | ✓ |
 | `fmv_chroma` | ✓ |  | ✓ |
+| `fmv_enhance` | ✓ |  | ✓ |
 | `fmv_state` | ✓ |  |  |
 | `fn_clear` | ✓ |  |  |
 | `fn_disable` | ✓ |  |  |
