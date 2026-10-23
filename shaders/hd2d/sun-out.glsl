@@ -16,6 +16,9 @@ uniform vec4 u_suncol;
 uniform vec4 u_amb;
 uniform vec4 u_sunview;
 uniform vec4 u_ss;
+uniform vec4 u_worldup, u_shadowdir;   // the framework's (pfx_shadow_uniforms): world up, the light
+uniform vec4 u_proj;                   // y = native height (the view rays)
+uniform vec4 u_horizon;                // the framework's: world up (view space, y up), w the camera's H (0 = none)
 
 // depth-aware upsample of the lit term (as in ao-out.glsl)
 float lit_at(float z)
@@ -48,6 +51,21 @@ void main()
         return;
     }
     float d = texelFetch(u_d, p, 0).r;
+    // the 3D mark with no depth (none, or the game's depth clear: 0.9999): a
+    // painted backdrop (the framework marks what a frame draws before its 3D
+    // world), lit as level ground in the sun, so the painted ground round a
+    // cutscene's 3D floor matches it
+    if (d >= 0.99985 && m > 0.5 && u_ss.y > 0.5 && u_shadowdir.w > 0.5 && u_horizon.w > 0.0) {
+        // only its ground: below the horizon (the view ray points down, view
+        // space y up; the camera's own H), fading in over the first few
+        // pixels; the sky and the mountains stay
+        vec3 up = normalize(u_horizon.xyz);
+        vec2 nat = vec2(u_proj.y * u_size.x / u_size.y, u_proj.y);
+        vec3 ray = normalize(vec3((v_uv - 0.5) * nat / u_horizon.w, 1.0));
+        float gnd = smoothstep(0.03, 0.06, -dot(ray, up));   // past the far dunes painted at the horizon
+        float lg = clamp(dot(up, normalize(u_shadowdir.xyz)), 0.0, 1.0);
+        o = vec4(src * mix(vec3(1.0), mix(u_amb.rgb, u_suncol.rgb, lg), gnd), 1.0); return;
+    }
     if (d >= 0.99999 || (m < 0.5 && u_sunview.x < 0.5)) { o = vec4(src, 1.0); return; }
     float z = 256.0 / max(1.0 - d, 1e-7) - 256.0;
     float lit = lit_at(z);

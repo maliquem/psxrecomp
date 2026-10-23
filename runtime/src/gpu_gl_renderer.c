@@ -2108,6 +2108,7 @@ static uint64_t    s_pres_seq = 0;
 static float s_bloom = 0.0f;           /* [video] bloom strength (gl_postfx.inc) */
 static int   s_bcls_on = 0;            /* draws keep the "may glow" mask (a chain reads it) */
 static int   s_b3d_on = 0;             /* draws keep the "3D" mask, stencil bit 2 (a chain reads mask3d) */
+static unsigned s_dbg_bdm[3];          /* DBG: prims marked as backdrop: flat, textured, asked */
 static int   s_dep_on = 0;             /* a chain reads `depth`: the presented surface's depth is noted */
 static int   s_bloom_add_only = 0;     /* [video] bloom_source: 1 "additive" (opaque 3D does not glow),
                                         * 2 "additive3d" (additive 2D UI does not glow either) */
@@ -4390,9 +4391,10 @@ static void bcls_begin(int tex, int additive, GLuint bit) {
 }
 /* pass 2: clear the bit under every covered pixel; pass 1 (glow) or 3 (3D):
  * set it on that mark's sources; pass 4: set the cover bit under see-through
- * fragments. */
+ * fragments; pass 5: the 3D mark on every fragment (a painted backdrop's,
+ * b3d 2 below). */
 static void bcls_pass(int tex, int pass) {
-    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : pass == 3 ? 0x04 : pass == 4 ? 0x08 : 0x00, 0xFF);
+    glStencilFunc(GL_ALWAYS, pass == 1 ? 0x02 : (pass == 3 || pass == 5) ? 0x04 : pass == 4 ? 0x08 : 0x00, 0xFF);
     p_glUniform1i(tex ? s_tex_uBcls : s_geo_uBcls, pass);
 }
 /* Back to an untextured draw's state: its blend and mask-bit stencil. */
@@ -4404,7 +4406,11 @@ static void bcls_end_geo(int semi, int mask, int check) {
     mask_stencil_ex(mask, check);
 }
 /* Which marking passes a draw needs. b3d: 1 = every primitive of the batch
- * is a 3D source, 0 = none is, -1 = not known. An opaque batch that is all
+ * is a 3D source, 0 = none is, -1 = not known; 2 = the batch is a painted
+ * backdrop (drawn before the 3D world: psx_ws_prim_in_backdrop, [widescreen]
+ * nw_phase_backdrop), which takes the 3D mark without depth, so the effects
+ * that light the scenery (the Sun) light it too, as level ground; never a
+ * bloom source. An opaque batch that is all
  * 3D only sets (one pass); one with no 3D (and so no additive texels) only
  * clears (one pass); a semi-transparent one never clears, it only sets its
  * additive or 3D fragments (one pass). Only a batch of unknown make needs
@@ -4420,6 +4426,7 @@ static int bcls_passes(int semi, int b3d) {
 /* The 3D mark: opaque 2D clears it, 3D (opaque or not) sets it, see-through
  * 2D leaves what is under it. */
 static int b3dm_passes(int semi, int b3d) {
+    if (b3d == 2) return BCLS_SET;   /* a painted backdrop: all marked (pass 5) */
     if (semi >= 0) return BCLS_SET;
     if (b3d == 1) return BCLS_SET;
     if (b3d == 0) return BCLS_CLEAR;
@@ -4434,7 +4441,7 @@ static int b3dm_passes(int semi, int b3d) {
         DRAW;                                                                 \
         if ((s_bcls_on || s_b3d_on) && (dmode) != 2 && !s_fg_drawing) {      \
             if (s_bcls_on) {                                                  \
-                const int bcls_p_ = bcls_passes((semi), (b3d));               \
+                const int bcls_p_ = bcls_passes((semi), (b3d) == 2 ? 0 : (b3d)); \
                 bcls_begin(0, (semi) == 1 || (semi) == 3, 0x02);              \
                 if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
                 if (bcls_p_ & BCLS_SET)   { bcls_pass(0, 1); DRAW; }          \
@@ -4444,7 +4451,7 @@ static int b3dm_passes(int semi, int b3d) {
                 /* opaque: its passes also clear the cover bit */             \
                 bcls_begin(0, 0, (semi) < 0 ? 0x0C : 0x04);                   \
                 if (b3dm_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
-                if (b3dm_p_ & BCLS_SET)   { bcls_pass(0, 3); DRAW; }          \
+                if (b3dm_p_ & BCLS_SET)   { bcls_pass(0, (b3d) == 2 ? 5 : 3); DRAW; } \
                 if ((semi) >= 0) { glStencilMask(0x08); bcls_pass(0, 4); DRAW; } \
             }                                                                 \
             bcls_end_geo((semi), (mask), (check));                            \
@@ -4499,7 +4506,7 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
     }
     if ((s_bcls_on || s_b3d_on) && !s_fg_drawing) {
         if (s_bcls_on) {
-            const int bp = bcls_passes(semi, b3d);
+            const int bp = bcls_passes(semi, b3d == 2 ? 0 : b3d);
             bcls_begin(1, 0, 0x02);
             if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
             if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, 0, nverts); }
@@ -4512,7 +4519,7 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
             const int bp = b3dm_passes(semi, b3d) | (semi >= 0 ? BCLS_CLEAR : 0);
             bcls_begin(1, 0, 0x0C);
             if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
-            if (bp & BCLS_SET)   { bcls_pass(1, 3); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+            if (bp & BCLS_SET)   { bcls_pass(1, b3d == 2 ? 5 : 3); glDrawArrays(GL_TRIANGLES, 0, nverts); }
             if (semi >= 0) { glStencilMask(0x08); bcls_pass(1, 4); glDrawArrays(GL_TRIANGLES, 0, nverts); }
         }
         /* Back to the state the branch above ended in. */
@@ -4615,8 +4622,10 @@ typedef struct {
     float   wscale, wcenter; /* its backdrop stretch (wide_bd_scale) */
     int     wsx, wsy, wsw, wsh;  /* its wide-surface scissor (native px) */
     uint8_t depth;           /* PGXP depth mode (depth_apply) */
+    int8_t  b3d;             /* its marking (bcls_passes): 2 = a painted backdrop, else -1 (each fragment's own) */
 } HiCmd;
 static int s_hq_depth_cur = 0;   /* depth mode of the batch being queued */
+static int s_hq_b3d_cur = -1;    /* a flat batch's b3d while it is queued */
 static HiCmd  *s_hq = NULL;
 static int     s_hq_n = 0, s_hq_cap = 0;
 static float  *s_hq_v = NULL;
@@ -4647,6 +4656,7 @@ static HiCmd *hiw_enqueue(int kind, const float *verts, int nverts, int stride) 
     s_hq_vn += nf;
     c->check = (uint8_t)s_mask_check;
     c->depth = (uint8_t)s_hq_depth_cur;
+    c->b3d = -1;
     c->ax0 = s_area_x1; c->ay0 = s_area_y1; c->ax1 = s_area_x2; c->ay1 = s_area_y2;
     s_hq_cmds++;
     return c;
@@ -4704,6 +4714,7 @@ static int hiw_enqueue_tex(int nverts, int semi, int mirror, int gate) {
     c->tex = s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex;
     c->palette = s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex;
     c->hd_tex = s_tb_hd_tex;
+    c->b3d = s_tb_b3d == 2 ? 2 : -1;
     if (wq) hiw_wide_set(c, gate);
     return wq;
 }
@@ -4716,6 +4727,7 @@ static int hiw_enqueue_geo(const float *verts, int nverts, int semi, int mask,
     if (!c) { hiw_flush_queue(); return 0; }
     c->semi = (int8_t)semi;
     c->mask = (uint8_t)(mask ? 1 : 0);
+    c->b3d = s_hq_b3d_cur == 2 ? 2 : -1;
     if (wq) hiw_wide_set(c, gate);
     return wq;
 }
@@ -4762,7 +4774,7 @@ static void hiw_replay_wide(void) {
             p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
                            s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
             depth_apply_ex(c->depth, 1);
-            tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
+            tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, c->b3d);
             depth_restore_ex(c->depth, 1, c->vcount);
         } else {
             if (cur != HQ_GEO) {
@@ -4779,7 +4791,7 @@ static void hiw_replay_wide(void) {
             p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
                            s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
             depth_apply_ex(c->depth, 0);
-            BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
+            BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
             depth_restore_ex(c->depth, 0, c->vcount);
         }
     }
@@ -4846,7 +4858,7 @@ static void hiw_flush_queue(void) {
                 p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
                                s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
                 depth_apply_ex(c->depth, 1);
-                tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
+                tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, c->b3d);
                 depth_restore_ex(c->depth, 1, c->vcount);
             } else {
                 if (cur != HQ_GEO) {
@@ -4860,7 +4872,7 @@ static void hiw_flush_queue(void) {
                 p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
                                s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
                 depth_apply_ex(c->depth, 0);
-                BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
+                BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
                 depth_restore_ex(c->depth, 0, c->vcount);
             }
         }
@@ -5059,7 +5071,8 @@ static void flush_flat_batch_impl(void) {
     }
     s_hq_depth_cur = dmode;
     if ((hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
-        hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;
+        (s_hq_b3d_cur = b3d, hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate))) mirror = 0;
+    s_hq_b3d_cur = -1;
     s_hq_depth_cur = 0;
 
     if (mirror) {
@@ -5470,7 +5483,9 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb);
     }
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
-    const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d();
+    const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d() ? 1
+                  : s_b3d_on && ctx_prim_in_backdrop() == 1 ? 2 : 0;
+    s_dbg_bdm[2]++; if (b3d == 2) s_dbg_bdm[0]++;
     if (s_fb_n > 0 && (s_fb_mode != GL_TRIANGLES || s_fb_semi != semi ||
                        s_fb_mask != (int)s_mask_set || s_fb_gate != gate ||
                        s_fb_depth != dmode || s_fb_b3d != b3d))
@@ -5617,6 +5632,10 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const int batch_semi = batch_class.key;
         const int isolate = batch_class.isolate;
         const int tdmode = pgxp_tri_depth_mode(semi);
+        /* the batch's mark (bcls_passes / b3dm_passes): 3D, or a painted backdrop */
+        const int tex_b3d = (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() ? 1
+                          : s_b3d_on && ctx_prim_in_backdrop() == 1 ? 2 : 0;
+        s_dbg_bdm[2]++; if (tex_b3d == 2) s_dbg_bdm[1]++;
         if ((semi == 1 || semi == 3) && s_sc_on) {
             float rgb[3];
             emit_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, rgb);
@@ -5658,7 +5677,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (tdmode != s_tb_depth) reason = 7;
             /* Bloom marks a batch in two passes (clear, then sources), so
              * one batch holds either 3D sources or not: painter order. */
-            else if ((s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() != s_tb_b3d) reason = 7;
+            else if ((s_bcls_on || s_b3d_on) && tex_b3d != s_tb_b3d) reason = 7;
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -5668,7 +5687,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = filter; s_tb_gate = gate;
             s_tb_depth = tdmode;
-            s_tb_b3d = (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d();
+            s_tb_b3d = tex_b3d;
             s_tb_bank_tex = s_selected_bank_tex;
             s_tb_bank_live_clut = s_selected_bank_live_clut;
             s_tb_hd_tex = hd_tex;
@@ -11925,9 +11944,13 @@ static void rth_send_state(void) {
 }
 
 /* Per-primitive widescreen tags, read by bd_prim_gate during replay. Taken
- * only when the backend would read them (native-wide on, stretch gate on). */
+ * only when the backend would read them (native-wide on, stretch gate on;
+ * or the 3D mark kept: a painted backdrop takes it, b3dm_passes). */
 static uint16_t rth_prim_flags(void) {
-    if (s_rthm_wide_w <= 0 || !g_ws_bd_stretch_on) return 0;
+    if (s_rthm_wide_w <= 0 || !g_ws_bd_stretch_on) {
+        if (!s_b3d_on) return 0;
+        return (uint16_t)(RTHF_PRIM | ((psx_ws_prim_in_backdrop() & 3) << RTHF_BD_SHIFT));
+    }
     uint16_t f = RTHF_PRIM;
     if (g_ws_bd_phase_mode != 0)
         f |= (uint16_t)((psx_ws_prim_in_backdrop() & 3) << RTHF_BD_SHIFT);

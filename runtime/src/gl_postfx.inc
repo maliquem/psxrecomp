@@ -1799,6 +1799,16 @@ static void pfx_shadow_uniforms(GLuint prog) {
     }
     /* the camera's world axes and the light, when the framework knows them
      * (after the preset's own values, which they replace) */
+    {   /* the horizon: world up in view space (y up) and the camera's H, so a
+         * pass finds the view rays that point below it (sun-out.glsl: a painted
+         * backdrop's ground); w 0 = no camera */
+        const GLint loc = p_glGetUniformLocation(prog, "u_horizon");
+        if (loc >= 0) {
+            if (s_sm_world[1][3] > 0.5f && s_cam_h > 0.0f)
+                p_glUniform4f(loc, s_sm_world[1][0], s_sm_world[1][1], s_sm_world[1][2], s_cam_h);
+            else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
     static const char *const wn[3] = {"u_world", "u_worldup", "u_shadowdir"};
     for (int k = 0; k < 3; k++) {
         if (s_sm_world[k][3] < 0.5f) continue;
@@ -1984,7 +1994,9 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             default: p_glUniform4f(loc, u->v[0], u->v[1], u->v[2], u->v[3]); break;
             }
         }
-        if (reads_shadow) pfx_shadow_uniforms(prog);   /* after the preset's own */
+        /* after the preset's own; every pass of a chain that reads the map (its
+         * composite needs the light too: a painted backdrop lit as ground) */
+        if (reads_shadow || st->chain.uses_shadow) pfx_shadow_uniforms(prog);
         if (reads_fire) pfx_fire_uniforms(prog);
         if (ps->blend == PFX_BLEND_SCREEN) {
             glEnable(GL_BLEND);
