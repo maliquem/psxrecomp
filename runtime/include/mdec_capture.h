@@ -8,15 +8,19 @@
  * game's own movie bitstream: keep it out of git.
  *
  * Layout, little-endian:
- *   header  "MDECCAP\0", u32 MDEC_CAPTURE_VERSION, u32 0
- *   record  u32 MDEC_CAPTURE_RECORD_TAG, u32 command word, u64 guest cycle,
- *           u32 n, u16 input halfwords[n], u32 output bytes,
- *           u64 mdec_fnv1a64(output)
+ *   header   "MDECCAP\0", u32 MDEC_CAPTURE_VERSION, u32 0
+ *   command  u32 MDEC_CAPTURE_RECORD_TAG, u32 command word, u64 guest cycle,
+ *            u32 n, u16 input halfwords[n], u32 output bytes,
+ *            u64 mdec_fnv1a64(output)
+ *   state    u32 MDEC_CAPTURE_STATE_TAG, u64 guest cycle, u32 n,
+ *            u8 mdec_snapshot_write() blob[n]
  * Every DECODE/SET_QUANT/SET_SCALE that received all its input is recorded,
  * and every command that takes none (NOP, 4..7). Only DECODE has output; the
- * others record 0 bytes and the hash of nothing (MDEC_FNV64_INIT). Control
- * register writes (reset, DMA enables) are not recorded: they do not change
- * what a command decodes. */
+ * others record 0 bytes and the hash of nothing (MDEC_FNV64_INIT). A state
+ * record opens the capture and follows every mdec_init and snapshot load, so
+ * a replay starts from the guest's tables even when the run began from a
+ * savestate mid-movie. Control register writes (reset, DMA enables) are not
+ * recorded: they do not change what a command decodes. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -26,8 +30,9 @@ extern "C" {
 #endif
 
 #define MDEC_CAPTURE_MAGIC "MDECCAP"          /* 8 bytes with its NUL */
-#define MDEC_CAPTURE_VERSION 1u
+#define MDEC_CAPTURE_VERSION 2u
 #define MDEC_CAPTURE_RECORD_TAG 0x444D4352u   /* "RCMD" */
+#define MDEC_CAPTURE_STATE_TAG 0x504E5352u    /* "RSNP" */
 
 #define MDEC_FNV64_INIT 0xcbf29ce484222325ull
 #define MDEC_FNV64_PRIME 0x00000100000001b3ull

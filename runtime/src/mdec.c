@@ -208,6 +208,37 @@ static uint8_t input_byte(uint32_t byte_index) {
 static FILE *s_capture;
 static int s_capture_env_checked;
 
+static void capture_failed(void) {
+    fprintf(stderr, "[mdec] capture: write failed; capture off\n");
+    mdec_capture_stop();
+}
+
+/* Record the whole decoder state (snapshot blob): opens the capture and
+ * follows mdec_init / a snapshot load, so a replay starts from the guest's
+ * tables even when the run began from a savestate. */
+static void capture_state(void) {
+    uint8_t head[16];
+    uint8_t *blob;
+    uint32_t n;
+    PstW w;
+    if (!s_capture) return;
+    n = mdec_snapshot_bytes();
+    blob = n ? (uint8_t *)malloc(n) : NULL;
+    if (!blob) {
+        capture_failed();
+        return;
+    }
+    mdec_snapshot_write(blob);
+    pst_w_init(&w, head, sizeof(head));
+    (void)pst_w_u32(&w, MDEC_CAPTURE_STATE_TAG);
+    (void)pst_w_u64(&w, psx_cycle_count);
+    (void)pst_w_u32(&w, n);
+    if (fwrite(head, 1, sizeof(head), s_capture) != sizeof(head) ||
+        fwrite(blob, 1, n, s_capture) != n || fflush(s_capture) != 0)
+        capture_failed();
+    free(blob);
+}
+
 int mdec_capture_start(const char *path) {
     uint8_t hdr[16];
     PstW w;
@@ -229,12 +260,23 @@ int mdec_capture_start(const char *path) {
         mdec_capture_stop();
         return 0;
     }
-    return 1;
+    capture_state();
+    return s_capture != NULL;
 }
 
 void mdec_capture_stop(void) {
     if (s_capture) fclose(s_capture);
     s_capture = NULL;
+}
+
+/* PSX_MDEC_CAPTURE is looked up once, when the first command begins: by then
+ * any savestate the run started from is loaded, and its state opens the file. */
+static void capture_poll_env(void) {
+    const char *path;
+    if (s_capture_env_checked) return;
+    s_capture_env_checked = 1;
+    path = getenv("PSX_MDEC_CAPTURE");
+    if (path && path[0]) (void)mdec_capture_start(path);
 }
 
 /* Record the command that just finished. `has_output`: a DECODE that ran, so
@@ -243,11 +285,6 @@ static void capture_command(int has_output) {
     uint8_t head[20], tail[12];
     PstW w;
     uint32_t out_bytes = has_output ? mdec.output_size : 0u;
-    if (!s_capture_env_checked) {
-        const char *path = getenv("PSX_MDEC_CAPTURE");
-        s_capture_env_checked = 1;
-        if (path && path[0]) (void)mdec_capture_start(path);
-    }
     if (!s_capture) return;
     pst_w_init(&w, head, sizeof(head));
     (void)pst_w_u32(&w, MDEC_CAPTURE_RECORD_TAG);
@@ -265,14 +302,14 @@ static void capture_command(int has_output) {
          fwrite(mdec.input, sizeof(uint16_t), mdec.input_count, s_capture) !=
              mdec.input_count) ||
         fwrite(tail, 1, sizeof(tail), s_capture) != sizeof(tail) ||
-        fflush(s_capture) != 0) {
-        fprintf(stderr, "[mdec] capture: write failed; capture off\n");
-        mdec_capture_stop();
-    }
+        fflush(s_capture) != 0)
+        capture_failed();
 }
 #else
 int mdec_capture_start(const char *path) { (void)path; return 0; }
 void mdec_capture_stop(void) {}
+static void capture_state(void) {}
+static void capture_poll_env(void) {}
 static void capture_command(int has_output) { (void)has_output; }
 #endif
 
@@ -812,6 +849,7 @@ static void execute_command(void) {
 }
 
 static void begin_command(uint32_t value) {
+    capture_poll_env();
     mdec.command = value;
     mdec.output_bit15 = (uint8_t)((value >> 25) & 1u);
     mdec.output_signed = (uint8_t)((value >> 26) & 1u);
@@ -949,6 +987,7 @@ void mdec_init(void) {
         mdec.output_depth = 3;
     }
 #endif
+    capture_state();
 }
 
 uint32_t mdec_read(uint32_t addr) {
@@ -1332,5 +1371,6 @@ int mdec_snapshot_read(const uint8_t *p, uint32_t len) {
         mdec_last_color_decode_cycle = MDEC_NEVER_DECODED;
     else
         mdec_last_color_decode_cycle = psx_cycle_count - age;
+    capture_state();
     return 1;
 }

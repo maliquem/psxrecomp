@@ -1,7 +1,8 @@
 /*
  * MDEC command capture (mdec_capture.h): every finished command lands in the
- * file with its command word, input halfwords and output hash, and turning the
- * capture on changes nothing the decoder outputs.
+ * file with its command word, input halfwords and output hash, the decoder
+ * state is recorded at the start and after mdec_init / a snapshot load, and
+ * turning the capture on changes nothing the decoder outputs.
  *
  * The capture feeds an offline replay that compares decoder builds byte for
  * byte, so a record that drifts from what the guest actually sent would make
@@ -109,20 +110,43 @@ static uint64_t rd64(const uint8_t *p) {
     return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
-/* Parse `path` and check it holds exactly `cmds[0..n)` in order. */
-static void check_file(const char *path, const Cmd *cmds, uint32_t n) {
+/* Parse `path`: its command records must be exactly `cmds[0..n)` in order,
+ * and it must hold `states` state records, each a snapshot the decoder
+ * accepts; the last one must equal `last_state` when given. */
+static void check_file(const char *path, const Cmd *cmds, uint32_t n,
+                       uint32_t states, const uint8_t *last_state,
+                       uint32_t last_len) {
     size_t len = 0, pos = 16;
+    uint32_t r = 0, nstates = 0;
     uint8_t *f = read_file(path, &len);
     CHECK(f != NULL, "capture file %s unreadable", path);
     if (!f) return;
     CHECK(len >= 16 && memcmp(f, MDEC_CAPTURE_MAGIC, 8) == 0, "bad magic");
     CHECK(len >= 16 && rd32(f + 8) == MDEC_CAPTURE_VERSION, "bad version");
-    for (uint32_t r = 0; r < n && failures == 0; r++) {
-        const Cmd *c = &cmds[r];
-        int is_decode = (c->command >> 29) == 1u;
+    while (pos < len && failures == 0) {
+        const Cmd *c;
+        int is_decode;
         uint32_t nhw, out_bytes;
-        CHECK(pos + 20 <= len, "record %u truncated", r);
+        CHECK(pos + 20 <= len, "record at %u truncated", (unsigned)pos);
         if (pos + 20 > len) break;
+        if (rd32(f + pos) == MDEC_CAPTURE_STATE_TAG) {
+            uint32_t blen = rd32(f + pos + 12);
+            CHECK(pos + 16u + blen <= len, "state %u truncated", nstates);
+            if (pos + 16u + blen > len) break;
+            CHECK(mdec_snapshot_validate(f + pos + 16, blen),
+                  "state %u is not a snapshot the decoder accepts", nstates);
+            nstates++;
+            if (nstates == states && last_state)
+                CHECK(blen == last_len &&
+                          memcmp(f + pos + 16, last_state, last_len) == 0,
+                      "state %u is not the snapshot that was loaded", nstates);
+            pos += 16u + blen;
+            continue;
+        }
+        CHECK(r < n, "more command records than commands sent");
+        if (r >= n) break;
+        c = &cmds[r];
+        is_decode = (c->command >> 29) == 1u;
         CHECK(rd32(f + pos) == MDEC_CAPTURE_RECORD_TAG, "record %u tag", r);
         CHECK(rd32(f + pos + 4) == c->command, "record %u command %08x",
               r, rd32(f + pos + 4));
@@ -145,8 +169,12 @@ static void check_file(const char *path, const Cmd *cmds, uint32_t n) {
                   mdec_fnv1a64(c->out, is_decode ? c->out_bytes : 0u),
               "record %u output hash", r);
         pos += 12;
+        r++;
     }
     CHECK(failures != 0 || pos == len, "%u trailing bytes", (unsigned)(len - pos));
+    CHECK(failures != 0 || r == n, "%u of %u commands recorded", r, n);
+    CHECK(failures != 0 || nstates == states, "%u state records, expected %u",
+          nstates, states);
     free(f);
 }
 
@@ -180,7 +208,7 @@ int main(int argc, char **argv) {
 #endif
     run_all(by_env);
     mdec_capture_stop();
-    check_file(env_path, by_env, 5);
+    check_file(env_path, by_env, 5, 1, NULL, 0);   /* state: capture start */
 
     /* Capture off: the reference outputs. */
     run_all(plain);
@@ -190,12 +218,23 @@ int main(int argc, char **argv) {
           plain[4].out_bytes);
     check_same_output(by_env, plain, "with the env capture on");
 
-    /* mdec_capture_start() over the same commands. */
+    /* mdec_capture_start() over the same commands, then a snapshot load. */
     CHECK(mdec_capture_start(api_path) == 1, "cannot capture to %s", api_path);
     run_all(by_api);
-    mdec_capture_stop();
-    check_same_output(by_api, plain, "with the capture started by call");
-    check_file(api_path, by_api, 5);
+    {
+        uint32_t n = mdec_snapshot_bytes();
+        uint8_t *blob = (uint8_t *)malloc(n);
+        CHECK(blob != NULL, "out of memory");
+        if (blob) {
+            mdec_snapshot_write(blob);
+            CHECK(mdec_snapshot_read(blob, n), "snapshot reload refused");
+        }
+        mdec_capture_stop();
+        check_same_output(by_api, plain, "with the capture started by call");
+        /* states: capture start, mdec_init, the snapshot load */
+        check_file(api_path, by_api, 5, 3, blob, n);
+        free(blob);
+    }
 
     if (failures) {
         fprintf(stderr, "mdec_capture_test: %d failure(s)\n", failures);
