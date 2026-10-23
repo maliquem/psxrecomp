@@ -463,6 +463,49 @@ static float  s_sm_u[4][4];
  * scenery's, so a reader can soften the scenery's shadows and keep the
  * sprites' pixel-art silhouettes sharp. */
 static GLuint s_sm2_tex = 0, s_sm2_fbo = 0;
+/* ... unless the sun is higher than the pass's u_sprsun.x (degrees): a sprite
+ * is an upright plane, and a sun near the zenith casts it as a line at its
+ * feet (it floats). The sprites then take that elevation (same azimuth), a
+ * short shadow from their feet, and their map its own mapping (u_ssx, u_ssy,
+ * u_ssz, u_sss, as u_smx..u_sms; w 0 = the scenery's). */
+static float  s_ss_u[4][4];
+/* In that mode a sprite's foot point is dropped onto the surface under it:
+ * the game's point can sit a little above the floor drawn there (BoF4: Cray
+ * on the sandflier's deck), hidden in a long shadow but floating under a
+ * high sun. s_spr_drop_h: the H the frame's triangles are placed with (0 = off). */
+static float  s_spr_drop_h = 0.0f;
+static unsigned s_spr_dropped = 0;   /* TCP: foot points dropped */
+/* The nearest surface of the frame's 3D triangles under view-space point A
+ * (y up) along -u, from 8 units over it to 128 under: how far down (0 = none). */
+static float spr_drop(const ScSlot *sc, const float *A, const float *u) {
+    if (!sc || s_spr_drop_h <= 0.0f) return 0.0f;
+    const float k = 1.0f / s_spr_drop_h, d[3] = {-u[0], -u[1], -u[2]};
+    const float O[3] = {A[0] + u[0] * 8.0f, A[1] + u[1] * 8.0f, A[2] + u[2] * 8.0f};
+    float best = 1e30f;
+    for (int t = 0; t < sc->n; t++) {
+        float P[3][3];
+        for (int j = 0; j < 3; j++) {
+            const float *v = sc->v + ((size_t)t * 3 + j) * SC_V;
+            P[j][0] = (v[0] - s_sc_cx) * v[2] * k; P[j][1] = -(v[1] - s_sc_cy) * v[2] * k; P[j][2] = v[2];
+        }
+        const float e1[3] = {P[1][0] - P[0][0], P[1][1] - P[0][1], P[1][2] - P[0][2]};
+        const float e2[3] = {P[2][0] - P[0][0], P[2][1] - P[0][1], P[2][2] - P[0][2]};
+        const float p[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+        const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+        if (fabsf(det) < 1e-6f) continue;
+        const float id = 1.0f / det;
+        const float s[3] = {O[0] - P[0][0], O[1] - P[0][1], O[2] - P[0][2]};
+        const float bu = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * id;
+        if (bu < 0.0f || bu > 1.0f) continue;
+        const float q[3] = {s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]};
+        const float bv = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) * id;
+        if (bv < 0.0f || bu + bv > 1.0f) continue;
+        const float tt = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * id;
+        if (tt >= 0.0f && tt < best) best = tt;
+    }
+    return best <= 136.0f ? fmaxf(best - 8.0f, 0.0f) : 0.0f;
+}
+static float *s_sm_pos = NULL; static int s_sm_pcap = 0;   /* each caster vertex, view space (y up) */
 static float  s_sm_world[3][4];   /* u_world, u_worldup, u_shadowdir (view space, y up; w 1 = set) */
 static float *s_sm_buf = NULL; static int s_sm_cap = 0;
 /* Sprites standing in the scene (gl_renderer_shadow_anchor): their pieces as
@@ -474,6 +517,7 @@ static GLint  s_spr_uvram = -1, s_sm_uatl = -1, s_spr_uatl = -1;
 static GLuint s_spr_atl_tex = 0;   /* the presented slot's sprite cut-outs (R8, SC_ATL square) */
 static int    s_spr_w = 0, s_spr_h = 0, s_spr_n = 0;
 static float *s_spr_cast = NULL, *s_spr_scr = NULL; static int s_spr_cap = 0;
+static float *s_spr_cau = NULL;   /* per caster vertex: its sprite's floor height (dot with world up) */
 static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
     for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
     return NULL;
@@ -508,6 +552,7 @@ static float s_spr_bend_h = 0.0f;
 /* Feet bent down to the floor: as casters (s_spr_xc) and on the
  * picture (s_spr_xs, with the standing pieces' depth, the nearest winning). */
 static float *s_spr_xc = NULL, *s_spr_xs = NULL; static int s_spr_nx = 0, s_spr_xcap = 0;
+static float *s_spr_xau = NULL;   /* per bent-foot caster vertex: its floor height */
 static float  s_spr_kx = 0.0f, s_spr_ky = 0.0f;
 /* The bottom of sprite r (pieces i with root r) into f; 0 = not known. */
 static int spr_feet(const ScSlot *sc, const int *ids, int *par, int r, int m,
@@ -594,7 +639,9 @@ static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float au, c
                 if (p) s_spr_xc = p;
                 float *q = (float *)realloc(s_spr_xs, (size_t)nc * SC_V * sizeof(float));
                 if (q) s_spr_xs = q;
-                if (!p || !q) return;
+                float *r = (float *)realloc(s_spr_xau, (size_t)nc * sizeof(float));
+                if (r) s_spr_xau = r;
+                if (!p || !q || !r) return;
                 s_spr_xcap = nc;
             }
             const float xl = (float)(f->X0 + x) - s_sc_cx, xr = xl + 1.0f;
@@ -618,6 +665,7 @@ static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float au, c
                 float *o = s_spr_xs + (size_t)(s_spr_nx + j) * SC_V;
                 memset(o, 0, SC_V * sizeof(float));
                 o[0] = qx[j] * s_spr_kx; o[1] = -qy[j] * s_spr_ky; o[2] = z; o[9] = -1.0f;
+                s_spr_xau[s_spr_nx + j] = au;
             }
             s_spr_nx += 6;
         }
@@ -669,6 +717,10 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         if (V[2] < 16.0f) continue;
         AP[na][0] = V[0]; AP[na][1] = -V[1]; AP[na][2] = V[2];
         AS[na][0] = s_cam_h * V[0] / V[2]; AS[na][1] = s_cam_h * V[1] / V[2];
+        {   /* a high sun: onto the surface under it (s_spr_drop_h) */
+            const float *u = s_sm_world[1], dz = spr_drop(sc, AP[na], u);
+            if (dz > 0.5f) { for (int i = 0; i < 3; i++) AP[na][i] -= u[i] * dz; s_spr_dropped++; }
+        }
         na++;
     }
     if (!na) return;
@@ -704,7 +756,9 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         if (c) s_spr_cast = c;
         float *s = (float *)realloc(s_spr_scr, (size_t)sc->sn * 3 * SC_V * sizeof(float));
         if (s) s_spr_scr = s;
-        if (!c || !s) return;
+        float *f = (float *)realloc(s_spr_cau, (size_t)sc->sn * 3 * sizeof(float));
+        if (f) s_spr_cau = f;
+        if (!c || !s || !f) return;
         s_spr_cap = sc->sn * 3;
     }
     const float h = s_cam_h, kx = 1.0f / (120.0f * aspect), ky = 1.0f / 120.0f;
@@ -893,7 +947,8 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
                 memcpy(c + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
                 memcpy(s + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
             }
-            if (ok) { s_spr_n += 3; s_spr_stood[best]++; }
+            if (ok) { for (int j = 0; j < 3; j++) s_spr_cau[s_spr_n + j] = au;
+                      s_spr_n += 3; s_spr_stood[best]++; }
         }
     }
     if (s_spr_n) s_spr_frames++;
@@ -1107,6 +1162,9 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     if (sun && gpu_shadow_sun_area(&area_sun[0], &area_sun[1])) sun = area_sun;
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
+    float Ls[3] = {L[0], L[1], L[2]};   /* the sprites' light (u_sprsun) */
+    int spr_own = 0;                    /* the sprites' map has its own mapping */
+    memset(s_ss_u, 0, sizeof s_ss_u);
     const ScSlot *sc = sc_presented();
     /* The scene's own geometry (gl_renderer_shadow_world) and the camera the
      * picture on screen was drawn with: the whole scenery, placed exactly. */
@@ -1138,6 +1196,13 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
                 L[i] = u[i] * sinf(el) + (rt[i] * cosf(az) + fw[i] * sinf(az)) * cosf(el);
             for (int i = 0; i < 3; i++) s_sm_world[2][i] = L[i];
             s_sm_world[2][3] = 1.0f;
+            const float *ssun = pfx_pass_uniform(ps, "u_sprsun");
+            if (ssun && ssun[0] > 0.0f && sun[1] > ssun[0]) {
+                const float es = ssun[0] * 0.01745329f;
+                for (int i = 0; i < 3; i++)
+                    Ls[i] = u[i] * sinf(es) + (rt[i] * cosf(az) + fw[i] * sinf(az)) * cosf(es);
+                spr_own = 1;
+            } else memcpy(Ls, L, sizeof Ls);
         }
     }
     {   /* u_ss.z, u_ss.w (TCP, debugging the feet): 1 = no bend; the bent zone's height */
@@ -1145,7 +1210,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         s_spr_bend_dbg = ss ? (int)(ss[2] + 0.5f) : 0;
         s_spr_bend_h = ss ? ss[3] : 0.0f;
     }
-    pfx_sprites_stand(sc, aspect, L);
+    s_spr_drop_h = spr_own ? H : 0.0f;
+    pfx_sprites_stand(sc, aspect, Ls);
     {   /* u_ss.x 0: sprite shadows off (no casters, no shading; the game's blobs stay) */
         const float *ss = pfx_pass_uniform(ps, "u_ss");
         s_spr_ss = !(ss && ss[0] < 0.5f);
@@ -1153,6 +1219,10 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     }
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0, nbase_all = 0;
+    /* the sprites' own mapping (spr_own): across, up and along their light,
+     * their box on the map, the depth range of everything along it, and each
+     * sprite vertex's bias (as the scenery's sprites get theirs below) */
+    float A2[3] = {0}, B2[3] = {0}, X0 = 1e30f, X1 = -1e30f, Y0 = 1e30f, Y1 = -1e30f, D0 = 1e30f, D1 = -1e30f, sbias = 0.0f, slam = 0.0f;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
     const int use_store = !use_world && s_cam_ok && s_scc_alive > 0;
     if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
@@ -1199,6 +1269,10 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             float *p = (float *)realloc(s_sm_buf, (size_t)n * SC_V * sizeof(float));
             if (!p) n = 0; else { s_sm_buf = p; s_sm_cap = n; }
         }
+        if (spr_own && n > s_sm_pcap) {
+            float *p = (float *)realloc(s_sm_pos, (size_t)n * 3 * sizeof(float));
+            if (!p) spr_own = 0; else { s_sm_pos = p; s_sm_pcap = n; }
+        }
         const float k = 1.0f / H;
         const float hw = 120.0f * aspect * 1.05f, hh = 120.0f * 1.05f;   /* the picture, native px */
         float sx0 = 1e30f, sx1 = -1e30f, sy0 = 1e30f, sy1 = -1e30f;
@@ -1234,6 +1308,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
                 scr[0] = v[0] - s_sc_cx; scr[1] = v[1] - s_sc_cy;
                 memcpy(o + 3, v + 3, (SC_V - 3) * sizeof(float));
             }
+            if (spr_own) memcpy(s_sm_pos + (size_t)i * 3, P, sizeof P);
             o[0] = P[0] * a[0] + P[1] * a[1] + P[2] * a[2];
             o[1] = P[0] * b[0] + P[1] * b[1] + P[2] * b[2];
             o[2] = P[0] * L[0] + P[1] * L[1] + P[2] * L[2];
@@ -1266,6 +1341,53 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
                 if (o[2] > d1) d1 = o[2];
             }
         }
+        if (spr_own && n > nbase) {
+            const float ls = sqrtf(Ls[0] * Ls[0] + Ls[1] * Ls[1] + Ls[2] * Ls[2]);
+            for (int i = 0; i < 3; i++) Ls[i] /= ls;
+            A2[0] = Ls[2]; A2[2] = -Ls[0];
+            float la2 = sqrtf(A2[0] * A2[0] + A2[2] * A2[2]);
+            if (la2 < 1e-4f) { A2[0] = 1.0f; A2[2] = 0.0f; la2 = 1.0f; }
+            A2[0] /= la2; A2[2] /= la2;
+            B2[0] = Ls[1] * A2[2] - Ls[2] * A2[1]; B2[1] = Ls[2] * A2[0] - Ls[0] * A2[2]; B2[2] = Ls[0] * A2[1] - Ls[1] * A2[0];
+            {   /* each sprite laid along its light onto the floor at its feet:
+                 * its whole silhouette at that height, so the reach (sun.glsl
+                 * u_sprsun.y) keeps it off a floor far below (the sand under a
+                 * deck) without cutting it */
+                const float *up = s_sm_world[1];
+                const float lu = Ls[0] * up[0] + Ls[1] * up[1] + Ls[2] * up[2];
+                if (lu > 0.1f)
+                    for (int i = nbase; i < n; i++) {
+                        float *P = s_sm_pos + (size_t)i * 3;
+                        const int k = i - nbase;
+                        const float fh = k < s_spr_n ? s_spr_cau[k] : s_spr_xau[k - s_spr_n];
+                        const float h = P[0] * up[0] + P[1] * up[1] + P[2] * up[2] - fh;
+                        if (h <= 0.0f) continue;
+                        for (int c = 0; c < 3; c++) P[c] -= Ls[c] * (h / lu);
+                    }
+            }
+            for (int i = 0; i < n; i++) {
+                const float *P = s_sm_pos + (size_t)i * 3;
+                const float d = P[0] * Ls[0] + P[1] * Ls[1] + P[2] * Ls[2];
+                if (d < D0) D0 = d; if (d > D1) D1 = d;
+                if (i < nbase) continue;
+                const float x = P[0] * A2[0] + P[1] * A2[1] + P[2] * A2[2], y = P[0] * B2[0] + P[1] * B2[1] + P[2] * B2[2];
+                if (x < X0) X0 = x; if (x > X1) X1 = x; if (y < Y0) Y0 = y; if (y > Y1) Y1 = y;
+            }
+            const float mx = fmaxf((X1 - X0) * 0.05f, 8.0f), my = fmaxf((Y1 - Y0) * 0.05f, 8.0f);
+            X0 -= mx; X1 += mx; Y0 -= my; Y1 += my;
+            const float *up = s_sm_world[1];
+            slam = fmaxf(0.0f, up[0] * Ls[0] + up[1] * Ls[1] + up[2] * Ls[2]);
+            sbias = (X1 - X0) / (float)s_sm_size;   /* a texel, for the bias */
+            const float *shb = pfx_pass_uniform(ps, "u_shadow");
+            const float by = shb ? shb[1] : 0.002f;
+            for (int i = nbase; i < n; i++) {   /* toward the light by a floor receiver's bias (feet first) */
+                const float z = s_sm_pos[(size_t)i * 3 + 2];
+                const float d = s_sm_pos[(size_t)i * 3] * Ls[0] + s_sm_pos[(size_t)i * 3 + 1] * Ls[1] + z * Ls[2]
+                              + (by * z + 2.0f * sbias) * (1.0f + 2.0f * (1.0f - slam));
+                if (d > D1) D1 = d;
+            }
+            if (!(X1 > X0 && Y1 > Y0 && D1 > D0)) spr_own = 0;
+        } else spr_own = 0;
     }
     GLboolean dmask = GL_TRUE;
     glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
@@ -1283,6 +1405,23 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             o[0] = (o[0] - x0) * sx * 2.0f - 1.0f;
             o[1] = (o[1] - y0) * sy * 2.0f - 1.0f;
             o[2] = (d1 - o[2]) * sd * 2.0f - 1.0f;
+        }
+        if (spr_own) {   /* the sprites onto their own map, along their light */
+            const float *shb = pfx_pass_uniform(ps, "u_shadow");
+            const float by = shb ? shb[1] : 0.002f;
+            const float qx = 1.0f / (X1 - X0), qy = 1.0f / (Y1 - Y0), qd = 1.0f / (D1 - D0);
+            for (int i = nbase_all; i < n; i++) {
+                const float *P = s_sm_pos + (size_t)i * 3;
+                float *o = s_sm_buf + (size_t)i * SC_V;
+                const float d = P[0] * Ls[0] + P[1] * Ls[1] + P[2] * Ls[2]
+                              + (by * P[2] + 2.0f * sbias) * (1.0f + 2.0f * (1.0f - slam));
+                o[0] = ((P[0] * A2[0] + P[1] * A2[1] + P[2] * A2[2]) - X0) * qx * 2.0f - 1.0f;
+                o[1] = ((P[0] * B2[0] + P[1] * B2[1] + P[2] * B2[2]) - Y0) * qy * 2.0f - 1.0f;
+                o[2] = (D1 - d) * qd * 2.0f - 1.0f;
+            }
+            const float su[4][4] = {{A2[0], A2[1], A2[2], X0}, {B2[0], B2[1], B2[2], Y0},
+                                    {Ls[0], Ls[1], Ls[2], D1}, {qx, qy, qd, (float)s_sm_size}};
+            memcpy(s_ss_u, su, sizeof s_ss_u);
         }
         p_glUseProgram(s_sm_prog);
         p_glBindVertexArray(s_sm_vao);
@@ -1652,6 +1791,11 @@ static void pfx_shadow_uniforms(GLuint prog) {
     for (int k = 0; k < 4; k++) {
         const GLint loc = p_glGetUniformLocation(prog, names[k]);
         if (loc >= 0) p_glUniform4f(loc, s_sm_u[k][0], s_sm_u[k][1], s_sm_u[k][2], s_sm_u[k][3]);
+    }
+    static const char *const sn[4] = {"u_ssx", "u_ssy", "u_ssz", "u_sss"};   /* the sprites' map (w 0: the scenery's) */
+    for (int k = 0; k < 4; k++) {
+        const GLint loc = p_glGetUniformLocation(prog, sn[k]);
+        if (loc >= 0) p_glUniform4f(loc, s_ss_u[k][0], s_ss_u[k][1], s_ss_u[k][2], s_ss_u[k][3]);
     }
     /* the camera's world axes and the light, when the framework knows them
      * (after the preset's own values, which they replace) */

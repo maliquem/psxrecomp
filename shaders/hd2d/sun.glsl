@@ -46,6 +46,8 @@ uniform vec4 u_worldup;
 uniform vec4 u_shadow;
 uniform vec4 u_shadowdir;
 uniform vec4 u_smx, u_smy, u_smz, u_sms;
+uniform vec4 u_ssx, u_ssy, u_ssz, u_sss;   // the sprites' map's own mapping (w 0: none, the scenery's)
+uniform vec4 u_sprsun;   // x: the sprites' sun at most this high (framework); y: their shadow's reach (world units, 0 = any); z: its softness then (world units)
 uniform vec4 u_proj;
 uniform vec4 u_soft;
 uniform vec4 u_ss;
@@ -79,37 +81,50 @@ float shadow_at(vec3 P, float bias, float tilt, float spr, float scn)
     if (u_sms.w <= 0.0 || u_sms.z <= 0.0) return 1.0;
     vec2 suv = vec2((dot(P, u_smx.xyz) - u_smx.w) * u_sms.x, (dot(P, u_smy.xyz) - u_smy.w) * u_sms.y);
     float own = (u_smz.w - dot(P, u_smz.xyz) - bias) * u_sms.z;
+    // the sprites' map: its own mapping when the framework gives one (a sun
+    // higher than u_sprsun: the sprites cast along a lower one), else the scenery's
+    bool sown_map = u_sss.w > 0.0;
+    vec4 ssm = sown_map ? u_sss : u_sms;
+    vec2 spv = sown_map ? vec2((dot(P, u_ssx.xyz) - u_ssx.w) * u_sss.x, (dot(P, u_ssy.xyz) - u_ssy.w) * u_sss.y) : suv;
+    float sown = sown_map ? (u_ssz.w - dot(P, u_ssz.xyz) - bias) * u_sss.z : own;
+    // ... and reaching no farther than u_sprsun.y world units along that light:
+    // a short shadow at the feet, none on a floor far below (a sprite on a
+    // deck over the sand), as under the real noon sun
+    float sfar = sown_map && u_sprsun.y > 0.0 ? u_sprsun.y * u_sss.z : 1e9;
     float bs = 0.0;
     if (u_soft.z > 0.0) {
         // the sprites' soft too: the spread grows with how far above P the
         // sprite is (u_soft.w per unit), from a texel at its feet up to
         // u_soft.z; 5x5 samples turned per pixel (no steps of the map's texels)
-        vec2 st0 = 0.5 * u_soft.z * u_sms.xy;
+        // a sprite laid on its floor (sown_map): no height to grow by, a fixed
+        // spread of u_sprsun.z world units instead
+        float smax = sown_map && u_sprsun.z > 0.0 ? u_sprsun.z : u_soft.z;
+        vec2 st0 = 0.5 * smax * ssm.xy;
         float sum = 0.0, n = 0.0;
         for (int j = -2; j <= 2; j++)
             for (int i = -2; i <= 2; i++) {
-                vec2 q = suv + vec2(i, j) * st0;
+                vec2 q = spv + vec2(i, j) * st0;
                 float d = sm_in(q) ? texture(u_ssm, q).r : 1.0;
-                if (d < own) { sum += d; n += 1.0; }
+                if (d < sown && sown - d < sfar) { sum += d; n += 1.0; }
             }
         if (n > 0.5) {
-            float texel = 1.0 / (u_sms.x * u_sms.w);
-            float w = clamp((own - sum / n) / u_sms.z * u_soft.w, texel, u_soft.z);
+            float texel = 1.0 / (ssm.x * ssm.w);
+            float w = sown_map && u_sprsun.z > 0.0 ? smax : clamp((sown - sum / n) / ssm.z * u_soft.w, texel, u_soft.z);
             float a = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
             mat2 rot = mat2(cos(a), sin(a), -sin(a), cos(a));
-            vec2 st = 0.5 * w * u_sms.xy;
+            vec2 st = 0.5 * w * ssm.xy;
             for (int j = -2; j <= 2; j++)
                 for (int i = -2; i <= 2; i++) {
-                    vec2 q = suv + (rot * vec2(i, j)) * st;
-                    if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
+                    vec2 q = spv + (rot * vec2(i, j)) * st;
+                    if (sm_in(q)) { float d = texture(u_ssm, q).r; bs += d < sown && sown - d < sfar ? 1.0 : 0.0; }
                 }
             bs /= 25.0;
         }
     } else {
         for (int j = -1; j <= 1; j++)
             for (int i = -1; i <= 1; i++) {
-                vec2 q = suv + vec2(i, j) / u_sms.w;
-                if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
+                vec2 q = spv + vec2(i, j) / ssm.w;
+                if (sm_in(q)) { float d = texture(u_ssm, q).r; bs += d < sown && sown - d < sfar ? 1.0 : 0.0; }
             }
         bs /= 9.0;
     }
