@@ -18,7 +18,7 @@ extern uint64_t s_frame_count;
 #define MDEC_NEVER_DECODED ((uint64_t)0 - 1000u)
 static uint64_t mdec_last_color_decode_cycle = MDEC_NEVER_DECODED;
 
-/* Beetle OutFIFO depth: 0x20 words (MDEC_DMACanRead's block size). */
+/* Data-out FIFO depth: 0x20 words, one 32-word DMA block. */
 #define MDEC_OUT_FIFO_BYTES (0x20u * 4u)
 
 enum {
@@ -547,10 +547,11 @@ uint32_t mdec_read(uint32_t addr) {
     if (!write_ready) status |= 1u << 30;
     if (mdec.enable_dma_out && mdec_dma_read_ready()) status |= 1u << 27;
     if (mdec.enable_dma_in && write_ready) status |= 1u << 28;
-    /* Bit 29 is Beetle's InCommand (mdec.c MDEC_Read). The hardware decodes
-     * progressively and stalls while its 32-word OutFIFO is full, so a decode
-     * command stays in progress until all but the last FIFO-load of its output
-     * has been read. This model decodes a whole command at once, so derive that
+    /* Bit 29 is Command Busy (psx-spx: busy receiving or processing
+     * parameters). The hardware decodes progressively and stalls while its
+     * 32-word data-out FIFO is full, so a decode command stays in progress
+     * until all but the last FIFO load of its output has been read. This
+     * model decodes a whole command at once, so derive that
      * from the unread output instead of clearing the bit at execute time:
      * libpress DecDCTin spins on this bit before issuing the next frame, and
      * reporting ready early let Breath of Fire IV's player issue the next

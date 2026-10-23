@@ -400,7 +400,7 @@ if(BUILD_TESTING)
     add_test(NAME guest_tty_test COMMAND guest_tty_test)
 
     # MDEC status bit 29 stays set until a decode's output is down to the last
-    # 32-word OutFIFO load (Beetle InCommand); libpress DecDCTin spins on it.
+    # 32-word data-out FIFO load; libpress DecDCTin spins on it.
     add_executable(mdec_busy_drain_test
         ../runtime/tests/test_mdec_busy_drain.c
         ../runtime/src/mdec.c
