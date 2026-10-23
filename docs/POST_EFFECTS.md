@@ -33,7 +33,7 @@ touches.
 pfx 1                              # required first line
 pass <name>                        # the last pass writes the window
   shader <file.glsl|builtin:name>  # file paths resolve next to the preset
-  input <sampler> <source|source_down|mask|mask3d|depth|shadow|sprshadow|sprite|previous|<earlier pass>>   # up to 6
+  input <sampler> <source|source_down|mask|mask3d|depth|shadow|sprshadow|sprite|firemap|previous|<earlier pass>>   # up to 6
   scale <f>                        # target size as a fraction of the game rect (default 1)
   format rgba8|rgba16f             # default rgba8
   filter linear|nearest            # how later passes sample this target
@@ -50,6 +50,7 @@ A shader file is a GLSL 330 fragment body. It is appended to this header:
 in vec2 v_uv; out vec4 o;      // v_uv: 0..1 over the game rect, bottom-up
 uniform vec2 u_rcp, u_size;    // this pass's target: 1/size and size in px
 uniform ivec2 u_org;           // window origin of the game rect
+uniform float u_time;          // wall-clock seconds (a flame's flicker)
 uniform sampler2D <sampler>;   // one per input
 ```
 
@@ -114,6 +115,16 @@ While a texture `off_textures` names was drawn in the last few VBlanks (a
 world map's paper or frame: no place under the sun), every stage whose chain
 reads `shadow` is skipped (`gpu_shadow_off_active`), whatever loaded it.
 
+The sun can be set per place: `sun_areas = ["0xAREA:az:el", "0xAREA:off"]`
+gives an area its own azimuth and elevation (degrees), over the pass's
+`u_sun`, or no sun at all ("off": a cave; the stages reading `shadow` are
+skipped and the game's own blobs stay). The area is the id a game mod gives
+(`gl_renderer_shadow_area`; BoF4: a hash of the map data, so each screen and
+each battle arena has its own), else a hash of `scene_keys`. `shadow_state`
+prints the current one (`scene`) and its sun (`scene_sun`), to fill the list
+as a player goes. The camera and the sprites' foot points are followed in an
+area with no sun too, for the fire lights below.
+
 The casters, best source first:
 
 1. **The scene's own geometry** (`gl_renderer_shadow_world`, world-space
@@ -168,9 +179,13 @@ that the level light meets it at a cosine of 0.7 (its shadow keeps 70% of
 its width). Feet drawn off that plane (a 3/4 pose's back foot, feet to one
 side of a turned plane) would float or sink: every column whose bottom is a
 foot's (within the bottom fifth, 3 columns wide or more, so not a staff's
-tip) gets its lower pixels bent, smoothly over the rows above, to where that
-bottom meets the floor, as extra casters (a pixel wider each side, no gaps)
-and in the `sprite` depth. Its cut-out is copied from VRAM as it is drawn (a
+tip) gets its pixels bent, smoothly over the rows above (3/4 of the sprite's
+height: the whole leg and the hips), to where that bottom meets the floor,
+as extra casters (a pixel wider each side, no gaps) and in the `sprite`
+depth. Bending the foot's end alone left the back leg's top on the plane,
+its shadow apart from the bent bottom's: under a low sun, four legs.
+`u_ss` z 1 (TCP) turns the bend off and `u_ss` w sets its height in native
+px, to compare. Its cut-out is copied from VRAM as it is drawn (a
 game may load the next animation's pieces before the picture is shown).
 Translucent pieces (dust, glows) neither cast nor take shadows. The game's
 own blob is not drawn: a translucent flat quad centred on a foot point, or
@@ -203,8 +218,11 @@ The Sun presets (`shaders/hd2d/sun*.pfx`) differ only in shadow detail:
 (5x5 samples, the bias grown with the face's tilt to the light), the spread
 growing with the distance to what casts it (`u_soft` y = 0.04 world units per
 unit, percentage-closer soft shadows as in Fernando 2005, from a texel up to
-x): a bush's leaves stay sharp at its foot, a cliff's far edge soft. They keep
-the sprites' sharp (3x3 texels of `sprshadow`). Their faces' normals come from
+x): a bush's leaves stay sharp at its foot, a cliff's far edge soft. The
+sprites' soften the same way, by `u_soft` z (at most, world units) and w
+(per unit of distance: 4 and 0.1, sharp at the feet, softer at the head),
+5x5 samples turned per pixel; z 0 keeps them sharp (3x3 texels of
+`sprshadow`). Their faces' normals come from
 two pixels on the side that stays in the pixel's plane (the least bend in
 1/Z), so creases between faces show no seams. A pass may read up to 6 inputs.
 
@@ -232,6 +250,42 @@ the pieces stood at each; `runs`: its runs [box, foot point, at it, CLUT
 code y*64+x/16; 9 = too big]),
 `shadow_hide {"list":"0xPAGE:0xCLUT,..."}`, `postfx_timing {"on":1}` (GPU
 microseconds per stage and pass).
+
+## The fire lights (`firemap`)
+
+A steady glow the game draws (a campfire, a lamp, a staff's orb) becomes a
+point light with its own shadows. The glowing pieces are the additive ones
+(blend modes 1 and 3), 3D or 2D, kept while a chain reads a map of the 3D
+triangles (`shadow`, `sprshadow` or `firemap`). Pieces within 24 px join; a
+2D group takes its depth from the nearest point the game projected with the
+camera (any RTPS), and is not a light when it has none, or when less than 4
+triangles and 3% of the frame's 3D are drawn after it: the HUD is drawn over
+the finished scene, a piece in it is sorted among it (a battle's 3D cursor
+after its HUD: 2 of 538 triangles; after the cave's campfire: 12 of 68). A
+light is followed in world space (joined within 160 units), lights after 30
+presents in a row and goes after 20 unseen. Its colour is its pieces' as
+drawn (4x4 texels through the CLUT, bright ones counting most, times the
+vertex colour; flat: the vertices'), brightest channel 1; its strength and
+reach go with its glow's size, full at 384 px (a campfire), a quarter or
+more below (a staff's orb, 64 px: 0.4).
+
+`firemap` holds, for the two biggest lights, the six 512 px faces of a cube
+round each (distance to the light over the reach): the scenery, the frame's
+triangles and the sprites stood as for the sun. A pass reading it gets
+`u_fl0`/`u_fl1` (view space, y up; w the reach, the map's depth scale),
+`u_fls0`/`u_fls1` (place on the picture), `u_flc0`/`u_flc1` (colour; w the
+size factor) and `u_flmap` (face px, lights, row pairs). The light sits
+`u_firecfg` y units over the glow's base. `light.pfx` (`light-out.glsl`)
+adds it to the scenery and the sprites (5x5 rotated samples over
+`u_firecfg` w units: soft edges), darkens its shadows by `u_firecfg` z, and
+flickers it (`u_flicker`, over `u_time`). `u_firecol` w is the strength (0:
+off, nothing built); its rgb is the colour of a light whose glow gives none.
+While a light casts, the game's own blobs are hidden in an area with no sun
+too. A light whose `u_firecol` w is 0 casts nothing.
+
+TCP `shadow_cache` adds `lights` (each: world, screen, z, size, 3D after it,
+rgb, hits, active), `glow_pieces`, `glow_now`, `points_now`, `tris_now` and
+this frame's `pieces` (x, y, z, area, 3D before it).
 
 ## Tests
 
