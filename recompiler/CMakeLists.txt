@@ -403,7 +403,8 @@ if(BUILD_TESTING)
     # 32-word OutFIFO load (Beetle InCommand); libpress DecDCTin spins on it.
     add_executable(mdec_busy_drain_test
         ../runtime/tests/test_mdec_busy_drain.c
-        ../runtime/src/mdec.c)
+        ../runtime/src/mdec.c
+        ../runtime/src/mdec_core_legacy.c)
     target_include_directories(mdec_busy_drain_test PRIVATE ../runtime/include)
     add_test(NAME mdec_busy_drain_test COMMAND mdec_busy_drain_test)
 
@@ -411,7 +412,8 @@ if(BUILD_TESTING)
     # offline decoder replay, and changes nothing the decoder outputs.
     add_executable(mdec_capture_test
         ../runtime/tests/test_mdec_capture.c
-        ../runtime/src/mdec.c)
+        ../runtime/src/mdec.c
+        ../runtime/src/mdec_core_legacy.c)
     target_include_directories(mdec_capture_test PRIVATE ../runtime/include)
     add_test(NAME mdec_capture_test
              COMMAND mdec_capture_test ${CMAKE_CURRENT_BINARY_DIR})
@@ -422,7 +424,8 @@ if(BUILD_TESTING)
     # decoded byte fails here. Its capture, replayed, must match live.
     add_executable(mdec_replay
         ../tools/mdec_replay/mdec_replay.c
-        ../runtime/src/mdec.c)
+        ../runtime/src/mdec.c
+        ../runtime/src/mdec_core_legacy.c)
     target_include_directories(mdec_replay PRIVATE ../runtime/include)
     set(_mdec_synth_cap "${CMAKE_CURRENT_BINARY_DIR}/mdec_replay_synthetic.cap")
     add_test(NAME mdec_replay_synthetic_test
@@ -455,10 +458,31 @@ if(BUILD_TESTING)
         endif()
         file(WRITE "${_mdec_ref_dir}/mdec_ref_tu.c"
              "#include \"mdec_ref_names.h\"\n#include \"mdec_ref_source.c\"\n")
+        # A reference from after the core split keeps its numeric core in a
+        # file of its own: build that too, under the same ref_ names, so the
+        # reference's mdec.c never reaches this tree's core.
+        set(_mdec_ref_srcs "${_mdec_ref_dir}/mdec_ref_tu.c")
+        foreach(_core mdec_core_legacy mdec_core)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" show "${MDEC_REF_COMMIT}:runtime/src/${_core}.c"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+                OUTPUT_FILE "${_mdec_ref_dir}/${_core}_ref_source.c"
+                ERROR_QUIET
+                RESULT_VARIABLE _mdec_core_rc)
+            if(_mdec_core_rc EQUAL 0)
+                file(WRITE "${_mdec_ref_dir}/${_core}_ref_tu.c"
+                     "#include \"mdec_ref_names.h\"\n#include \"${_core}_ref_source.c\"\n")
+                list(APPEND _mdec_ref_srcs "${_mdec_ref_dir}/${_core}_ref_tu.c")
+            else()
+                file(REMOVE "${_mdec_ref_dir}/${_core}_ref_source.c"
+                            "${_mdec_ref_dir}/${_core}_ref_tu.c")
+            endif()
+        endforeach()
         add_executable(mdec_replay_ab
             ../tools/mdec_replay/mdec_replay.c
             ../runtime/src/mdec.c
-            "${_mdec_ref_dir}/mdec_ref_tu.c")
+            ../runtime/src/mdec_core_legacy.c
+            ${_mdec_ref_srcs})
         target_include_directories(mdec_replay_ab PRIVATE
             ../runtime/include ../tools/mdec_replay)
         target_compile_definitions(mdec_replay_ab PRIVATE MDEC_REPLAY_HAVE_REF=1)

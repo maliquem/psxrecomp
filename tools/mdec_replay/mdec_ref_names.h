@@ -32,5 +32,8 @@
 #define mdec_snapshot_validate ref_mdec_snapshot_validate
 #define mdec_capture_start ref_mdec_capture_start
 #define mdec_capture_stop ref_mdec_capture_stop
+#define mdec_core_set_scale ref_mdec_core_set_scale
+#define mdec_core_decode_block ref_mdec_core_decode_block
+#define mdec_core_color_macroblock ref_mdec_core_color_macroblock
 
 #endif
