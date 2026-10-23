@@ -779,7 +779,31 @@ static void shadow_off_note(uint16_t tpage, uint16_t clut) {
             return;
         }
 }
-int gpu_shadow_off_active(void) { return sh_off_seen && (uint32_t)s_frame_count - sh_off_frame <= 4u; }
+int gpu_shadow_area_off(void);   /* below (sun_areas) */
+int gpu_shadow_off_active(void) {
+    return (sh_off_seen && (uint32_t)s_frame_count - sh_off_frame <= 4u) || gpu_shadow_area_off();
+}
+/* [video.shadow] sun_areas: the sun per area (a mod's map id, or else the
+ * scene_keys' number; kept at each VBlank while the shadow map is in use). */
+enum { SH_SUN_MAX = 256 };
+static int      sh_sun_n = 0;
+static uint32_t sh_sun_area[SH_SUN_MAX], sh_area = 0;
+static float    sh_sun_az[SH_SUN_MAX], sh_sun_el[SH_SUN_MAX];
+void gpu_set_shadow_sun_areas(const uint32_t *area, const float *az, const float *el, int n) {
+    sh_sun_n = n < 0 ? 0 : n > SH_SUN_MAX ? SH_SUN_MAX : n;
+    for (int i = 0; i < sh_sun_n; i++) { sh_sun_area[i] = area[i]; sh_sun_az[i] = az[i]; sh_sun_el[i] = el[i]; }
+}
+int gpu_shadow_sun_area(float *az, float *el) {
+    for (int i = 0; i < sh_sun_n; i++)
+        if (sh_sun_area[i] == sh_area && sh_sun_el[i] > 0.0f) { *az = sh_sun_az[i]; *el = sh_sun_el[i]; return 1; }
+    return 0;
+}
+/* an entry "off" (elevation 0): no sun in that area */
+int gpu_shadow_area_off(void) {
+    for (int i = 0; i < sh_sun_n; i++)
+        if (sh_sun_area[i] == sh_area) return sh_sun_el[i] <= 0.0f;
+    return 0;
+}
 static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
     if (!sh_hide_on) return 0;
     for (int i = 0; i < sh_hide_n; i++)
@@ -791,10 +815,12 @@ static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
 static float    sh_last_bad[10];
 static int sh_ts_n;   /* routines that draw both windings (below) */
 int psx_shadow_state(char *out, int cap) {
-    return snprintf(out, (size_t)cap, "\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
+    float saz = 0.0f, sel = 0.0f;
+    const int sun = gpu_shadow_sun_area(&saz, &sel);
+    return snprintf(out, (size_t)cap, "\"scene\":\"0x%08x\",\"scene_sun\":[%d,%.1f,%.1f],\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
                     "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
                     "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
+                    (unsigned)sh_area, sun, saz, sel, sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -860,13 +886,29 @@ extern uint32_t psx_mod_cpu_gpr(int r);
 extern int psx_mod_gte_data(uint32_t out[32]);
 enum { SH_ANC_MAX = 64 };
 static uint32_t sh_anc_ra[8];
-static int      sh_anc_n = 0, sh_anc_live = 0;
+static int      sh_anc_n = 0, sh_anc_live = 0, sh_blob_on = 0, sh_track = 0;
 static int16_t  sh_anc_sxy[SH_ANC_MAX][2];
 static uint32_t sh_anc_frame[SH_ANC_MAX];
 static int      sh_anc_at = 0;
 void psx_shadow_sprite_anchors(const uint32_t *ra, int n) {
     sh_anc_n = n < 0 ? 0 : n > 8 ? 8 : n;
     for (int i = 0; i < sh_anc_n; i++) sh_anc_ra[i] = ra[i];
+}
+/* Any single point projected with the camera (an RTPS): to the renderer, in
+ * that camera's view space; an effect drawn in 2D round it (a fire's flames)
+ * is a light there (gl_postfx.inc pfx_lights_update). */
+static void shadow_point_note(void) {
+    int16_t ri[9];
+    int32_t pj[6];
+    uint32_t d[32];
+    if (!psx_mod_gte_rotation(ri) || !psx_mod_gte_projection(pj) || !psx_mod_gte_data(d)) return;
+    if (!sh_cam_have[0] || memcmp(ri, sh_cam_r[0], sizeof ri) || memcmp(pj, sh_cam_t[0], sizeof sh_cam_t[0])) return;
+    const float w[3] = {(float)(int16_t)d[0], (float)(int16_t)(d[0] >> 16), (float)(int16_t)d[1]};
+    float V[3];
+    for (int r = 0; r < 3; r++)
+        V[r] = sh_cam_last[r * 3] * w[0] + sh_cam_last[r * 3 + 1] * w[1] + sh_cam_last[r * 3 + 2] * w[2] + sh_cam_last[9 + r];
+    if (V[2] < 1.0f) return;
+    gl_renderer_shadow_point(V);
 }
 static void shadow_anchor_note(void) {
     const uint32_t ra = psx_mod_cpu_gpr(31);
@@ -897,7 +939,7 @@ static void shadow_anchor_note(void) {
 /* A translucent textured quad, flatter than tall, centred (3 px) on a foot
  * point projected in the last few VBlanks: the game's blob shadow. */
 static int shadow_blob_quad(int semi, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3) {
-    if (!sh_anc_live || !semi) return 0;
+    if (!sh_blob_on || !semi) return 0;
     const uint32_t p[4] = {p0, p1, p2, p3};
     int x0 = 99999, x1 = -99999, y0 = 99999, y1 = -99999;
     for (int i = 0; i < 4; i++) {
@@ -933,7 +975,7 @@ static struct { uint16_t clut, col; uint8_t idx, npos; int16_t pos[4][2]; uint32
 static int sh_key_n = 0;
 static int shadow_blob_key(int semi, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, const uint32_t *tc,
                            int *kx, int *ky) {
-    if (!sh_anc_live || semi) return 0;
+    if (!sh_blob_on || semi) return 0;
     const uint16_t clut = (uint16_t)(tc[0] >> 16), tpage = (uint16_t)(tc[1] >> 16);
     const int depth = (tpage >> 7) & 3;
     if (depth > 1) return 0;
@@ -1031,25 +1073,41 @@ static void shadow_blob_key_put(int x, int y, uint16_t c) {
     gr_vram_write(x, y, c);
 }
 static void shadow_vblank(void) {
-    const int wanted = gl_renderer_shadow_wanted();
-    sh_hide_on = wanted && sh_hide_n > 0;
+    const int chain = gl_renderer_shadow_sun_wanted();
+    /* the camera and the sprites' foot points are followed while a chain
+     * reads the shadow map or the sprites (a light that also lights them),
+     * in an area with no sun too */
+    const int track = (chain || gl_renderer_shadow_sprites_wanted()) && sh_camera;
+    sh_track = track;
+    uint32_t key = 0;
+    if (track) {
+        for (int i = 0; i < sh_nkeys; i++) {
+            uint32_t v = psx_read_byte(sh_key_addr[i]);
+            if (sh_key_size[i] >= 2) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 1) << 8;
+            if (sh_key_size[i] == 4) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 2) << 16
+                                        | (uint32_t)psx_read_byte(sh_key_addr[i] + 3) << 24;
+            key = key * 2654435761u ^ v;
+        }
+        if (sh_nkeys && key != sh_key_last) { sh_key_last = key; gl_renderer_shadow_cache_clear(); }
+        /* the area: a mod's (its map) when it gives one, else the scene_keys' */
+        const uint32_t mod_area = gl_renderer_shadow_area_id();
+        sh_area = mod_area ? mod_area : sh_nkeys ? key : 0;
+    }
+    /* an area with no sun (sun_areas "off": a cave, a room) is as if no chain
+     * read the shadow map: the game's own blob shadows are drawn there */
+    const int wanted = chain && !gpu_shadow_area_off();
+    /* our shadows stand in for the game's blobs: under the sun, or a fire's */
+    const int ours = wanted || (track && gl_renderer_fire_casting());
+    sh_hide_on = ours && sh_hide_n > 0;
     if (wanted != sh_od_on && (sh_od_x || sh_od_y)) {
         gpu_set_overdraw(wanted ? sh_od_x : 0, wanted ? sh_od_y : 0);
         sh_od_on = wanted;
     }
     sh_bf_on = wanted && sh_camera;
-    sh_anc_live = wanted && sh_camera == 2 && sh_anc_n > 0 && gl_renderer_shadow_sprites_wanted();
+    sh_anc_live = track && sh_camera == 2 && sh_anc_n > 0 && gl_renderer_shadow_sprites_wanted();
+    sh_blob_on = sh_anc_live && ours;   /* the game's blobs hidden: only under our sun or a fire */
     if (sh_bf_on) shadow_backfaces_flush();   /* this frame's culled faces, before the camera takes the frame in */
-    if (!wanted || !sh_camera) return;
-    uint32_t key = 0;
-    for (int i = 0; i < sh_nkeys; i++) {
-        uint32_t v = psx_read_byte(sh_key_addr[i]);
-        if (sh_key_size[i] >= 2) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 1) << 8;
-        if (sh_key_size[i] == 4) v |= (uint32_t)psx_read_byte(sh_key_addr[i] + 2) << 16
-                                    | (uint32_t)psx_read_byte(sh_key_addr[i] + 3) << 24;
-        key = key * 2654435761u ^ v;
-    }
-    if (sh_nkeys && key != sh_key_last) { sh_key_last = key; gl_renderer_shadow_cache_clear(); }
+    if (!track) return;
     if (sh_camera == 2) {   /* the camera met lately (a 30 fps game projects every other VBlank) */
         sh_cam_age = sh_cam_met ? 0 : sh_cam_age < 99 ? sh_cam_age + 1 : 99;
         sh_cam_met = 0;
@@ -3992,9 +4050,10 @@ static void sh_bf_take(const uint32_t *d, uint32_t ra) {
     sh_bfm_add(sxy, ra);
 }
 static void shadow_note_projection(int nverts) {
-    if (sh_bf_on && sh_camera == 2) {
+    if (sh_track && sh_camera == 2) {
         shadow_camera_note();   /* the matrix this projection uses */
         if (nverts == 1 && sh_anc_live) shadow_anchor_note();
+        if (nverts == 1) shadow_point_note();
     }
     const int prev = sh_bf_prev;
     const uint32_t pra = sh_bf_prev_ra;

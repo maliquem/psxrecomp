@@ -216,7 +216,8 @@ void  gl_renderer_set_post_uniform(const char *name, int count, const float *v);
 void  gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h);
 int   gl_renderer_shadow_cache_stats(char *out, int cap);
 void  gl_renderer_shadow_cache_clear(void);
-int   gl_renderer_shadow_wanted(void);   /* a chain reads `shadow` */
+int   gl_renderer_shadow_wanted(void);       /* a chain reads a map of the 3D triangles (sun or fire) */
+int   gl_renderer_shadow_sun_wanted(void);   /* a chain reads the sun's (`shadow`, `sprshadow`) */
 /* The camera the triangles drawn from now on use (gpu.c, camera "ram:"): the
  * picture they make is lit with exactly this camera. */
 void  gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h);
@@ -224,6 +225,12 @@ void  gl_renderer_shadow_frame_camera(const float rot[9], const float tr[3], flo
  * that projected it (GTE axes), in stream order: the 2D pieces of the next frame
  * drawn around it stand there. */
 void  gl_renderer_shadow_anchor(const float v[3]);
+/* Any single point the game projects with the camera (an RTPS), in that
+ * camera's view space (GTE: y down): where an effect drawn in 2D round it
+ * (a fire's flames) stands, so its glow is a light at that place. */
+void  gl_renderer_shadow_point(const float v[3]);
+/* 1 while a fire light (a steady glow the game draws) casts shadows. */
+int   gl_renderer_fire_casting(void);
 int   gl_renderer_shadow_sprites_wanted(void);   /* a chain reads `sprite` */
 /* The scene's static geometry in world space (a game mod reads it from the
  * game's own map data): n triangles x 9 floats (x, y, z per corner, the
@@ -231,6 +238,11 @@ int   gl_renderer_shadow_sprites_wanted(void);   /* a chain reads `sprite` */
  * known, the shadow map takes it whole plus the frame's own triangles, in
  * place of the scenery memory. n 0: none. */
 void  gl_renderer_shadow_world(const float *w9, int n);
+/* The area that geometry is (a mod's id for the map: the same screen, the
+ * same number, wherever it was entered from); [video.shadow] sun_areas use it
+ * in place of the scene_keys' number. 0: none (the scene_keys'). */
+void     gl_renderer_shadow_area(uint32_t id);
+uint32_t gl_renderer_shadow_area_id(void);
 /* Faces the game culled (NCLIP back-facing), shadow-only casters: n x 9
  * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
 void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);

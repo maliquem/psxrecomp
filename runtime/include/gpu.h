@@ -448,10 +448,19 @@ int  psx_shadow_state(char *out, int cap);   /* JSON fields for TCP shadow_cache
 void gpu_set_hidden_textures(const uint32_t *tpage, const uint32_t *clut, int n);
 /* [video.shadow] off_textures: textured primitives (page 9 bits + CLUT,
  * 0xFFFF = any) only a screen with no place under the sun draws (a world
- * map); while one was drawn in the last few VBlanks, gpu_shadow_off_active
- * is 1 and the effects that read the shadow map are skipped. */
+ * map); while one was drawn in the last few VBlanks, or in an area with no
+ * sun (sun_areas "off"), gpu_shadow_off_active is 1 and the effects that
+ * read the shadow map are skipped. */
 void gpu_set_shadow_off_textures(const uint32_t *tpage, const uint32_t *clut, int n);
 int  gpu_shadow_off_active(void);
+/* [video.shadow] sun_areas: the sun (azimuth, elevation in degrees) in the
+ * areas with these numbers (a mod's map id, else the scene_keys');
+ * gpu_shadow_sun_area gives the current area's (1) or 0 when it has none
+ * (the shadow pass's own u_sun). Elevation 0 = "off": no sun there
+ * (gpu_shadow_area_off 1; the game's own blob shadows drawn). */
+void gpu_set_shadow_sun_areas(const uint32_t *area, const float *az, const float *el, int n);
+int  gpu_shadow_sun_area(float *az, float *el);
+int  gpu_shadow_area_off(void);
 /* Signed-funnel variants (min/max + center±halfwidth idioms — see
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */

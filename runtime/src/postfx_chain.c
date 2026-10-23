@@ -244,9 +244,13 @@ int pfx_chain_parse(const char *text, const char *name, PfxShaderLoader load, vo
             else if (!strcmp(f, "mask")) { from = PFX_IN_MASK; out->uses_mask = 1; }
             else if (!strcmp(f, "mask3d")) { from = PFX_IN_MASK3D; out->uses_mask3d = 1; }
             else if (!strcmp(f, "depth")) { from = PFX_IN_DEPTH; out->uses_depth = 1; }
-            else if (!strcmp(f, "shadow")) { from = PFX_IN_SHADOW; out->uses_shadow = 1; }
-            else if (!strcmp(f, "sprite")) { from = PFX_IN_SPRITE; out->uses_shadow = 1; out->uses_sprite = 1; }
-            else if (!strcmp(f, "sprshadow")) { from = PFX_IN_SPRSHADOW; out->uses_shadow = 1; out->uses_sprite = 1; }
+            else if (!strcmp(f, "shadow")) { from = PFX_IN_SHADOW; out->uses_shadow = out->uses_world = 1; }
+            /* the sprites' depth stands without a shadow map (gl_postfx.inc pfx_sprites_alone) */
+            else if (!strcmp(f, "sprite")) { from = PFX_IN_SPRITE; out->uses_sprite = 1; }
+            else if (!strcmp(f, "sprshadow")) { from = PFX_IN_SPRSHADOW; out->uses_shadow = out->uses_world = out->uses_sprite = 1; }
+            /* the fire lights' shadow map (gl_postfx.inc pfx_fire_build): the scenery and the sprites
+             * cast; no sun, so a place with none (uses_shadow) still runs it */
+            else if (!strcmp(f, "firemap")) { from = PFX_IN_FIREMAP; out->uses_world = out->uses_sprite = 1; }
             else if (!strcmp(f, "previous")) {
                 if (self == 0) { pfx_chain_free(out); return pfx_fail(err, errlen, line, "the first pass has no previous"); }
                 from = self - 1;

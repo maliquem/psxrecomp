@@ -499,6 +499,13 @@ struct RuntimeConfig {
     // frame); while it is drawn the effects that read the shadow map are skipped.
     std::vector<uint32_t> video_shadow_off_tpage;
     std::vector<uint32_t> video_shadow_off_clut;
+    // sun_areas = ["0xAREA:azimuth:elevation", ...]: the sun (degrees, as the
+    // shadow pass's u_sun) in the area whose scene_keys give AREA (TCP
+    // shadow_cache "scene"), lined up with the shadows painted in its textures;
+    // elsewhere the pass's own. "0xAREA:off": no sun there (a cave, a room;
+    // the game's own blob shadows), stored as elevation 0.
+    std::vector<uint32_t> video_shadow_sun_area;
+    std::vector<float>    video_shadow_sun_az, video_shadow_sun_el;
     // sprite_anchors = ["0xRA", ...]: return addresses of the game's calls whose
     // RTPS projects a sprite's foot point (sprite shadows; camera "ram:" only).
     std::vector<uint32_t> video_shadow_sprite_anchors;

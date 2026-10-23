@@ -7,6 +7,9 @@
 // u_light: x = reach (native px at the light), y = strength.
 // u_proj:  x = H (GTE projection distance), y = native height (240),
 //          z = internal scale (reads snap to the depth's own grid).
+// A sprite standing in the scene (u_spr, the framework's `sprite` input, with
+// u_m3 mask3d green 0: the pixel shows it) takes the light at its own place
+// on its upright plane, facing the camera (a fire beside it lights it half).
 // Output (rgba16f): rgb = light reaching this point.
 
 uniform vec4 u_light;
@@ -31,19 +34,27 @@ void main()
     g_grid = nat * max(u_proj.z, 1.0);
     vec2 uv0 = snap(v_uv);
     float z = sz_at(uv0);
-    if (z <= 0.0) { o = vec4(0.0); return; }
-    vec3 P = pos_at(uv0, z, nat);
+    vec3 P, n;
+    float zs = texture(u_spr, v_uv).r;
+    if (zs > 0.0 && zs < 50000.0 && texture(u_m3, v_uv).g < 0.5) {   // a sprite standing here
+        uv0 = v_uv; z = zs;
+        P = pos_at(uv0, z, nat);
+        n = vec3(0.0, 0.0, -1.0);
+    } else {
+        if (z <= 0.0) { o = vec4(0.0); return; }
+        P = pos_at(uv0, z, nat);
 
-    // normal from the closer neighbour on each axis (as in ao.glsl)
-    vec2 px = max(1.0 / u_size, 1.0 / g_grid);
-    float zr = sz_at(uv0 + vec2(px.x, 0.0)), zl = sz_at(uv0 - vec2(px.x, 0.0));
-    float zu = sz_at(uv0 + vec2(0.0, px.y)), zd = sz_at(uv0 - vec2(0.0, px.y));
-    vec3 dx = (zr > 0.0 && (abs(zr - z) <= abs(zl - z) || zl <= 0.0))
-            ? pos_at(uv0 + vec2(px.x, 0.0), zr, nat) - P : P - pos_at(uv0 - vec2(px.x, 0.0), zl, nat);
-    vec3 dy = (zu > 0.0 && (abs(zu - z) <= abs(zd - z) || zd <= 0.0))
-            ? pos_at(uv0 + vec2(0.0, px.y), zu, nat) - P : P - pos_at(uv0 - vec2(0.0, px.y), zd, nat);
-    vec3 n = normalize(cross(dx, dy));
-    if (n.z > 0.0) n = -n;
+        // normal from the closer neighbour on each axis (as in ao.glsl)
+        vec2 px = max(1.0 / u_size, 1.0 / g_grid);
+        float zr = sz_at(uv0 + vec2(px.x, 0.0)), zl = sz_at(uv0 - vec2(px.x, 0.0));
+        float zu = sz_at(uv0 + vec2(0.0, px.y)), zd = sz_at(uv0 - vec2(0.0, px.y));
+        vec3 dx = (zr > 0.0 && (abs(zr - z) <= abs(zl - z) || zl <= 0.0))
+                ? pos_at(uv0 + vec2(px.x, 0.0), zr, nat) - P : P - pos_at(uv0 - vec2(px.x, 0.0), zl, nat);
+        vec3 dy = (zu > 0.0 && (abs(zu - z) <= abs(zd - z) || zd <= 0.0))
+                ? pos_at(uv0 + vec2(0.0, px.y), zu, nat) - P : P - pos_at(uv0 - vec2(0.0, px.y), zd, nat);
+        n = normalize(cross(dx, dy));
+        if (n.z > 0.0) n = -n;
+    }
 
     float rw = u_light.x * z / u_proj.x;        // reach in world units at this depth
     ivec2 ip = ivec2(gl_FragCoord.xy) & 3;

@@ -8667,15 +8667,19 @@ static void handle_extra_shader(int id, const char *json)
 
 /* post_uniform: {"cmd":"post_uniform","uniform":"u_x","v":"a b c d"} sets a
  * file-chain uniform live (1..4 floats; every pass that declares it). */
-/* shadow_cache: the shadow casters' world-space store (gl_renderer_shadow_camera);
- * {"clear":1} empties it first. */
+/* shadow_cache: the shadow casters' world-space store (gl_renderer_shadow_camera)
+ * and the light sources found in the picture ("lights"); {"clear":1} empties
+ * the store first. */
 static void handle_shadow_cache(int id, const char *json)
 {
     if (json_get_int(json, "clear", 0)) gl_renderer_shadow_cache_clear();
-    char body[2048];
-    const int k = psx_shadow_state(body, (int)sizeof body);
-    body[k] = ',';
-    gl_renderer_shadow_cache_stats(body + k + 1, (int)sizeof body - k - 1);
+    extern int gl_renderer_lights_json(char *out, int cap);
+    static char body[8192];
+    int k = psx_shadow_state(body, (int)sizeof body);
+    body[k++] = ',';
+    k += gl_renderer_lights_json(body + k, (int)sizeof body - k);   /* the light sources (gl_postfx.inc) */
+    body[k++] = ',';
+    gl_renderer_shadow_cache_stats(body + k, (int)sizeof body - k);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 

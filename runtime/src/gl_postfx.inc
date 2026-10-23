@@ -26,8 +26,9 @@
  * reading pass gives, and the camera's world axes; see pfx_shadow_build),
  * and
  * earlier passes' targets. The executor owns target allocation and lifetime,
- * program build/cache, uniform binding (u_rcp, u_size, u_org and the preset's
- * uniforms) and GL state: everything the pass touches is put back.
+ * program build/cache, uniform binding (u_rcp, u_size, u_org, u_time: seconds,
+ * wall clock; and the preset's uniforms) and GL state: everything the pass
+ * touches is put back.
  *
  * The mask. While an active chain reads `mask`, every draw keeps a mark in
  * stencil bit 1 of the surface it draws into (BCLS_DRAW in gpu_gl_renderer.c):
@@ -44,7 +45,17 @@
 
 /* Uniform locations, looked up once per program (a lookup per frame is a
  * driver round trip on a threaded GL). */
-enum { PFX_LOC_RCP, PFX_LOC_SIZE, PFX_LOC_ORG, PFX_LOC_UV, PFX_LOC_FIXED };
+enum { PFX_LOC_RCP, PFX_LOC_SIZE, PFX_LOC_ORG, PFX_LOC_UV, PFX_LOC_TIME, PFX_LOC_FIXED };
+/* u_time: seconds since the first present (wall clock, so flickers and other
+ * motion keep their pace whatever the frame rate), wrapped at an hour. */
+static float pfx_time_now(void) {
+    static double t0 = -1.0;
+    struct timespec ts;
+    if (!timespec_get(&ts, TIME_UTC)) return 0.0f;
+    const double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (t0 < 0.0) t0 = t;
+    return (float)fmod(t - t0, 3600.0);
+}
 typedef struct {
     GLint fixed[PFX_LOC_FIXED];
     GLint in[PFX_MAX_INPUTS];
@@ -146,17 +157,20 @@ static void pfx_mask_wanted_update(void) {
     int want3d = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_mask3d) want3d = 1;
-    int wantd = 0, wants = 0;
+    int wantd = 0, wants = 0, wantw = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_shadow) wants = 1;
+    for (int i = 0; i < PFX_NSTAGES; i++)
+        if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_world) wantw = 1;
     int wspr = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_sprite) wspr = 1;
     s_spr_on = wspr;
-    if (wants && !s_sc_on) gl_renderer_shadow_cache_clear();   /* switched on: a fresh memory */
-    s_sc_on = wants;
+    if (wantw && !s_sc_on) gl_renderer_shadow_cache_clear();   /* switched on: a fresh memory */
+    s_sc_on = wantw;
+    s_sun_on = wants;
     if (want != s_bcls_on || want3d != s_b3d_on || wantd != s_dep_on) {
         s_bcls_on = want; s_b3d_on = want3d; s_dep_on = wantd;
         pgxp_render_wanted_update();
@@ -198,7 +212,7 @@ static GLuint pfx_build_pass(const PfxPass *ps) {
     char *src = (char *)malloc(n);
     if (!src) return 0;
     int k = snprintf(src, n, "#version 330\nin vec2 v_uv; out vec4 o;\n"
-                             "uniform vec2 u_rcp; uniform vec2 u_size; uniform ivec2 u_org;\n");
+                             "uniform vec2 u_rcp; uniform vec2 u_size; uniform ivec2 u_org; uniform float u_time;\n");
     for (int i = 0; i < ps->ninputs; i++)
         k += snprintf(src + k, n - (size_t)k, "uniform sampler2D %s;\n", ps->in[i].sampler);
     snprintf(src + k, n - (size_t)k, "%s", ps->shader);
@@ -438,6 +452,12 @@ enum { SM_SIZE = 2048 };
 static int s_sm_size = 0;   /* allocated size */
 static GLuint s_sm_tex = 0, s_sm_fbo = 0, s_sm_prog = 0, s_sm_vao = 0, s_sm_vbo = 0;
 static GLint  s_sm_uvram = -1;
+/* The fire lights' shadow map (`firemap`, pfx_fire_build): per light a row of
+ * cube faces, FIRE_FACE px each (3 x 2 tiles), up to FIRE_MAX lights stacked. */
+enum { FIRE_MAX = 2, FIRE_FACE = 512 };
+static GLuint s_fm_tex = 0, s_fm_fbo = 0, s_fm_prog = 0;
+static GLint  s_fm_uvram = -1, s_fm_uatl = -1;
+static unsigned s_fire_built = ~0u;
 static float  s_sm_u[4][4];
 /* The sprites' own map (`sprshadow`): same light, size and mapping as the
  * scenery's, so a reader can soften the scenery's shadows and keep the
@@ -481,6 +501,10 @@ enum { SPR_COLS = 136, SPR_ZONE = 64, SPR_FOOT_MIN = 3, SPR_MIN_H = 12, SPR_AIR 
  * (row k = VRAM row Yb - 1 - k); lo, its lowest; band, how far above lo a
  * column's bottom is still a foot (its bottom fifth). */
 typedef struct { int X0, W, Yb; float lo, band; float col[SPR_COLS]; uint8_t mask[SPR_ZONE][SPR_COLS]; } SprFoot;
+/* TCP, debugging the feet (u_ss.z, u_ss.w; see pfx_shadow_build): 1 = no
+ * bend; the bent zone's height (native px, 0 = by the sprite's height) */
+static int   s_spr_bend_dbg = 0;
+static float s_spr_bend_h = 0.0f;
 /* Feet bent down to the floor: as casters (s_spr_xc) and on the
  * picture (s_spr_xs, drawn over the standing pieces' depth: the foot takes
  * light where its bent copy is, never shading itself). */
@@ -538,10 +562,14 @@ static int spr_feet(const ScSlot *sc, const int *ids, int *par, int r, int m,
  * (na_d along nrm) toward one through where that bottom meets the floor (at
  * height au along u), smoothly from none at the zone's top to all of it at
  * the bottom. The leg's shadow meets the foot; the sprite's own pieces still
- * cast as they stand. */
+ * cast as they stand. The zone is the whole leg and the hips (3/4 of the
+ * sprite's height): bending only the foot's end (a third, at most 24 px)
+ * left the back leg's top on the plane, its shadow apart from the bent
+ * bottom's, so a low sun drew four legs. */
 static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float au, const float *u, float height) {
     const float h = s_cam_h;
-    const float hb = fminf(fminf(fmaxf(0.3f * height, 8.0f), 24.0f), (float)SPR_ZONE - f->band - 2.0f);
+    const float hz = s_spr_bend_h > 0.0f ? s_spr_bend_h : fmaxf(0.75f * height, 8.0f);
+    const float hb = fminf(hz, (float)SPR_ZONE - f->band - 2.0f);
     if (hb < 2.0f) return;
     int any = 0, run = 0;
     for (int x = 0; x < f->W; x++) {
@@ -605,6 +633,7 @@ static void spr_bend(const SprFoot *f, const float *nrm, float na_d, float au, c
  * vertices, as casters in view space (s_spr_cast) and on the picture
  * (s_spr_scr: clip x, y, view z). */
 #define SPR_LIGHT_MIN 0.7f   /* least cosine between a sprite's plane normal and the level light */
+static unsigned s_pfx_presents = 0, s_spr_built = ~0u;   /* the `sprite` input built this present? */
 /* The CLUTs of the sprites seen standing on the floor (a run at its foot
  * point, SPR_MIN_H tall or more) in the last SPR_CLUT_KEEP builds: only those
  * stand off the floor (a jump), never a UI palette (its bars are smaller). */
@@ -846,7 +875,8 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         if (rdir[r] && !air) sprc_note(spr_clut_code(sc, ids[r]));
         /* its feet bent down to the floor */
         static SprFoot sf;
-        if (!joined && !air && spr_feet(sc, ids, par, r, m, bx0, bx1, by0, ob, &sf)) spr_bend(&sf, nrm, na_d, au, u, by1 - by0);
+        if (!joined && !air && s_spr_bend_dbg != 1 && spr_feet(sc, ids, par, r, m, bx0, bx1, by0, ob, &sf))
+            spr_bend(&sf, nrm, na_d, au, u, by1 - by0);
         for (int i = r; i < m; i++) {
             if (spr_root(par, i) != r) continue;
             const float *v = sc->sv + (size_t)ids[i] * 3 * SC_V;
@@ -947,87 +977,112 @@ static void pfx_sprites_depth(int lw, int lh) {
         p_glBindVertexArray(0);
     }
 }
-static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
-    if (!s_sm_tex) {
-        glGenTextures(1, &s_sm_tex);
-        glBindTexture(GL_TEXTURE_2D, s_sm_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
-                     0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
-        s_sm_size = SM_SIZE;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        p_glGenFramebuffers(1, &s_sm_fbo);
-        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
-        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm_tex, 0);
-        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
-        glGenTextures(1, &s_sm2_tex);
-        glBindTexture(GL_TEXTURE_2D, s_sm2_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
-                     0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        p_glGenFramebuffers(1, &s_sm2_fbo);
-        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm2_fbo);
-        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm2_tex, 0);
-        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
-        /* Transparent texels (raw 0) cast no shadow, as they draw nothing:
-         * the fetch is the textured shader's (page, CLUT, window). */
+/* The shadow maps' textures, programs and vertex layout (the sun's, the
+ * sprites' depth, the fire lights'), made once. */
+static void pfx_sm_init(void) {
+    glGenTextures(1, &s_sm_tex);
+    glBindTexture(GL_TEXTURE_2D, s_sm_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
+                 0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+    s_sm_size = SM_SIZE;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glGenFramebuffers(1, &s_sm_fbo);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm_fbo);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm_tex, 0);
+    glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+    glGenTextures(1, &s_sm2_tex);
+    glBindTexture(GL_TEXTURE_2D, s_sm2_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, SM_SIZE, SM_SIZE, 0,
+                 0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glGenFramebuffers(1, &s_sm2_fbo);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_sm2_fbo);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_sm2_tex, 0);
+    glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+    /* Transparent texels (raw 0) cast no shadow, as they draw nothing:
+     * the fetch is the textured shader's (page, CLUT, window). */
 #define SM_VS_HEAD \
-            "#version 330\n" \
-            "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n" \
-            "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n" \
-            "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw; out float v_z;\n" \
-            "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw); v_z = a_p.z;\n"
+        "#version 330\n" \
+        "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n" \
+        "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n" \
+        "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw; out float v_z;\n" \
+        "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw); v_z = a_p.z;\n"
 #define SM_FS_HEAD \
-            "#version 330\n" \
-            "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; in float v_z; out vec4 o;\n" \
-            "uniform usampler2D u_vram; uniform sampler2D u_atl;\n" \
-            "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n" \
-            "void main(){\n"
+        "#version 330\n" \
+        "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; in float v_z; out vec4 o;\n" \
+        "uniform usampler2D u_vram; uniform sampler2D u_atl;\n" \
+        "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n" \
+        "void main(){\n"
 #define SM_FS_TEXEL \
-            "  if (v_dw.x < 0) return;\n" \
-            "  if (v_dw.x == 3) { if (texelFetch(u_atl, ivec2(floor(v_uv)), 0).r < 0.5) discard; return; }\n" \
-            "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n" \
-            "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n" \
-            "  if ((tw.x | tw.y) != 0) { u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n" \
-            "                            v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8); }\n" \
-            "  int raw;\n" \
-            "  if (v_dw.x == 0) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 2), v_tc.y + v) >> ((u & 3) * 4)) & 0xF), v_tc.w);\n" \
-            "  else if (v_dw.x == 1) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 1), v_tc.y + v) >> ((u & 1) * 8)) & 0xFF), v_tc.w);\n" \
-            "  else raw = vram_at(v_tc.x + u, v_tc.y + v);\n" \
-            "  if (raw == 0) discard;\n" \
-            "}\n"
-        s_sm_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p, 1.0); }\n",
-                                  SM_FS_HEAD "  o = vec4(1.0);\n" SM_FS_TEXEL);
-        /* The sprites' view depth on the picture (the `sprite` input): the
-         * nearest one wins (min blending), transparent texels leave none. */
-        s_spr_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p.xy, 0.0, 1.0); }\n",
-                                   SM_FS_HEAD "  o = vec4(v_z, 0.0, 0.0, 1.0);\n" SM_FS_TEXEL);
+        "  if (v_dw.x < 0) return;\n" \
+        "  if (v_dw.x == 3) { if (texelFetch(u_atl, ivec2(floor(v_uv)), 0).r < 0.5) discard; return; }\n" \
+        "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n" \
+        "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n" \
+        "  if ((tw.x | tw.y) != 0) { u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n" \
+        "                            v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8); }\n" \
+        "  int raw;\n" \
+        "  if (v_dw.x == 0) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 2), v_tc.y + v) >> ((u & 3) * 4)) & 0xF), v_tc.w);\n" \
+        "  else if (v_dw.x == 1) raw = vram_at(v_tc.z + ((vram_at(v_tc.x + (u >> 1), v_tc.y + v) >> ((u & 1) * 8)) & 0xFF), v_tc.w);\n" \
+        "  else raw = vram_at(v_tc.x + u, v_tc.y + v);\n" \
+        "  if (raw == 0) discard;\n" \
+        "}\n"
+    s_sm_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p, 1.0); }\n",
+                              SM_FS_HEAD "  o = vec4(1.0);\n" SM_FS_TEXEL);
+    /* The sprites' view depth on the picture (the `sprite` input): the
+     * nearest one wins (min blending), transparent texels leave none. */
+    s_spr_prog = build_program(SM_VS_HEAD "  gl_Position = vec4(a_p.xy, 0.0, 1.0); }\n",
+                               SM_FS_HEAD "  o = vec4(v_z, 0.0, 0.0, 1.0);\n" SM_FS_TEXEL);
+    /* The fire lights' shadow map (pfx_fire_build): a cube round each light,
+     * its six faces side by side; a_p is a view-space point, drawn from the
+     * light (u_lp) along the face's axes (u_ff forward, u_fr right, u_fu up,
+     * 90 degrees each way), its depth the distance to the light over u_far. */
+    s_fm_prog = build_program(
+        "#version 330\n"
+        "layout(location = 0) in vec3 a_p; layout(location = 1) in vec2 a_uv;\n"
+        "layout(location = 2) in vec4 a_tc; layout(location = 3) in vec2 a_dw;\n"
+        "out vec2 v_uv; flat out ivec4 v_tc; flat out ivec2 v_dw; out float v_z;\n"
+        "uniform vec3 u_lp, u_ff, u_fr, u_fu; uniform float u_far;\n"
+        "void main(){ v_uv = a_uv; v_tc = ivec4(a_tc); v_dw = ivec2(a_dw);\n"
+        "  vec3 d = a_p - u_lp; v_z = length(d);\n"
+        "  float z = dot(d, u_ff), n = 2.0;\n"
+        "  gl_Position = vec4(dot(d, u_fr), dot(d, u_fu), (z * (u_far + n) - 2.0 * u_far * n) / (u_far - n), z); }\n",
+        "#version 330\n"
+        "in vec2 v_uv; flat in ivec4 v_tc; flat in ivec2 v_dw; in float v_z; out vec4 o;\n"
+        "uniform usampler2D u_vram; uniform sampler2D u_atl; uniform float u_far;\n"
+        "int vram_at(int x, int y){ return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r); }\n"
+        "void main(){\n"
+        "  o = vec4(1.0); gl_FragDepth = clamp(v_z / u_far, 0.0, 1.0);\n" SM_FS_TEXEL);
+    s_fm_uvram = s_fm_prog ? p_glGetUniformLocation(s_fm_prog, "u_vram") : -1;
+    s_fm_uatl = s_fm_prog ? p_glGetUniformLocation(s_fm_prog, "u_atl") : -1;
 #undef SM_VS_HEAD
 #undef SM_FS_HEAD
 #undef SM_FS_TEXEL
-        s_sm_uvram = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_vram") : -1;
-        s_spr_uvram = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_vram") : -1;
-        s_sm_uatl = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_atl") : -1;
-        s_spr_uatl = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_atl") : -1;
-        p_glGenVertexArrays(1, &s_sm_vao);
-        p_glGenBuffers(1, &s_sm_vbo);
-        p_glBindVertexArray(s_sm_vao);
-        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
-        const GLsizei st = SC_V * sizeof(float);
-        p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, st, (void *)0);
-        p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, st, (void *)(3 * sizeof(float)));
-        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, st, (void *)(5 * sizeof(float)));
-        p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, st, (void *)(9 * sizeof(float)));
-        for (GLuint k = 0; k < 4; k++) p_glEnableVertexAttribArray(k);
-        p_glBindVertexArray(0);
-    }
+    s_sm_uvram = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_vram") : -1;
+    s_spr_uvram = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_vram") : -1;
+    s_sm_uatl = s_sm_prog ? p_glGetUniformLocation(s_sm_prog, "u_atl") : -1;
+    s_spr_uatl = s_spr_prog ? p_glGetUniformLocation(s_spr_prog, "u_atl") : -1;
+    p_glGenVertexArrays(1, &s_sm_vao);
+    p_glGenBuffers(1, &s_sm_vbo);
+    p_glBindVertexArray(s_sm_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
+    const GLsizei st = SC_V * sizeof(float);
+    p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, st, (void *)0);
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, st, (void *)(3 * sizeof(float)));
+    p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, st, (void *)(5 * sizeof(float)));
+    p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, st, (void *)(9 * sizeof(float)));
+    for (GLuint k = 0; k < 4; k++) p_glEnableVertexAttribArray(k);
+    p_glBindVertexArray(0);
+}
+static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
+    if (!s_sm_tex) pfx_sm_init();
     memset(s_sm_u, 0, sizeof s_sm_u);
     {   /* the size the pass asks for */
         const float *rq = pfx_pass_uniform(ps, "u_smsize");
@@ -1046,6 +1101,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     s_sm_u[3][3] = (float)s_sm_size;
     const float *dir = pfx_pass_uniform(ps, "u_shadowdir"), *proj = pfx_pass_uniform(ps, "u_proj");
     const float *sun = pfx_pass_uniform(ps, "u_sun");
+    float area_sun[2];   /* [video.shadow] sun_areas: this area's own sun */
+    if (sun && gpu_shadow_sun_area(&area_sun[0], &area_sun[1])) sun = area_sun;
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
     const ScSlot *sc = sc_presented();
@@ -1080,6 +1137,11 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             for (int i = 0; i < 3; i++) s_sm_world[2][i] = L[i];
             s_sm_world[2][3] = 1.0f;
         }
+    }
+    {   /* u_ss.z, u_ss.w (TCP, debugging the feet): 1 = no bend; the bent zone's height */
+        const float *ss = pfx_pass_uniform(ps, "u_ss");
+        s_spr_bend_dbg = ss ? (int)(ss[2] + 0.5f) : 0;
+        s_spr_bend_h = ss ? ss[3] : 0.0f;
     }
     pfx_sprites_stand(sc, aspect, L);
     {   /* u_ss.x 0: sprite shadows off (no casters, no shading; the game's blobs stay) */
@@ -1251,6 +1313,337 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     }
     glDepthMask(dmask);
     pfx_sprites_depth(lw, lh);
+    s_spr_built = s_pfx_presents;
+}
+/* Light sources: the presented picture's glowing pieces (sc_add_emit)
+ * grouped (within LIT_JOIN native px and 20% of the depth), each group placed
+ * by its own depth (3D) or the point projected with the camera nearest it
+ * (2D; none near: the HUD, not a light), taken to the world (the picture's
+ * camera), and followed from present to present
+ * there (within LIT_MATCH units): one seen in LIT_STEADY presents or more,
+ * and lately, is a light that stays (a fire, a lamp); a spell's flash is not.
+ * Out: s_lit (world, GTE axes), for the lights that cast (steps to come) and
+ * TCP shadow_cache "lights". */
+enum { LIT_MAX = 16, LIT_JOIN = 24, LIT_STEADY = 30, LIT_GONE = 20 };
+#define LIT_MATCH 160.0f
+typedef struct { float w[3]; float sx, sy, z, size, after, c[3]; unsigned hits, seen; int active; } PfxLight;
+static PfxLight s_lit[LIT_MAX];
+static int      s_lit_n = 0;
+static void pfx_lights_update(void) {
+    const ScSlot *sc = sc_presented();
+    for (int i = 0; i < s_lit_n; i++) s_lit[i].active = 0;
+    if (!sc || !sc->cam_ok || sc->en <= 0) goto age;
+    {
+        const float *r = sc->cam.r, *t = sc->cam.t, h = sc->cam.h;
+        /* groups: the pieces joined to a nearby earlier one (on the picture,
+         * and in depth when both have one) */
+        enum { G_MAX = 32 };
+        float g[G_MAX][10];  /* sum x*a, sum y*a, sum a, sum z*a and sum a over the pieces with a depth, count,
+                                most 3D triangles drawn after a piece, sum rgb*a */
+        int ng = 0;
+        for (int i = 0; i < sc->en; i++) {
+            const float *e = sc->ev + (size_t)i * SC_EV;
+            const float x = e[0] - s_sc_cx, y = e[1] - s_sc_cy, z = e[2], a = fmaxf(e[3], 1.0f);
+            int k = 0;
+            for (; k < ng; k++) {
+                const float gx = g[k][0] / g[k][2], gy = g[k][1] / g[k][2];
+                if (fabsf(x - gx) >= LIT_JOIN || fabsf(y - gy) >= LIT_JOIN) continue;
+                if (z > 0.0f && g[k][4] > 0.0f && fabsf(z - g[k][3] / g[k][4]) > 0.2f * z) continue;
+                break;
+            }
+            if (k == ng) { if (ng == G_MAX) continue; memset(g[ng], 0, sizeof g[ng]); ng++; }
+            g[k][0] += x * a; g[k][1] += y * a; g[k][2] += a; g[k][5] += 1.0f;
+            g[k][6] = fmaxf(g[k][6], (float)sc->n - e[4]);
+            for (int c = 0; c < 3; c++) g[k][7 + c] += e[5 + c] * a;
+            if (z > 0.0f) { g[k][3] += z * a; g[k][4] += a; }
+        }
+        for (int k = 0; k < ng; k++) {
+            const float sx = g[k][0] / g[k][2], sy = g[k][1] / g[k][2];
+            /* its place in view space (GTE: y down): its own depth (3D), else
+             * the point projected with the camera nearest it on the picture
+             * (an effect drawn in 2D round it); none, or drawn over the
+             * finished scene: not a light (the HUD). A piece in the scene is
+             * sorted among it, so nearer scenery comes after it; after the HUD
+             * at most an overlay (a 3D cursor: 2 of 538 triangles in a battle,
+             * 12 of 68 after the cave's campfire) */
+            float Vv[3];
+            if (g[k][4] > 0.0f) {
+                const float z = g[k][3] / g[k][4];
+                Vv[0] = sx * z / h; Vv[1] = sy * z / h; Vv[2] = z;
+            } else {
+                if (g[k][6] < fmaxf(4.0f, 0.03f * (float)sc->n)) continue;
+                int best = -1;
+                float bd = (float)(LIT_JOIN * LIT_JOIN);
+                for (int p = 0; p < sc->npts; p++) {
+                    const float *P = sc->pts[p];
+                    if (P[2] < 1.0f) continue;
+                    const float dx = h * P[0] / P[2] - sx, dy = h * P[1] / P[2] - sy, d = dx * dx + dy * dy;
+                    if (d < bd) { bd = d; best = p; }
+                }
+                if (best < 0) continue;
+                memcpy(Vv, sc->pts[best], sizeof Vv);
+            }
+            const float z = Vv[2];
+            /* GTE view (y down) -> world: R^T (V - t) */
+            const float V[3] = {Vv[0] - t[0], Vv[1] - t[1], Vv[2] - t[2]};
+            float w[3];
+            for (int c = 0; c < 3; c++) w[c] = r[c] * V[0] + r[3 + c] * V[1] + r[6 + c] * V[2];
+            int m = -1;
+            float best = LIT_MATCH * LIT_MATCH;
+            for (int i = 0; i < s_lit_n; i++) {
+                const float dx = s_lit[i].w[0] - w[0], dy = s_lit[i].w[1] - w[1], dz = s_lit[i].w[2] - w[2];
+                const float d = dx * dx + dy * dy + dz * dz;
+                if (d < best) { best = d; m = i; }
+            }
+            if (m < 0) {
+                if (s_lit_n < LIT_MAX) m = s_lit_n++;
+                else {   /* the one seen longest ago makes room */
+                    m = 0;
+                    for (int i = 1; i < s_lit_n; i++) if (s_lit[i].seen < s_lit[m].seen) m = i;
+                }
+                memset(&s_lit[m], 0, sizeof s_lit[m]);
+                memcpy(s_lit[m].w, w, sizeof w);
+                for (int c = 0; c < 3; c++) s_lit[m].c[c] = g[k][7 + c] / g[k][2];
+            }
+            PfxLight *L = &s_lit[m];
+            for (int c = 0; c < 3; c++) L->w[c] = 0.8f * L->w[c] + 0.2f * w[c];   /* a flame moves; its light, less */
+            for (int c = 0; c < 3; c++) L->c[c] = 0.9f * L->c[c] + 0.1f * g[k][7 + c] / g[k][2];   /* its colour: the pieces' (emit_tex_rgb) */
+            L->sx = sx; L->sy = sy; L->z = z; L->size = g[k][2]; L->after = g[k][4] > 0.0f ? -1.0f : g[k][6];
+            L->hits++; L->seen = s_pfx_presents;
+            L->active = L->hits >= LIT_STEADY;
+        }
+    }
+age:
+    for (int i = 0; i < s_lit_n;) {   /* gone: not seen for a while */
+        if (s_pfx_presents - s_lit[i].seen > LIT_GONE) { s_lit[i] = s_lit[--s_lit_n]; continue; }
+        i++;
+    }
+}
+int gl_renderer_lights_json(char *out, int cap) {
+    GL_RT_SYNC("lights_json");
+    const ScSlot *sc = sc_presented();
+    int k = snprintf(out, (size_t)cap, "\"glow_pieces\":[%u,%u,%u],\"glow_now\":%d,\"points_now\":%d,\"tris_now\":%d,\"lights\":[",
+                     s_emit_seen[0], s_emit_seen[1], s_emit_seen[2], sc ? sc->en : -1, sc ? sc->npts : -1, sc ? sc->n : -1);
+    for (int i = 0; i < s_lit_n && k < cap - 160; i++) {
+        const PfxLight *L = &s_lit[i];
+        k += snprintf(out + k, (size_t)(cap - k), "%s{\"world\":[%.0f,%.0f,%.0f],\"screen\":[%.1f,%.1f],\"z\":%.0f,\"size\":%.0f,\"after\":%.0f,\"rgb\":[%.2f,%.2f,%.2f],\"hits\":%u,\"active\":%d}",
+                      i ? "," : "", L->w[0], L->w[1], L->w[2], L->sx, L->sy, L->z, L->size, L->after,
+                      L->c[0], L->c[1], L->c[2], L->hits, L->active);
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[");   /* this frame's: x, y, z, area, 3D before it */
+    for (int i = 0; sc && i < sc->en && i < 48 && k < cap - 80; i++) {
+        const float *e = sc->ev + (size_t)i * SC_EV;
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f]", i ? "," : "", e[0], e[1], e[2], e[3], e[4]);
+    }
+    return k + snprintf(out + k, (size_t)(cap - k), "]");
+}
+/* The `sprite` input with no shadow map this present (a light that lights
+ * the sprites, in an area with no sun or with the Sun off): the sprites stand
+ * facing the camera, from the presented picture's own camera. */
+static void pfx_sprites_alone(float aspect, int lw, int lh) {
+    s_spr_built = s_pfx_presents;
+    if (!s_sm_tex) pfx_sm_init();   /* the sprites' depth program */
+    const ScSlot *sc = sc_presented();
+    memset(s_sm_world, 0, sizeof s_sm_world);
+    s_spr_n = s_spr_nx = 0;
+    if (sc && sc->cam_ok) {
+        memcpy(s_cam_r, sc->cam.r, sizeof s_cam_r); memcpy(s_cam_t, sc->cam.t, sizeof s_cam_t);
+        s_cam_of[0] = sc->cam.of[0]; s_cam_of[1] = sc->cam.of[1]; s_cam_h = sc->cam.h;
+        s_cam_ok = 1;
+        const float *r = s_cam_r;
+        float u[3] = {r[1], -r[4], r[7]};
+        if (u[1] < 0.0f) { u[0] = -u[0]; u[1] = -u[1]; u[2] = -u[2]; }
+        for (int i = 0; i < 3; i++) s_sm_world[1][i] = u[i];
+        s_sm_world[1][3] = 1.0f;
+        const float none[3] = {0.0f, 0.0f, 0.0f};   /* no light to turn toward */
+        pfx_sprites_stand(sc, aspect, none);
+    }
+    pfx_sprites_depth(lw, lh);
+}
+/* The fire lights' shadow map (`firemap`): for the steady lights (s_lit,
+ * the FIRE_MAX biggest), each raised u_firecfg.y units off its point (a
+ * flame stands over its base), a cube of six 90-degree faces round it, drawn
+ * side by side (3 x 2 tiles of FIRE_FACE px, one row pair per light); each
+ * point keeps its distance to the light over the reach (u_firecfg.x world
+ * units: beyond it, no light). Casting: the area's geometry, the frame's own
+ * triangles (culled faces too) and the sprites standing (their cut-outs).
+ * The face axes below and in the shaders that read it (fire_face) agree:
+ * forward, right, up per face; a direction's face is its largest axis. */
+static const float k_fire_face[6][3][3] = {
+    {{ 1, 0, 0}, {0, 0, -1}, {0, 1,  0}}, {{-1, 0, 0}, {0, 0,  1}, {0, 1,  0}},
+    {{ 0, 1, 0}, {1, 0,  0}, {0, 0, -1}}, {{ 0,-1, 0}, {1, 0,  0}, {0, 0,  1}},
+    {{ 0, 0, 1}, {1, 0,  0}, {0, 1,  0}}, {{ 0, 0,-1}, {-1, 0, 0}, {0, 1,  0}}};
+static float s_fl_view[FIRE_MAX][4];   /* each light: view space (y up), reach */
+static float s_fl_scr[FIRE_MAX][4];    /* its place on the picture (uv), 1 */
+static float s_fl_col[FIRE_MAX][4];    /* its colour (its glow's, brightest channel 1), its strength (0..1) */
+#define LIT_FULL 384.0f                /* a glow's size (px, the cave's campfire) that lights at full strength */
+static int   s_fl_n = 0;
+/* A fire light cast shadows in the last present (gpu.c: the game's own blob
+ * shadows are hidden then, as under the sun). */
+/* a fire light cast in the last presents (the chain may be gone since) */
+int gl_renderer_fire_casting(void) { return s_fl_n > 0 && s_pfx_presents - s_fire_built <= 2u; }
+static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
+    s_fire_built = s_pfx_presents;
+    s_fl_n = 0;
+    const float *fcol = pfx_pass_uniform(ps, "u_firecol");
+    if (fcol && fcol[3] <= 0.0f) return;   /* the fire lights off (menu) */
+    if (!s_sm_tex) pfx_sm_init();
+    if (!s_fm_prog) return;
+    const float *cfg = pfx_pass_uniform(ps, "u_firecfg");
+    const float reach = cfg && cfg[0] > 0.0f ? cfg[0] : 1200.0f, lift = cfg ? cfg[1] : 48.0f;
+    const ScSlot *sc = sc_presented();
+    if (!sc || !sc->cam_ok) return;
+    if (s_spr_built != s_pfx_presents) pfx_sprites_alone(aspect, lw, lh);
+    memcpy(s_cam_r, sc->cam.r, sizeof s_cam_r); memcpy(s_cam_t, sc->cam.t, sizeof s_cam_t);
+    s_cam_of[0] = sc->cam.of[0]; s_cam_of[1] = sc->cam.of[1]; s_cam_h = sc->cam.h; s_cam_ok = 1;
+    const float *r = s_cam_r, h = s_cam_h;
+    float up[3] = {r[1], -r[4], r[7]};   /* world up in view space (y up) */
+    if (up[1] < 0.0f) { up[0] = -up[0]; up[1] = -up[1]; up[2] = -up[2]; }
+    /* the lights: the steady ones, biggest first */
+    int pick[LIT_MAX], np = 0;
+    for (int i = 0; i < s_lit_n; i++)
+        if (s_lit[i].active) {
+            int j = np++;
+            while (j > 0 && s_lit[pick[j - 1]].size < s_lit[i].size) { pick[j] = pick[j - 1]; j--; }
+            pick[j] = i;
+        }
+    int nl = 0;
+    for (int k = 0; k < np && nl < FIRE_MAX; k++) {
+        const float *w = s_lit[pick[k]].w;
+        float V[3];
+        for (int c = 0; c < 3; c++) V[c] = r[c * 3] * w[0] + r[c * 3 + 1] * w[1] + r[c * 3 + 2] * w[2] + s_cam_t[c];
+        if (V[2] < 16.0f) continue;
+        const float P[3] = {V[0] + up[0] * lift, -V[1] + up[1] * lift, V[2] + up[2] * lift};
+        memcpy(s_fl_view[nl], P, sizeof P); s_fl_view[nl][3] = reach;
+        s_fl_scr[nl][0] = 0.5f + (h * V[0] / V[2]) / (240.0f * aspect);
+        s_fl_scr[nl][1] = 0.5f - (h * V[1] / V[2]) / 240.0f;
+        s_fl_scr[nl][2] = 1.0f; s_fl_scr[nl][3] = 0.0f;
+        {   /* its glow's colour, as bright as can be (none known: u_firecol's);
+             * its strength and reach by how big its glow is: a campfire's
+             * (LIT_FULL px) full, a staff's small orb a quarter or so */
+            const float *c = s_lit[pick[k]].c, mx = fmaxf(c[0], fmaxf(c[1], c[2]));
+            for (int i = 0; i < 3; i++) s_fl_col[nl][i] = mx > 0.05f ? c[i] / mx : (fcol ? fcol[i] : 1.0f);
+            const float big = fminf(fmaxf(sqrtf(s_lit[pick[k]].size / LIT_FULL), 0.25f), 1.0f);
+            s_fl_col[nl][3] = big;   /* light-out.glsl: strength, and reach (the map's depth stays over `reach`) */
+        }
+        nl++;
+    }
+    s_fl_n = nl;
+    if (!nl) return;
+    /* the casters, in view space (y up) */
+    static float *buf = NULL; static int cap = 0;
+    const int use_world = s_wg_n > 0;
+    const int nw = use_world ? s_wg_n * 3 : 0, nf = sc->n * 3, ns = s_spr_n + s_spr_nx;
+    const int n = nw + nf + ns;
+    if (n <= 0) { s_fl_n = 0; return; }
+    if (n > cap) {
+        float *p = (float *)realloc(buf, (size_t)n * SC_V * sizeof(float));
+        if (!p) { s_fl_n = 0; return; }
+        buf = p; cap = n;
+    }
+    const float k = 1.0f / h;
+    for (int i = 0; i < n; i++) {
+        float *o = buf + (size_t)i * SC_V;
+        if (i < nw) {
+            float V[3]; scc_view(s_wg + (size_t)i * 3, V);
+            o[0] = V[0]; o[1] = -V[1]; o[2] = V[2];
+            o[3] = o[4] = o[5] = o[6] = o[7] = o[8] = o[10] = 0.0f; o[9] = -1.0f;   /* solid */
+        } else if (i < nw + nf) {
+            const float *v = sc->v + (size_t)(i - nw) * SC_V;
+            const float z = v[2];
+            o[0] = (v[0] - s_sc_cx) * z * k; o[1] = -(v[1] - s_sc_cy) * z * k; o[2] = z;
+            memcpy(o + 3, v + 3, (SC_V - 3) * sizeof(float));
+        } else {
+            memcpy(o, spr_caster(i - nw - nf), SC_V * sizeof(float));
+        }
+    }
+    /* the map: its texture and target, made once */
+    if (!s_fm_tex) {
+        glGenTextures(1, &s_fm_tex);
+        glBindTexture(GL_TEXTURE_2D, s_fm_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x81A6 /*DEPTH_COMPONENT24*/, 3 * FIRE_FACE, 2 * FIRE_FACE * FIRE_MAX, 0,
+                     0x1902 /*DEPTH_COMPONENT*/, 0x1405 /*UNSIGNED_INT*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        p_glGenFramebuffers(1, &s_fm_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fm_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, 0x8D00 /*DEPTH_ATTACHMENT*/, GL_TEXTURE_2D, s_fm_tex, 0);
+        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+    }
+    static GLint u_lp = -2, u_ff, u_fr, u_fu, u_far;
+    if (u_lp == -2) {
+        u_lp = p_glGetUniformLocation(s_fm_prog, "u_lp"); u_ff = p_glGetUniformLocation(s_fm_prog, "u_ff");
+        u_fr = p_glGetUniformLocation(s_fm_prog, "u_fr"); u_fu = p_glGetUniformLocation(s_fm_prog, "u_fu");
+        u_far = p_glGetUniformLocation(s_fm_prog, "u_far");
+    }
+    GLboolean dmask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fm_fbo);
+    glViewport(0, 0, 3 * FIRE_FACE, 2 * FIRE_FACE * FIRE_MAX);
+    glDepthMask(GL_TRUE);
+    glClearDepth(1.0);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    p_glUseProgram(s_fm_prog);
+    p_glBindVertexArray(s_sm_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_sm_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * SC_V * sizeof(float)), buf, PSXGL_STREAM_DRAW);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glUniform1i(s_fm_uvram, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
+    p_glUniform1i(s_fm_uatl, 1);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    for (int l = 0; l < nl; l++) {
+        p_glUniform3f(u_lp, s_fl_view[l][0], s_fl_view[l][1], s_fl_view[l][2]);
+        p_glUniform1f(u_far, reach);
+        for (int f = 0; f < 6; f++) {
+            glViewport((f % 3) * FIRE_FACE, (f / 3 + 2 * l) * FIRE_FACE, FIRE_FACE, FIRE_FACE);
+            p_glUniform3f(u_ff, k_fire_face[f][0][0], k_fire_face[f][0][1], k_fire_face[f][0][2]);
+            p_glUniform3f(u_fr, k_fire_face[f][1][0], k_fire_face[f][1][1], k_fire_face[f][1][2]);
+            p_glUniform3f(u_fu, k_fire_face[f][2][0], k_fire_face[f][2][1], k_fire_face[f][2][2]);
+            glDrawArrays(GL_TRIANGLES, 0, n);
+        }
+    }
+    glDisable(GL_DEPTH_TEST);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glBindVertexArray(0);
+    glDepthMask(dmask);
+}
+/* For a pass reading `firemap`: u_fl0, u_fl1 the lights (view space, y up;
+ * w the reach), u_fls0, u_fls1 their place on the picture (uv; z 1 = lit),
+ * u_flc0, u_flc1 their colours (w their strength), u_flmap (face px,
+ * lights, row pairs). */
+static void pfx_fire_uniforms(GLuint prog) {
+    static const char *const pn[FIRE_MAX] = {"u_fl0", "u_fl1"}, *const sn[FIRE_MAX] = {"u_fls0", "u_fls1"};
+    static const char *const cn[FIRE_MAX] = {"u_flc0", "u_flc1"};
+    for (int l = 0; l < FIRE_MAX; l++) {
+        const GLint lc = p_glGetUniformLocation(prog, cn[l]);
+        if (lc >= 0) {
+            if (l < s_fl_n) p_glUniform4f(lc, s_fl_col[l][0], s_fl_col[l][1], s_fl_col[l][2], s_fl_col[l][3]);
+            else p_glUniform4f(lc, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        GLint loc = p_glGetUniformLocation(prog, pn[l]);
+        if (loc >= 0) {
+            if (l < s_fl_n) p_glUniform4f(loc, s_fl_view[l][0], s_fl_view[l][1], s_fl_view[l][2], s_fl_view[l][3]);
+            else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        loc = p_glGetUniformLocation(prog, sn[l]);
+        if (loc >= 0) {
+            if (l < s_fl_n) p_glUniform4f(loc, s_fl_scr[l][0], s_fl_scr[l][1], s_fl_scr[l][2], s_fl_scr[l][3]);
+            else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    const GLint loc = p_glGetUniformLocation(prog, "u_flmap");
+    if (loc >= 0) p_glUniform4f(loc, (float)FIRE_FACE, (float)s_fl_n, (float)(2 * FIRE_MAX), 0.0f);
 }
 static void pfx_shadow_uniforms(GLuint prog) {
     static const char *const names[4] = {"u_smx", "u_smy", "u_smz", "u_sms"};
@@ -1350,6 +1743,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                 L->fixed[PFX_LOC_SIZE] = p_glGetUniformLocation(pg, "u_size");
                 L->fixed[PFX_LOC_ORG] = p_glGetUniformLocation(pg, "u_org");
                 L->fixed[PFX_LOC_UV] = p_glGetUniformLocation(pg, "u_uv_rect");
+                L->fixed[PFX_LOC_TIME] = p_glGetUniformLocation(pg, "u_time");
                 for (int k = 0; k < ps->ninputs; k++) L->in[k] = p_glGetUniformLocation(pg, ps->in[k].sampler);
                 for (int k = 0; k < ps->nuniforms; k++) L->u[k] = p_glGetUniformLocation(pg, ps->u[k].name);
             }
@@ -1386,6 +1780,12 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         for (int k = 0; k < ps->ninputs; k++)
             if (ps->in[k].from == PFX_IN_SHADOW) reads_shadow = 1;
         if (reads_shadow) pfx_shadow_build(ps, (float)lw / (float)lh, lw, lh);
+        for (int k = 0; k < ps->ninputs; k++)
+            if (ps->in[k].from == PFX_IN_SPRITE && s_spr_built != s_pfx_presents) pfx_sprites_alone((float)lw / (float)lh, lw, lh);
+        int reads_fire = 0;
+        for (int k = 0; k < ps->ninputs; k++)
+            if (ps->in[k].from == PFX_IN_FIREMAP) reads_fire = 1;
+        if (reads_fire && s_fire_built != s_pfx_presents) pfx_fire_build(ps, (float)lw / (float)lh, lw, lh);
         for (int k = 0; k < ps->ninputs; k++) {
             if (ps->in[k].from == PFX_IN_SOURCE && !copied) {
                 post_copy_bind(lw, lh);
@@ -1416,6 +1816,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                            : from == PFX_IN_SHADOW ? s_sm_tex
                            : from == PFX_IN_SPRSHADOW ? s_sm2_tex
                            : from == PFX_IN_SPRITE ? s_spr_tex
+                           : from == PFX_IN_FIREMAP ? s_fm_tex
                            : st->tex[from];
             p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
             glBindTexture(GL_TEXTURE_2D, t);
@@ -1425,6 +1826,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         p_glUniform2f(L->fixed[PFX_LOC_RCP], 1.0f / (float)w, 1.0f / (float)h);
         p_glUniform2f(L->fixed[PFX_LOC_SIZE], (float)w, (float)h);
         p_glUniform2i(L->fixed[PFX_LOC_ORG], last ? lx : 0, last ? ly : 0);
+        if (L->fixed[PFX_LOC_TIME] >= 0) p_glUniform1f(L->fixed[PFX_LOC_TIME], pfx_time_now());
         for (int k = 0; k < ps->nuniforms; k++) {
             const PfxUniform *u = &ps->u[k];
             const GLint loc = L->u[k];
@@ -1437,6 +1839,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
             }
         }
         if (reads_shadow) pfx_shadow_uniforms(prog);   /* after the preset's own */
+        if (reads_fire) pfx_fire_uniforms(prog);
         if (ps->blend == PFX_BLEND_SCREEN) {
             glEnable(GL_BLEND);
             p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
@@ -1486,6 +1889,8 @@ static void pfx_state_restore(const PfxGlState *st) {
  * with_aa: a real frame (runs AA too); 0: a Smooth motion generated frame. */
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh) {
     const int src_fresh = fresh;
+    s_pfx_presents++;
+    if (fresh) pfx_lights_update();
     if (!s_ctx) { s_mask_src_valid = 0; return; }
     if (!post_clip_rect(&lx, &ly, &lw, &lh, 8)) { s_mask_src_valid = 0; return; }
     const int mark_shown = fresh && s_sc_on;   /* after this present's shadow map */

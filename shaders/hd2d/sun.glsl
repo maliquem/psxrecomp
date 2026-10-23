@@ -21,7 +21,8 @@
 //           is (0..1), w = 0
 // u_smx..u_sms: the framework's shadow map mapping (gl_postfx.inc)
 // u_soft:   x = how far the scenery's shadow edges spread (world units each
-//           way; 0 = a texel); the sprites' stay sharp. y > 0: the spread
+//           way; 0 = a texel); z the sprites' (0 = sharp, 3x3 texels), grown
+//           by w per unit of distance like the scenery's by y. y > 0: the spread
 //           grows with the distance to what casts it, y world units per unit
 //           (the sun's size, as in percentage-closer soft shadows, Fernando
 //           2005), from a texel up to x: a bush's leaves sharp at its foot,
@@ -64,7 +65,7 @@ vec2 uv_of(vec3 p) { return p.xy * u_proj.x / (p.z * g_nat) + 0.5; }
 
 // Shadow at P: is something nearer the light in the shadow maps? The
 // sprites' map (u_ssm) with 3x3 samples a texel apart (sharp pixel-art
-// silhouettes); the scenery's (u_sm) with 5x5 over u_soft.x world units each
+// silhouettes), or soft by u_soft.zw; the scenery's (u_sm) with 5x5 over u_soft.x world units each
 // way (soft edges; 0 = 3x3 texels; u_soft.y: over the distance to the
 // blockers found there times y, see above), its bias grown with the receiver's tilt
 // to the light (tilt = tan of the angle) across that spread; sprites (spr 0)
@@ -78,12 +79,40 @@ float shadow_at(vec3 P, float bias, float tilt, float spr, float scn)
     vec2 suv = vec2((dot(P, u_smx.xyz) - u_smx.w) * u_sms.x, (dot(P, u_smy.xyz) - u_smy.w) * u_sms.y);
     float own = (u_smz.w - dot(P, u_smz.xyz) - bias) * u_sms.z;
     float bs = 0.0;
-    for (int j = -1; j <= 1; j++)
-        for (int i = -1; i <= 1; i++) {
-            vec2 q = suv + vec2(i, j) / u_sms.w;
-            if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
+    if (u_soft.z > 0.0) {
+        // the sprites' soft too: the spread grows with how far above P the
+        // sprite is (u_soft.w per unit), from a texel at its feet up to
+        // u_soft.z; 5x5 samples turned per pixel (no steps of the map's texels)
+        vec2 st0 = 0.5 * u_soft.z * u_sms.xy;
+        float sum = 0.0, n = 0.0;
+        for (int j = -2; j <= 2; j++)
+            for (int i = -2; i <= 2; i++) {
+                vec2 q = suv + vec2(i, j) * st0;
+                float d = sm_in(q) ? texture(u_ssm, q).r : 1.0;
+                if (d < own) { sum += d; n += 1.0; }
+            }
+        if (n > 0.5) {
+            float texel = 1.0 / (u_sms.x * u_sms.w);
+            float w = clamp((own - sum / n) / u_sms.z * u_soft.w, texel, u_soft.z);
+            float a = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+            mat2 rot = mat2(cos(a), sin(a), -sin(a), cos(a));
+            vec2 st = 0.5 * w * u_sms.xy;
+            for (int j = -2; j <= 2; j++)
+                for (int i = -2; i <= 2; i++) {
+                    vec2 q = suv + (rot * vec2(i, j)) * st;
+                    if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
+                }
+            bs /= 25.0;
         }
-    bs *= spr / 9.0;
+    } else {
+        for (int j = -1; j <= 1; j++)
+            for (int i = -1; i <= 1; i++) {
+                vec2 q = suv + vec2(i, j) / u_sms.w;
+                if (sm_in(q)) bs += texture(u_ssm, q).r < own ? 1.0 : 0.0;
+            }
+        bs /= 9.0;
+    }
+    bs *= spr;
     float bw = 0.0;
     if (u_soft.x > 0.0) {
         float w = u_soft.x;

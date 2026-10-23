@@ -113,6 +113,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdatomic.h>
 #include "png_write.h"   /* png_write_rgb — present_shot readback */
 static uint64_t s_fg_flips;   /* frame generation (below): game frames seen */
@@ -798,6 +799,7 @@ static float   s_pz[3];
  * area would otherwise pile up every frame's triangles); the present uses
  * the list whose area holds the picture. */
 static int     s_sc_on = 0;
+static int     s_sun_on = 0;   /* of those, a chain reads the sun's shadow map (`shadow`, `sprshadow`) */
 static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
 enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
 /* A camera: V = R W + T, screen = of + h V.xy / V.z. */
@@ -811,11 +813,15 @@ enum { SC_ANC_MAX = 64 };
 /* atl: the cut-outs of the frame's sprite pieces (1 = drawn texel), copied from
  * VRAM as each piece was drawn (the game may load the next animation's pieces
  * before the picture is shown), packed in rows of SC_ATL x SC_ATL. */
-enum { SC_ATL = 512 };
+enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 8 };
 typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
                  float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
                  float *sb;   /* per 2D triangle: VRAM y below its lowest drawn texel row, -1e30 = none known */
-                 uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky, atl_klo, atl_khi; } ScSlot;
+                 uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky, atl_klo, atl_khi;
+                 float *ev; int en, ecap;   /* glowing pieces (light sources): x, y (VRAM px), SZ (0 = none), area,
+                                               3D triangles drawn before it, colour (rgb, 1 = full) */
+                 float pts[SC_PTS_MAX][3]; int npts;   /* the points projected with the camera (view space) */
+               } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
 /* Sprite shadows (a chain reads `sprite`): the foot points projected since the
@@ -832,6 +838,8 @@ static int      s_spr_dbg_nrun = 0;
 static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
 static float    s_anc_pend[SC_ANC_MAX][3];
 static int      s_anc_pend_n = 0;
+static float    s_pts_pend[SC_PTS_MAX][3];   /* projected points, taken by the next frame (gl_renderer_shadow_point) */
+static int      s_pts_pend_n = 0;
 static ScCam    s_fcam;                /* the camera of the triangles being drawn */
 static int      s_fcam_ok = 0;
 static unsigned s_fcam_ver = 0;
@@ -846,18 +854,99 @@ static ScSlot *sc_slot(const int area[4], int make) {
     }
     if (!make) return NULL;
     memcpy(lru->area, area, sizeof lru->area);
-    lru->n = 0; lru->conv = 0; lru->shown = 0; lru->sn = 0; lru->nanc = 0;
+    lru->n = 0; lru->conv = 0; lru->shown = 0; lru->sn = 0; lru->nanc = 0; lru->en = 0; lru->npts = 0;
     lru->atl_x = lru->atl_y = lru->atl_h = 0; lru->atl_key[0] = -1;
     if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
     return lru->cap ? lru : NULL;
 }
 /* A new frame in this list: it starts over and takes the foot points. */
 static void sc_restart(ScSlot *sl) {
-    sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0;
+    sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0; sl->en = 0;
     sl->atl_x = sl->atl_y = sl->atl_h = 0; sl->atl_key[0] = -1;
     memcpy(sl->anc, s_anc_pend, (size_t)s_anc_pend_n * sizeof s_anc_pend[0]);
     sl->nanc = s_anc_pend_n;
     s_anc_pend_n = 0;
+    memcpy(sl->pts, s_pts_pend, (size_t)s_pts_pend_n * sizeof s_pts_pend[0]);
+    sl->npts = s_pts_pend_n;
+    s_pts_pend_n = 0;
+}
+/* A glowing piece (additive: fire, lamps, spells), 3D or 2D, kept while a
+ * chain reads the shadow map or the sprites: where the frame's light sources
+ * are (gl_postfx.inc pfx_lights_update: a 2D one counts only round a point
+ * the game projected with the camera and with 3D drawn after it, so the
+ * HUD's, drawn over the finished scene, never do). xs, ys: its corners (VRAM
+ * px), when PGXP has none sub-pixel; rgb, its colour (emit_flat_rgb,
+ * emit_tex_rgb). */
+static unsigned s_emit_seen[3];   /* TCP: additive pieces with depth and sub-pixel corners, with depth only, without depth */
+/* A flat glowing piece's colour: its vertices' (15-bit). */
+static void emit_flat_rgb(const uint16_t *cs, float *rgb) {
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        rgb[0] += (float)(cs[i] & 31) / 93.0f;
+        rgb[1] += (float)((cs[i] >> 5) & 31) / 93.0f;
+        rgb[2] += (float)((cs[i] >> 10) & 31) / 93.0f;
+    }
+}
+/* A textured glowing piece's colour as the game draws it: its texels (4x4
+ * over its uv box, through the CLUT; transparent ones left out, bright ones
+ * counting most) times its vertex colour (col: mod / 255, 128 = as is; raw:
+ * not modulated). A mod's texture bank: the vertex colour alone. */
+static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth, int cx, int cy,
+                         const float *col, int raw, float *rgb) {
+    float m[3] = {0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) m[c] += (raw ? 1.0f / 3.0f : col[i * 3 + c] * (255.0f / 128.0f) / 3.0f);
+    float s[3] = {0.0f, 0.0f, 0.0f}, w = 0.0f;
+    if (s_vram && !s_selected_bank_tex) {
+        int u0 = us[0], u1 = us[0], v0 = vs[0], v1 = vs[0];
+        for (int i = 1; i < 3; i++) {
+            u0 = us[i] < u0 ? us[i] : u0; u1 = us[i] > u1 ? us[i] : u1;
+            v0 = vs[i] < v0 ? vs[i] : v0; v1 = vs[i] > v1 ? vs[i] : v1;
+        }
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                const int u = (u0 + (u1 - u0) * (2 * i + 1) / 8) & 255, v = (v0 + (v1 - v0) * (2 * j + 1) / 8) & 255;
+                const int row = ((by + v) & 511) * 1024;
+                uint16_t t;
+                if (depth == 0) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+                else if (depth == 1) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+                else t = s_vram[row + ((bx + u) & 1023)];
+                if (!t) continue;
+                const float r = (float)(t & 31) / 31.0f, g = (float)((t >> 5) & 31) / 31.0f, b = (float)((t >> 10) & 31) / 31.0f;
+                const float l = r + g + b;
+                s[0] += r * l; s[1] += g * l; s[2] += b * l; w += l;
+            }
+    }
+    for (int c = 0; c < 3; c++) rgb[c] = (w > 0.0f ? s[c] / w : 1.0f) * m[c];
+}
+static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int *ys, const float *rgb) {
+    if (!s_sc_on) return;   /* needs the 3D triangles counted (sl->n) */
+    s_emit_seen[!s_pz_valid ? 2 : s_pc_valid ? 0 : 1]++;
+    const int area[4] = {x1, y1, x2, y2};
+    ScSlot *sl = sc_slot(area, 1);
+    if (!sl) return;
+    if (sl->shown) sc_restart(sl);
+    if (sl->en >= 1024) return;
+    if (sl->en == sl->ecap) {
+        const int nc = sl->ecap ? sl->ecap * 2 : 64;
+        float *p = (float *)realloc(sl->ev, (size_t)nc * SC_EV * sizeof(float));
+        if (!p) return;
+        sl->ev = p; sl->ecap = nc;
+    }
+    float *e = sl->ev + (size_t)sl->en * SC_EV;
+    float px[3], py[3];
+    for (int i = 0; i < 3; i++) {
+        px[i] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        py[i] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+    }
+    e[0] = (px[0] + px[1] + px[2]) / 3.0f;
+    e[1] = (py[0] + py[1] + py[2]) / 3.0f;
+    e[2] = s_pz_valid ? (s_pz[0] + s_pz[1] + s_pz[2]) / 3.0f : 0.0f;   /* none: a projected point's (gl_postfx.inc) */
+    e[3] = 0.5f * fabsf((px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0]));
+    e[4] = (float)sl->n;
+    e[5] = rgb[0]; e[6] = rgb[1]; e[7] = rgb[2];
+    sl->en++;
+    sl->use = ++s_sc_use;
 }
 /* A 2D textured triangle (not proven 3D): kept while sprites cast, so the
  * pieces drawn around a foot point can stand there in the shadow map. */
@@ -868,6 +957,9 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
     if (sl->shown) sc_restart(sl);
+    /* the camera too (when no chain reads the shadow map, no 3D triangle
+     * brings it: a light that lights the sprites in an area with no sun) */
+    if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
     if (sl->sn >= 8192) return;
     if (sl->sn == sl->scap) {
         const int nc = sl->scap ? sl->scap * 2 : 512;
@@ -1277,6 +1369,7 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     return k;
 }
 int gl_renderer_shadow_wanted(void) { return s_sc_on; }
+int gl_renderer_shadow_sun_wanted(void) { return s_sun_on; }
 /* c: r[9], t[3], of[2], h; NULL = no camera. */
 static void fcam_apply(const float *c) {
     s_fcam_ok = c != NULL;
@@ -1289,14 +1382,32 @@ static void anchor_apply(const float *w) {
     if (s_anc_pend_n >= SC_ANC_MAX) return;
     memcpy(s_anc_pend[s_anc_pend_n++], w, sizeof s_anc_pend[0]);
 }
+static void point_apply(const float *w) {
+    if (s_pts_pend_n >= SC_PTS_MAX) return;
+    memcpy(s_pts_pend[s_pts_pend_n++], w, sizeof s_pts_pend[0]);
+}
+/* Any single point the game projected with the camera (an RTPS; gpu.c): an
+ * effect's place in the scene (a fire's 2D flames are drawn round one); the
+ * next frame to start takes it, as the foot points. */
+void gl_renderer_shadow_point(const float w[3]) {
+    if (rth_record_mode()) {
+        int32_t v[4];
+        memcpy(v, w, 3 * sizeof(float));
+        v[3] = 1;   /* a point, not a foot point */
+        if (rth_rec_ints(RTH_ANCHOR, 0, 4, v)) return;
+        gl_rth_acquire("shadow_point");
+    }
+    point_apply(w);
+}
 /* A sprite's foot point (gpu.c, sprite_anchors) in the view space of the camera
  * that projected it (GTE: y down), in stream order like the camera: the next
  * frame to start takes it. */
 void gl_renderer_shadow_anchor(const float w[3]) {
     if (rth_record_mode()) {
-        int32_t v[3];
-        memcpy(v, w, sizeof v);
-        if (rth_rec_ints(RTH_ANCHOR, 0, 3, v)) return;
+        int32_t v[4];
+        memcpy(v, w, 3 * sizeof(float));
+        v[3] = 0;   /* a foot point */
+        if (rth_rec_ints(RTH_ANCHOR, 0, 4, v)) return;
         gl_rth_acquire("shadow_anchor");
     }
     anchor_apply(w);
@@ -1330,6 +1441,9 @@ void gl_renderer_shadow_world(const float *w9, int n) {
     memcpy(s_wg, w9, (size_t)n * 9 * sizeof(float));
     s_wg_n = n;
 }
+static uint32_t s_wg_area = 0;   /* gl_renderer_shadow_area */
+void gl_renderer_shadow_area(uint32_t id) { s_wg_area = id; }
+uint32_t gl_renderer_shadow_area_id(void) { return s_wg_area; }
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();
@@ -5350,6 +5464,11 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     int gate = bd_prim_gate(xs, n, 0);
     const int dmode = n == 3 ? pgxp_tri_depth_mode(semi) : 0;
     if (dmode) { depth_before_tri(); sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, NULL); }
+    if (n == 3 && (semi == 1 || semi == 3) && s_sc_on) {
+        float rgb[3];
+        emit_flat_rgb(cs, rgb);
+        sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb);
+    }
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
     const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d();
     if (s_fb_n > 0 && (s_fb_mode != GL_TRIANGLES || s_fb_semi != semi ||
@@ -5498,6 +5617,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const int batch_semi = batch_class.key;
         const int isolate = batch_class.isolate;
         const int tdmode = pgxp_tri_depth_mode(semi);
+        if ((semi == 1 || semi == 3) && s_sc_on) {
+            float rgb[3];
+            emit_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, rgb);
+            sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb);
+        }
         if (tdmode) {
             depth_before_tri();
             if (s_sc_on) {
@@ -14580,10 +14704,10 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         fcam_apply(v[0] ? c : NULL);
         break;
     }
-    case RTH_ANCHOR: {
+    case RTH_ANCHOR: {   /* v[3]: 0 a foot point, 1 any projected point */
         float w[3];
         memcpy(w, v, sizeof w);
-        anchor_apply(w);
+        if (v[3]) point_apply(w); else anchor_apply(w);
         break;
     }
     case RTH_FILL:      glb_fill_rect(v[0], v[1], v[2], v[3], (uint16_t)v[4]); break;

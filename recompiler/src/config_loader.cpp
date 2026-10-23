@@ -863,6 +863,28 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 if (rt.video_shadow_off_tpage.size() > 16)
                     throw std::runtime_error("[video.shadow] off_textures: at most 16");
             }
+            if (sh.contains("sun_areas")) {
+                for (const auto& k : toml::find<std::vector<std::string>>(sh, "sun_areas")) {
+                    const auto c1 = k.find(':'), c2 = c1 == std::string::npos ? c1 : k.find(':', c1 + 1);
+                    if (c1 != std::string::npos && k.substr(c1 + 1) == "off") {   // no sun in this area
+                        rt.video_shadow_sun_area.push_back((uint32_t)std::stoul(k.substr(0, c1), nullptr, 0));
+                        rt.video_shadow_sun_az.push_back(0.0f);
+                        rt.video_shadow_sun_el.push_back(0.0f);
+                        continue;
+                    }
+                    if (c2 == std::string::npos)
+                        throw std::runtime_error(fmt::format(
+                            "[video.shadow] sun_areas entries are \"0xAREA:azimuth:elevation\" or \"0xAREA:off\": {}", k));
+                    const float az = std::stof(k.substr(c1 + 1, c2 - c1 - 1)), el = std::stof(k.substr(c2 + 1));
+                    if (el < 1.0f || el > 89.0f)
+                        throw std::runtime_error(fmt::format("[video.shadow] sun_areas elevation must be 1..89: {}", k));
+                    rt.video_shadow_sun_area.push_back((uint32_t)std::stoul(k.substr(0, c1), nullptr, 0));
+                    rt.video_shadow_sun_az.push_back(az);
+                    rt.video_shadow_sun_el.push_back(el);
+                }
+                if (rt.video_shadow_sun_area.size() > 256)
+                    throw std::runtime_error("[video.shadow] sun_areas: at most 256");
+            }
             if (sh.contains("sprite_anchors")) {
                 for (const auto& k : toml::find<std::vector<std::string>>(sh, "sprite_anchors"))
                     rt.video_shadow_sprite_anchors.push_back((uint32_t)std::stoul(k, nullptr, 0));
