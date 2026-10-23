@@ -18,7 +18,8 @@
 // u_shadowdir: xyz = direction to the light in view space (the plugin, from
 //           the camera), w = 1 when set; else it comes from u_sun here
 // u_shadow: x = unused, y = bias (fraction of Z), z = how dark a full shadow
-//           is (0..1), w = 0
+//           is (0..1), w = the seam at a wall's foot filled over w x the bias
+//           (contact_at; 0 = off)
 // u_smx..u_sms: the framework's shadow map mapping (gl_postfx.inc)
 // u_soft:   x = how far the scenery's shadow edges spread (world units each
 //           way; 0 = a texel); z the sprites' (0 = sharp, 3x3 texels), grown
@@ -150,6 +151,25 @@ float shadow_at(vec3 P, float bias, float tilt, float spr, float scn)
     return 1.0 - max(bs, bw * scn) * u_shadow.z;
 }
 
+// The seam where a wall meets the floor: the bias that keeps a face from
+// shading itself (tens of world units on a floor under a low sun) also lifts
+// the wall's shadow off its foot, a lit line along it. From P, a few steps
+// toward the light over len world units: scenery standing in front of the
+// ray there (nearer the camera, by less than len) shades P. It only adds
+// shadow, and only that close.
+float contact_at(vec3 P, vec3 L, float len)
+{
+    for (int i = 1; i <= 6; i++) {
+        vec3 R = P + L * (len * float(i) / 6.0);
+        if (R.z <= 1.0) return 1.0;
+        vec2 uv = uv_of(R);
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+        float zq = sz_at(uv);
+        if (zq > 0.0 && zq < R.z - 1.0 && zq > R.z - len) return 1.0 - u_shadow.z;
+    }
+    return 1.0;
+}
+
 // Two pixels along +d from P on its own face (see main), as a step forward.
 vec3 face_step(vec2 uv0, vec3 P, float z, vec2 d)
 {
@@ -209,8 +229,11 @@ void main()
 
     // the bias grows on faces turned from the light
     float scn = u_ss.y > 0.5 ? 1.0 : 0.0;   // sprites only: no facing, no scenery shadows
+    float bias = (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert));
     float shadow = (lambert > 0.0 || scn < 0.5)
-        ? shadow_at(P, (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert)),
-                    sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0, scn) : 1.0;
+        ? shadow_at(P, bias, sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0, scn) : 1.0;
+    // u_shadow.w: the seam at a wall's foot filled (contact_at over w x the bias; 0 = off)
+    if (u_shadow.w > 0.0 && lambert > 0.0 && scn > 0.5 && shadow > 1.0 - u_shadow.z)
+        shadow = min(shadow, contact_at(P, L, u_shadow.w * bias));
     o = vec4(mix(1.0, lambert, scn) * shadow, z, 0.0, 1.0);
 }
