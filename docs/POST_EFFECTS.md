@@ -222,7 +222,12 @@ x): a bush's leaves stay sharp at its foot, a cliff's far edge soft. The
 sprites' soften the same way, by `u_soft` z (at most, world units) and w
 (per unit of distance: 4 and 0.1, sharp at the feet, softer at the head),
 5x5 samples turned per pixel; z 0 keeps them sharp (3x3 texels of
-`sprshadow`). Their faces' normals come from
+`sprshadow`). The bias that keeps a face from shading itself (tens of world
+units on a floor under a low sun) also lifts a wall's shadow off its foot,
+a lit line where wall and floor meet: `u_shadow` w (2 in the presets, 0 =
+off) fills it, a few steps from a lit point toward the sun over w x the bias,
+shaded where the scenery stands in front of that path (it only adds shadow,
+and only that close). Their faces' normals come from
 two pixels on the side that stays in the pixel's plane (the least bend in
 1/Z), so creases between faces show no seams. A pass may read up to 6 inputs.
 
