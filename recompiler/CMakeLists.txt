@@ -416,6 +416,56 @@ if(BUILD_TESTING)
     add_test(NAME mdec_capture_test
              COMMAND mdec_capture_test ${CMAKE_CURRENT_BINARY_DIR})
 
+    # Offline MDEC replay (tools/mdec_replay): fingerprints the decoder's
+    # output and state over generated or captured commands. The pinned
+    # synthetic fingerprint is the decoder's exact output: a change to any
+    # decoded byte fails here. Its capture, replayed, must match live.
+    add_executable(mdec_replay
+        ../tools/mdec_replay/mdec_replay.c
+        ../runtime/src/mdec.c)
+    target_include_directories(mdec_replay PRIVATE ../runtime/include)
+    set(_mdec_synth_cap "${CMAKE_CURRENT_BINARY_DIR}/mdec_replay_synthetic.cap")
+    add_test(NAME mdec_replay_synthetic_test
+             COMMAND mdec_replay --synthetic 1 6000 --expect d3c6fd9fc4d8bf4f
+                     --capture ${_mdec_synth_cap})
+    set_tests_properties(mdec_replay_synthetic_test PROPERTIES
+        FIXTURES_SETUP mdec_replay_capture)
+    add_test(NAME mdec_replay_corpus_test
+             COMMAND mdec_replay --corpus ${_mdec_synth_cap} --check-live)
+    set_tests_properties(mdec_replay_corpus_test PROPERTIES
+        FIXTURES_REQUIRED mdec_replay_capture)
+
+    # mdec_replay_ab: the same events through this tree's decoder and the one
+    # at MDEC_REF_COMMIT (its mdec.c is extracted into the build tree only),
+    # stopping at the first difference.
+    set(MDEC_REF_COMMIT "" CACHE STRING
+        "psxrecomp commit whose runtime/src/mdec.c mdec_replay_ab compares against")
+    if(MDEC_REF_COMMIT)
+        find_package(Git REQUIRED)
+        set(_mdec_ref_dir "${CMAKE_CURRENT_BINARY_DIR}/mdec_ref")
+        file(MAKE_DIRECTORY "${_mdec_ref_dir}")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" show "${MDEC_REF_COMMIT}:runtime/src/mdec.c"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            OUTPUT_FILE "${_mdec_ref_dir}/mdec_ref_source.c"
+            RESULT_VARIABLE _mdec_ref_rc)
+        if(NOT _mdec_ref_rc EQUAL 0)
+            message(FATAL_ERROR
+                "MDEC_REF_COMMIT=${MDEC_REF_COMMIT}: cannot read its runtime/src/mdec.c")
+        endif()
+        file(WRITE "${_mdec_ref_dir}/mdec_ref_tu.c"
+             "#include \"mdec_ref_names.h\"\n#include \"mdec_ref_source.c\"\n")
+        add_executable(mdec_replay_ab
+            ../tools/mdec_replay/mdec_replay.c
+            ../runtime/src/mdec.c
+            "${_mdec_ref_dir}/mdec_ref_tu.c")
+        target_include_directories(mdec_replay_ab PRIVATE
+            ../runtime/include ../tools/mdec_replay)
+        target_compile_definitions(mdec_replay_ab PRIVATE MDEC_REPLAY_HAVE_REF=1)
+        add_test(NAME mdec_replay_ab_test
+                 COMMAND mdec_replay_ab --synthetic 1 6000)
+    endif()
+
     add_executable(debug_trace_ranges_test
         ../runtime/tests/test_debug_trace_ranges.c
         ../runtime/src/debug_trace_ranges.c
