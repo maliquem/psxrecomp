@@ -230,7 +230,17 @@ x): a bush's leaves stay sharp at its foot, a cliff's far edge soft. The
 sprites' soften the same way, by `u_soft` z (at most, world units) and w
 (per unit of distance: 4 and 0.1, sharp at the feet, softer at the head),
 5x5 samples turned per pixel; z 0 keeps them sharp (3x3 texels of
-`sprshadow`). The bias that keeps a face from shading itself (tens of world
+`sprshadow`). A sun higher than `u_sprsun` x (degrees; 50 in the presets)
+would cast an upright sprite as a line at its feet: the sprites then cast
+along a sun at x (same azimuth) in `sprshadow` with its own mapping (the
+pass gets `u_ssx`, `u_ssy`, `u_ssz`, `u_sss`, as `u_smx`..`u_sms`; w 0 = the
+scenery's), each foot point dropped onto the surface under it (a ray down
+through the frame's 3D triangles, up to 128 units: the game's point can sit
+above a deck), and each sprite's silhouette laid along that light onto the
+floor at its feet, so its shadow lies there whole; it reaches `u_sprsun` y
+world units down at most (40: none on a floor far below, the sand under a
+deck) and is `u_sprsun` z units soft (3). The scenery keeps the real sun.
+The bias that keeps a face from shading itself (tens of world
 units on a floor under a low sun) also lifts a wall's shadow off its foot,
 a lit line where wall and floor meet: `u_shadow` w (2 in the presets, 0 =
 off) fills it, a few steps from a lit point toward the sun over w x the bias,
