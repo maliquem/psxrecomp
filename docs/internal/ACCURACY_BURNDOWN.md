@@ -448,11 +448,11 @@ overlap the cycle axis or each other (different files), so they parallelize.
   pull timing not guest-768-cycle clock. FAITHFUL: ADPCM decode + ADSR envelope (verbatim
   Beetle ports). Recommend: port Beetle PS_SPU on a guest-clock timeline. Validate: audio
   sample-stream diff.
-- **`accuracy/axis5_mdec.md` — explains the slightly-off FMV.** HIGH: IDCT rounding/clamp
-  diverges (contrast/ringing); HIGH: YUV→RGB lacks HW green-precision truncation (off-hue
-  greens); HIGH: dequant domain/bias/clamp wrong (DC banding). MED: 4bpp output broken
-  (textures, not FMV); MED: one-shot decode vs FIFO/block state machine. Validate:
-  per-block decode diff + live FMV pixel-diff.
+- **`accuracy/axis5_mdec.md` — MDEC.** RESOLVED (2026-10): dequant precision, IDCT
+  rounding/9-bit limits and YUV→RGB green truncation follow `docs/MDEC_DECODER_SPEC.md`
+  in a clean-room core (`mdec_core.c`), output pinned by `mdec_replay`. MED: 4bpp output
+  not packed (textures, not FMV); MED: one-shot decode vs FIFO/block state machine.
+  Validate: `mdec_replay_ab` + a live capture replayed with `--check-live`.
 - **`accuracy/axis4_memory_mmio.md`.** GOOD: I_STAT/I_MASK/DICR ack semantics CORRECT.
   P1: RAM mirror wrong (we gate `<2MB`; HW aliases 2MB DRAM across an 8MB window 4× —
   mirror accesses silently read 0 / drop writes). P2: `IsC` over-broadly drops scratchpad

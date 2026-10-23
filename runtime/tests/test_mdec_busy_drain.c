@@ -1,9 +1,9 @@
 /*
  * MDEC status bit 29 (Command Busy) across output drain.
  *
- * Beetle's MDEC_Read reports InCommand as bit 29, and a decode command stays
- * InCommand until its last macroblock fits in the 32-word OutFIFO: the hardware
- * decodes progressively and stalls while OutFIFO is full. mdec.c decodes a whole
+ * Bit 29 is Command Busy (psx-spx), and a decode command stays busy until its
+ * last macroblock fits in the 32-word data-out FIFO: the hardware decodes
+ * progressively and stalls while that FIFO is full. mdec.c decodes a whole
  * command at once, so bit 29 must be derived from the unread output.
  *
  * Regression: reporting ready right after the instant decode let libpress

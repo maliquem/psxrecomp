@@ -399,6 +399,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
+    ${PSXRECOMP_ROOT}/runtime/src/mdec_core.c
     ${PSXRECOMP_ROOT}/runtime/src/timers.c
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_timing.c
