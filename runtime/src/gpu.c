@@ -734,10 +734,28 @@ void gpu_set_overdraw(int x, int y) {
     ws_overdraw_x = x < 0 ? 0 : x > 256 ? 256 : x;
     ws_overdraw_y = y < 0 ? 0 : y > 256 ? 256 : y;
 }
+/* More of the band for part of a frame (psx_mod_set_overdraw_extra): while a
+ * title's own routine draws casters it culls by itself near the edges (props:
+ * a bush, a rock), x / y px past the overdraw, so one whose shadow reaches the
+ * picture is drawn before it shows. Added only while the overdraw is on; the
+ * title clears it after that routine. 0, 0 = none. */
+static int ws_overdraw_ex = 0, ws_overdraw_ey = 0;
+static unsigned ws_overdraw_extras = 0;   /* times one was asked for (TCP shadow_cache) */
+int gpu_set_overdraw_extra(int x, int y) {
+    ws_overdraw_ex = x < 0 ? 0 : x > 256 ? 256 : x;
+    ws_overdraw_ey = y < 0 ? 0 : y > 256 ? 256 : y;
+    if (ws_overdraw_ex || ws_overdraw_ey) ws_overdraw_extras++;
+    return ws_overdraw_x || ws_overdraw_y;
+}
 int psx_overdraw_x(void) { return ws_overdraw_x; }
 int psx_overdraw_y(void) { return ws_overdraw_y; }
-int psx_overdraw_axis(int axis) { return axis ? ws_overdraw_y : ws_overdraw_x; }
-static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_overdraw_x; }
+/* the band the culls keep now: the overdraw and, while it is on, the extra */
+static int ws_od(int axis) {
+    const int base = axis ? ws_overdraw_y : ws_overdraw_x;
+    return (ws_overdraw_x || ws_overdraw_y) ? base + (axis ? ws_overdraw_ey : ws_overdraw_ex) : base;
+}
+int psx_overdraw_axis(int axis) { return ws_od(axis); }
+static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_od(0); }
 
 /* [video.shadow]: while a post-effect chain reads `shadow` (the shadow map of
  * the scenery, gl_postfx.inc), each VBlank hands the renderer the game's
@@ -870,10 +888,10 @@ static int sh_ts_n;   /* routines that draw both windings (below) */
 int psx_shadow_state(char *out, int cap) {
     float saz = 0.0f, sel = 0.0f;
     const int sun = gpu_shadow_sun_area(&saz, &sel);
-    return snprintf(out, (size_t)cap, "\"scene\":\"0x%08x\",\"scene_sun\":[%d,%.1f,%.1f],\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,"
+    return snprintf(out, (size_t)cap, "\"scene\":\"0x%08x\",\"scene_sun\":[%d,%.1f,%.1f],\"two_sided\":%d,\"cfg_camera\":%d,\"overdraw\":[%d,%d],\"overdraw_on\":%d,\"overdraw_extra\":[%d,%d,%u],"
                     "\"keys\":%d,\"hide\":%d,\"hidden\":%u,\"discs\":%u,\"fed\":%u,\"rejected\":%u,\"cam_taken\":%u,\"anchors\":%u,\"blobs\":%u,"
                     "\"last_bad\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
-                    (unsigned)sh_area, sun, saz, sel, sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, sh_nkeys, sh_hide_n, sh_hidden, sh_discs, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
+                    (unsigned)sh_area, sun, saz, sel, sh_ts_n, sh_camera, sh_od_x, sh_od_y, sh_od_on, ws_overdraw_ex, ws_overdraw_ey, ws_overdraw_extras, sh_nkeys, sh_hide_n, sh_hidden, sh_discs, sh_fed, sh_rejected, sh_cam_taken, sh_anc_taken, sh_blobs,
                     sh_last_bad[0], sh_last_bad[1], sh_last_bad[2], sh_last_bad[3], sh_last_bad[4],
                     sh_last_bad[5], sh_last_bad[6], sh_last_bad[7], sh_last_bad[8], sh_last_bad[9]);
 }
@@ -2507,7 +2525,7 @@ int psx_ws_cull_bltz(uint32_t v) {
  * SY, H`, H from screen_h_imms): widened by the overdraw on both edges only
  * (widescreen never moves Y). Identity at 0. */
 int psx_ws_cull_sltiu_y(uint32_t sy, uint32_t imm) {
-    const int m = ws_overdraw_y;
+    const int m = ws_od(1);
     return ((uint32_t)((int32_t)(int16_t)(uint16_t)sy + m)
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
@@ -5602,6 +5620,29 @@ static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n
         || maxy < (int32_t)draw_area_top  || miny > (int32_t)draw_area_bottom;
 }
 
+/* A polygon wholly past the drawing area draws nothing. While the overdraw
+ * band is on, one inside the band still goes to the renderer: the drawing
+ * area clips it there (nothing drawn, as before) and the shadow map takes it
+ * as a caster. Dropped here, the casters the game's culls keep in the band
+ * (a bush just off the picture) never reached the shadow map, and a shadow
+ * appeared on the floor only with its object. */
+static inline int draw_area_out_poly(const int32_t *vx, const int32_t *vy, int n) {
+    if (!draw_area_out_bbox(vx, vy, n)) return 0;
+    if (!ws_overdraw_x && !ws_overdraw_y) return 1;
+    int32_t minx = vx[0], maxx = vx[0], miny = vy[0], maxy = vy[0];
+    for (int i = 1; i < n; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+        if (vy[i] < miny) miny = vy[i];
+        if (vy[i] > maxy) maxy = vy[i];
+    }
+    int32_t left, right;
+    draw_area_host_x_bounds(&left, &right);
+    const int32_t bx = ws_od(0), by = ws_od(1);
+    return maxx < left - bx || minx > right + bx
+        || maxy < (int32_t)draw_area_top - by || miny > (int32_t)draw_area_bottom + by;
+}
+
 static inline int draw_area_out_rect(int32_t x, int32_t y, int w, int h) {
     if (w <= 0 || h <= 0) return 1;
     int32_t left, right;
@@ -5709,7 +5750,7 @@ static void gp0_exec_mono_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_poly(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(1, 2, 3,
                              vx, vy);
@@ -5801,7 +5842,7 @@ static void gp0_exec_mono_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_poly(vx, vy, 4)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     /* Semi axis-aligned mono quads (UI boxes/borders): one rect, not two tris.
      * Thin semi borders (e.g. CTR name-entry OT-1144 teal 3×H) otherwise double-
@@ -5852,7 +5893,7 @@ static void gp0_exec_shaded_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_poly(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(1, 3, 5,
                              vx, vy);
@@ -5892,7 +5933,7 @@ static void gp0_exec_shaded_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_poly(vx, vy, 4)) return;
     /* Capture vertex data when armed. */
     if (sq_cap_armed && sq_cap_count < SQ_CAP_MAX) {
         GpuSqCapEntry* e = &sq_cap_buf[sq_cap_count++];
@@ -6025,7 +6066,7 @@ static void gp0_exec_textured_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_poly(vx, vy, 3)) return;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
     prepare_precise_triangle(1, 3, 5,
@@ -6086,7 +6127,7 @@ static void gp0_exec_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_poly(vx, vy, 4)) return;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
 
@@ -6184,7 +6225,7 @@ static void gp0_exec_shaded_textured_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_poly(vx, vy, 3)) return;
 
     uint16_t host_bank = mod_texture_packet_bank(gp0_cmd_source_addr, gp0_cmd_buf, 9u);
     if (host_bank && (gr_backend() != GR_BACKEND_OPENGL ||
@@ -6263,7 +6304,7 @@ static void gp0_exec_shaded_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_poly(vx, vy, 4)) return;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     if (!rej_a) {

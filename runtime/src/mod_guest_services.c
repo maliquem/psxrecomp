@@ -210,6 +210,7 @@ int psx_mod_gte_projection(int32_t out[6]) {
 }
 
 void psx_mod_set_overdraw(int x, int y) { gpu_set_overdraw(x, y); }
+int psx_mod_set_overdraw_extra(int x, int y) { return gpu_set_overdraw_extra(x, y); }
 
 int psx_mod_gte_data(uint32_t out[32]) {
     const CPUState *cpu = debug_cpu_ptr;

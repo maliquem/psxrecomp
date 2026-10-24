@@ -163,6 +163,11 @@ int psx_mod_gte_projection(int32_t out[6]);
  * [widescreen.cull]); the picture itself is unchanged. 0, 0 = vanilla. For
  * effects that need the surroundings (shadow casters). */
 void psx_mod_set_overdraw(int x, int y);
+/* More of that band for part of a frame: x / y px past it while the overdraw
+ * is on (shadows), e.g. set before a routine that draws casters the title
+ * culls by itself near the edges and cleared (0, 0) after it. Returns 1 while
+ * the overdraw is on (the extra applies), else 0. */
+int psx_mod_set_overdraw_extra(int x, int y);
 /* The GTE data registers (COP2 0..31) as the guest left them. Read-only;
  * returns 0 before the CPU is bound. */
 int psx_mod_gte_data(uint32_t out[32]);

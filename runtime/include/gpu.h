@@ -431,6 +431,7 @@ int  psx_ws_is_cull_h_imm(uint32_t imm);
 /* Overdraw guard band (see gpu.c): extra screen px kept past each edge by the
  * game's per-primitive screen culls. 0 = vanilla. */
 void gpu_set_overdraw(int x, int y);
+int  gpu_set_overdraw_extra(int x, int y);   /* more, for part of a frame, while it is on (returns on) */
 int  psx_overdraw_x(void);
 int  psx_overdraw_y(void);
 int  psx_overdraw_axis(int axis);   /* 0 = X, 1 = Y (overlay callback) */

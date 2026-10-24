@@ -213,7 +213,8 @@ included).
 [video.shadow]
 camera = "ram:0x801381BC"   # the game's camera MATRIX (9 x s16 R, pad, 3 x s32 T);
                             # "gte" = the GTE at VBlank (a guess), "none" = a mod feeds it
-overdraw = [64, 64]         # px past the picture the game's screen culls keep (memory only)
+overdraw = [64, 64]         # px past the picture the game's screen culls keep; the polygons there
+                            # are clipped as before and cast (a mod may ask for more: psx_mod_set_overdraw_extra)
 scene_keys = ["0xADDR:4"]   # guest RAM whose change starts a new scene (memory only)
 hide_textures = ["0x46:0x7c43", "0x149:*"]   # page:CLUT of the game's own blob shadows
 off_textures = ["0x1e:0x3dc0", "*:0x3e00"]   # page:CLUT only a sunless screen draws (no shadow effects)
