@@ -8160,6 +8160,9 @@ static void apply_title_direct_shortcut(const std::string& shortcut,
 static int savestate_menu_open = 0;
 static int savestate_menu_slot = 0;
 static int savestate_menu_ignore_toggle_release = 0;
+/* Set when the menu opens: controller buttons already held then (a shortcut
+ * that includes a face button) act only after a release. */
+static int savestate_menu_nav_fresh = 0;
 static SDL_Keycode savestate_menu_open_key = 0;
 
 static void savestate_menu_sync_overlay(void) {
@@ -8182,6 +8185,7 @@ static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
     }
     savestate_menu_open = 1;
     savestate_menu_ignore_toggle_release = 1;
+    savestate_menu_nav_fresh = 1;
     savestate_menu_open_key = opened_by_key;
     savestate_menu_sync_overlay();
 }
@@ -8279,24 +8283,23 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     int prev = 0, next = 0, load = 0, save = 0, cancel = 0;
     int dir = 0;
 
-    SDL_GameController *h = g_players[0].handle;
-    if (h) {
-        const Sint16 lx =
-            SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX);
+    /* P1's controller as the shortcuts see it (the debug host layer too) */
+    if (p1_host_present()) {
+        const int lx = p1_host_axis_value(nullptr, SDL_CONTROLLER_AXIS_LEFTX);
         const int dz = 16000;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_LEFT) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_UP) ||
+        if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_LEFT) ||
+            p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_UP) ||
             lx < -dz)
             prev = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_DOWN) ||
+        if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
+            p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_DOWN) ||
             lx > dz)
             next = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_A))
+        if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_A))
             load = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_X))
+        if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_X))
             save = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_B))
+        if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_B))
             cancel = 1;
     }
 
@@ -8309,6 +8312,12 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     }
     prev_toggle = toggle;
 
+    if (savestate_menu_nav_fresh) {
+        savestate_menu_nav_fresh = 0;
+        prev_load = load;
+        prev_save = save;
+        prev_cancel = cancel;
+    }
     if (load && !prev_load)
         savestate_menu_submit(0);
     if (save && !prev_save)
@@ -8629,6 +8638,11 @@ static void savestate_menu_host_pause_loop(void) {
     psx_local_mouse_reset();
     freeze_heartbeat_set_paused(1);
     while (savestate_menu_open) {
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* The guest is frozen; keep the debug endpoint live (status reads,
+         * screenshots, host keys and the host pad layer) as the other pauses do. */
+        debug_server_poll();
+#endif
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             (void)psx_local_mouse_event(ev);
