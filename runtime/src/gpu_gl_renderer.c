@@ -14792,7 +14792,15 @@ static uint64_t fg_tick(void *user, uint64_t now) {
          * multiple of the game's 30 Hz) and a late tick both get the camera
          * where it is when the frame is seen. Past the end of the game
          * frame the rest are dropped and the real frame goes. */
-        const double t = fg_clock_phase(now - s_fg_t0, s_fg_step_ns, s_fg_flip_ns);
+        /* Test (PSX_FG_FIXED_PHASE=1, to compare by eye): the plan's phases
+         * k / (n + 1) instead of the clock's, every one of them drawn. Even
+         * steps whatever the frame's arrival jitter; measured (perf_summary,
+         * tools fg_pacing) steadier phase steps and no in-between frame
+         * dropped past the end of the game frame. */
+        static int fixed = -1;
+        if (fixed < 0) { const char *e = getenv("PSX_FG_FIXED_PHASE"); fixed = e && e[0] == '1'; }
+        const double t = fixed ? (double)s_fg_k / (double)(s_fg_n + 1)
+                               : fg_clock_phase(now - s_fg_t0, s_fg_step_ns, s_fg_flip_ns);
         if (t > 0.0) {
             fg_generate_timed(t);
             s_fg_k++;
@@ -15247,7 +15255,7 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
     for (unsigned i = 0; i < n && k < cap - 48; i++) {
         const unsigned j = (first + i) % FG_TL;
         k += snprintf(out + k, (size_t)(cap - k), "%s[%u,%.3f,%.3f]", i ? "," : "", s_fg_tl_ty[j], s_fg_tl_ph[j],
-                      (double)(s_fg_tl_ns[j] - s_fg_tl_ns[first % FG_TL]) * 1e-6);
+                      (double)(int64_t)(s_fg_tl_ns[j] - s_fg_tl_ns[first % FG_TL]) * 1e-6);
     }
     k += snprintf(out + k, (size_t)(cap - k), "],\"vlog\":{\"rewinds\":%llu,\"missed\":%llu,\"entries\":%llu,\"bytes\":%llu}",
                   (unsigned long long)s_vlog_rewinds, (unsigned long long)s_vlog_missed,
