@@ -559,6 +559,73 @@ static int pfx_depth_build(int fresh, int lw, int lh) {
     return s_dep_ok;
 }
 
+/* A dim grey glowing piece drawn in the scene loses the see-through cover mark
+ * (mask3d blue) over its triangles: it adds little light (under UNC_DIM) and
+ * grey (its weakest channel over half its strongest: dust, smoke; BoF4's
+ * running dust adds about 0.3 of each, a campfire 0.42 0.27 0, spells more)
+ * and 3D scenery was drawn after it, as the light sources count it
+ * (pfx_lights_update: the HUD,
+ * drawn over the finished scene, keeps it). The effects then light it with the
+ * ground under it, as the textured cover pass already does for 3D pieces (it
+ * stood out as a light where they darkened the ground). The scene-capture
+ * pieces (sc_add_emit) are kept while a chain reads the shadow map or the
+ * sprites. */
+enum { UNC_MAX = 1024 };
+#define UNC_DIM 0.4f
+static GLuint s_unc_prog = 0, s_unc_vao = 0, s_unc_vbo = 0;
+static float  s_unc_buf[UNC_MAX * 6];
+static int    s_unc_last = 0;   /* TCP shadow_cache "uncovered": the last mask's pieces */
+static void pfx_mask_uncover(int lw, int lh) {
+    s_unc_last = 0;
+    const ScSlot *sc = sc_presented();
+    if (!sc || sc->en <= 0 || s_sc_nh <= 0.0f || lw <= 0 || lh <= 0) return;
+    const float k = (float)lh / s_sc_nh, after_min = fmaxf(4.0f, 0.03f * (float)sc->n);
+    int n = 0;
+    for (int i = 0; i < sc->en && n < UNC_MAX; i++) {
+        const float *e = sc->ev + (size_t)i * SC_EV;
+        const float mx = fmaxf(e[5], fmaxf(e[6], e[7])), mn = fminf(e[5], fminf(e[6], e[7]));
+        if (mx * e[14] >= UNC_DIM || mx - mn >= 0.5f * mx) continue;      /* a light */
+        if ((float)sc->n - e[4] < after_min) continue;                      /* over the scene */
+        const float cx = (e[8] + e[10] + e[12]) / 3.0f, cy = (e[9] + e[11] + e[13]) / 3.0f;
+        for (int v = 0; v < 3; v++) {   /* native px from the picture's centre -> NDC (y up) */
+            /* grown 1 native px from its centre: the drawn piece sits up to
+             * half a pixel off (the rasteriser's sample grid), which left a
+             * lit sliver at one edge */
+            float x = e[8 + 2 * v], y = e[9 + 2 * v];
+            const float dx = x - cx, dy = y - cy, dl = sqrtf(dx * dx + dy * dy);
+            if (dl > 1e-3f) { x += dx / dl; y += dy / dl; }
+            s_unc_buf[n * 6 + 2 * v] = 2.0f * (x - s_sc_cx) * k / (float)lw;
+            s_unc_buf[n * 6 + 2 * v + 1] = -2.0f * (y - s_sc_cy) * k / (float)lh;
+        }
+        n++;
+    }
+    s_unc_last = n;
+    if (!n) return;
+    if (!s_unc_prog) {
+        s_unc_prog = build_program(
+            "#version 330\nlayout(location = 0) in vec2 a_p;\nvoid main(){ gl_Position = vec4(a_p, 0.0, 1.0); }\n",
+            "#version 330\nout vec4 o;\nvoid main(){ o = vec4(0.0); }\n");
+        if (!s_unc_prog) return;
+        p_glGenVertexArrays(1, &s_unc_vao);
+        p_glGenBuffers(1, &s_unc_vbo);
+        p_glBindVertexArray(s_unc_vao);
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_unc_vbo);
+        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
+        p_glEnableVertexAttribArray(0);
+    }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_mask_fbo);
+    glViewport(0, 0, lw, lh);
+    glColorMask(GL_FALSE, GL_FALSE, GL_TRUE, GL_FALSE);   /* the cover mark only */
+    p_glUseProgram(s_unc_prog);
+    p_glBindVertexArray(s_unc_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_unc_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * 6 * sizeof(float)), s_unc_buf, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, n * 3);
+    p_glBindVertexArray(0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
 /* Window-sized mask from the presented surface's marks (fresh) or the last. */
 static int pfx_mask_build(int fresh, int lw, int lh) {
     if (!s_mask_prog) {
@@ -596,6 +663,7 @@ static int pfx_mask_build(int fresh, int lw, int lh) {
             const int c0 = (int)lrintf(s_mask_ctr_x0 * (float)lw), c1 = (int)lrintf(s_mask_ctr_x1 * (float)lw);
             if (c1 > c0) pfx_mask_map(1, s_mask_ctr, c0, c1, lh);
         }
+        pfx_mask_uncover(lw, lh);
         s_mask_ok = 1;
     }
     return s_mask_ok;
@@ -1819,8 +1887,9 @@ age:
 int gl_renderer_lights_json(char *out, int cap) {
     GL_RT_SYNC("lights_json");
     const ScSlot *sc = sc_presented();
-    int k = snprintf(out, (size_t)cap, "\"glow_pieces\":[%u,%u,%u],\"glow_now\":%d,\"points_now\":%d,\"tris_now\":%d,\"lights\":[",
-                     s_emit_seen[0], s_emit_seen[1], s_emit_seen[2], sc ? sc->en : -1, sc ? sc->npts : -1, sc ? sc->n : -1);
+    int k = snprintf(out, (size_t)cap, "\"glow_pieces\":[%u,%u,%u],\"glow_now\":%d,\"points_now\":%d,\"tris_now\":%d,\"uncovered\":%d,\"lights\":[",
+                     s_emit_seen[0], s_emit_seen[1], s_emit_seen[2], sc ? sc->en : -1, sc ? sc->npts : -1, sc ? sc->n : -1,
+                     s_unc_last);
     for (int i = 0; i < s_lit_n && k < cap - 160; i++) {
         const PfxLight *L = &s_lit[i];
         k += snprintf(out + k, (size_t)(cap - k), "%s{\"world\":[%.0f,%.0f,%.0f],\"screen\":[%.1f,%.1f],\"z\":%.0f,\"size\":%.0f,\"after\":%.0f,\"rgb\":[%.2f,%.2f,%.2f],\"hits\":%u,\"active\":%d}",

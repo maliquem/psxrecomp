@@ -811,6 +811,7 @@ static float   s_pz[3];
 static int     s_sc_on = 0;
 static int     s_sun_on = 0;   /* of those, a chain reads the sun's shadow map (`shadow`, `sprshadow`) */
 static float   s_sc_cx = 160.0f, s_sc_cy = 120.0f;   /* displayed picture centre, VRAM px */
+static float   s_sc_nh = 240.0f;                     /* and its height, native px */
 enum { SC_SLOTS = 4, SC_MAX_TRIS = 65536, SC_V = 11 };
 /* A camera: V = R W + T, screen = of + h V.xy / V.z. */
 typedef struct { float r[9], t[3], of[2], h; } ScCam;
@@ -823,13 +824,15 @@ enum { SC_ANC_MAX = 64 };
 /* atl: the cut-outs of the frame's sprite pieces (1 = drawn texel), copied from
  * VRAM as each piece was drawn (the game may load the next animation's pieces
  * before the picture is shown), packed in rows of SC_ATL x SC_ATL. */
-enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 8 };
+enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 15 };
 typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
                  float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
                  float *sb;   /* per 2D triangle: VRAM y below its lowest drawn texel row, -1e30 = none known */
                  uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky, atl_klo, atl_khi;
                  float *ev; int en, ecap;   /* glowing pieces (light sources): x, y (VRAM px), SZ (0 = none), area,
-                                               3D triangles drawn before it, colour (rgb, 1 = full) */
+                                               3D triangles drawn before it, colour (rgb, 1 = full), its
+                                               corners (x, y VRAM px x 3), the share of the colour it adds
+                                               (1, mode 3: 0.25) */
                  float pts[SC_PTS_MAX][3]; int npts;   /* the points projected with the camera (view space) */
                } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
@@ -965,7 +968,8 @@ static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth
  * the real frames (their pieces, foot points, lights), so its draws leave them
  * alone. Restarting a shown slot there took the next real frame's foot points
  * and left the real frame's picture without its sprites' shadows. */
-static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int *ys, const float *rgb) {
+static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int *ys, const float *rgb,
+                        float share) {
     if (!s_sc_on || s_fg_drawing) return;   /* needs the 3D triangles counted (sl->n) */
     s_emit_seen[!s_pz_valid ? 2 : s_pc_valid ? 0 : 1]++;
     const int area[4] = {x1, y1, x2, y2};
@@ -991,6 +995,8 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
     e[3] = 0.5f * fabsf((px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0]));
     e[4] = (float)sl->n;
     e[5] = rgb[0]; e[6] = rgb[1]; e[7] = rgb[2];
+    for (int i = 0; i < 3; i++) { e[8 + 2 * i] = px[i]; e[9 + 2 * i] = py[i]; }
+    e[14] = share;
     sl->en++;
     sl->use = ++s_sc_use;
 }
@@ -2647,13 +2653,19 @@ static const char *GEO_FS =
     "noperspective in vec4 v_col; smooth in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;   /* mask pass (gl_postfx.inc): 0 off, 2 clear, 1 mark glow, 3 mark 3D, 4 mark see-through */\n"
-    "uniform int u_badd;   /* this batch blends additively */\n"
+    "uniform int u_badd;   /* this batch blends additively: 1 adds its colour (mode 1), 4 a quarter (mode 3) */\n"
     "uniform int u_baddonly; /* 1: only additive primitives feed the bloom; 2: only additive 3D ones */\n"
     "noperspective in vec2 v_npos; flat in int v_dith;\n"
     PSX_DITHER_GLSL
     "void main(){\n"
     "  if (u_bcls != 0) { if (u_bcls == 1 && !((u_baddonly == 0 && v_b3d > 0.999) || (u_badd != 0 && (u_baddonly != 2 || v_b3d > 0.999)))) discard;\n"
-    "    if (u_bcls == 3 && v_b3d <= 0.999) discard; frag = vec4(0.0); return; }\n"
+    "    if (u_bcls == 3 && v_b3d <= 0.999) discard;\n"
+    "    if (u_bcls == 4 && u_badd != 0 && v_b3d > 0.999) {   /* a 3D piece adding a little grey light: lit with the scenery */\n"
+    "      vec3 add = (v_cp != 0 ? v_col_p : v_col.rgb) / float(u_badd);\n"
+    "      float mx = max(add.r, max(add.g, add.b)), mn = min(add.r, min(add.g, add.b));\n"
+    "      if (mx < 0.4 && mx - mn < 0.5 * mx) discard;\n"
+    "    }\n"
+    "    frag = vec4(0.0); return; }\n"
     "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\n"
     "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\n";
 
@@ -2981,6 +2993,15 @@ static const char *TEX_FS =
     "    if (u_bcls == 3 && v_b3d <= 0.999) discard;            /* 3D mask: 3D texels only */\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
     "    if (u_bcls == 4 && !(v_semi != 0 && stp == 1)) discard; /* see-through cover: those texels only */\n"
+    "    if (u_bcls == 4 && (v_semi == 2 || v_semi == 4) && v_b3d > 0.999) {\n"
+    "      /* a 3D piece adding a little grey light (dust, smoke: BoF4's running\n"
+    "       * dust adds ~0.3 of each; a fire is orange) is lit with the scenery\n"
+    "       * under it, not left as a light */\n"
+    "      vec3 add = v_raw == 0 ? clamp(rgb * (v_cp != 0 ? v_col_p : v_col.rgb) * 2.0, 0.0, 1.0) : rgb;\n"
+    "      if (v_semi == 4) add *= 0.25;\n"
+    "      float mx = max(add.r, max(add.g, add.b)), mn = min(add.r, min(add.g, add.b));\n"
+    "      if (mx < 0.4 && mx - mn < 0.5 * mx) discard;\n"
+    "    }\n"
     "    frag = vec4(0.0); blend_factor = vec4(0.0); return;\n"
     "  }\n"
     "  if (u_semipass == 1 && stp == 1) discard;\n"
@@ -4529,6 +4550,9 @@ static int b3dm_passes(int semi, int b3d) {
     if (b3d == 0) return BCLS_CLEAR;
     return BCLS_CLEAR | BCLS_SET;
 }
+/* GEO_FS u_badd for blend `semi`: 1 adds the colour (mode 1), 4 a quarter of
+ * it (mode 3), 0 not additive. */
+#define BCLS_ADD(semi) ((semi) == 1 ? 1 : (semi) == 3 ? 4 : 0)
 /* DRAW (an untextured draw set up with blend `semi`, mask_stencil_ex(mask,
  * check) and PGXP depth mode `dmode`; b3d as above), then (mask on) its
  * marking passes. GEO semi modes 1 and 3 add. A semi-transparent primitive
@@ -4539,14 +4563,15 @@ static int b3dm_passes(int semi, int b3d) {
         if ((s_bcls_on || s_b3d_on) && (dmode) != 2 && (!s_fg_drawing || s_fg_marks)) { \
             if (s_bcls_on) {                                                  \
                 const int bcls_p_ = bcls_passes((semi), (b3d) == 2 ? 0 : (b3d)); \
-                bcls_begin(0, (semi) == 1 || (semi) == 3, 0x02);              \
+                bcls_begin(0, BCLS_ADD(semi), 0x02);                          \
                 if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
                 if (bcls_p_ & BCLS_SET)   { bcls_pass(0, 1); DRAW; }          \
             }                                                                 \
             if (s_b3d_on) {                                                   \
                 const int b3dm_p_ = b3dm_passes((semi), (b3d));               \
-                /* opaque: its passes also clear the cover bit */             \
-                bcls_begin(0, 0, (semi) < 0 ? 0x0C : 0x04);                   \
+                /* opaque: its passes also clear the cover bit; the cover     \
+                 * pass reads u_badd (a dim additive 3D piece: no cover) */   \
+                bcls_begin(0, BCLS_ADD(semi), (semi) < 0 ? 0x0C : 0x04);      \
                 if (b3dm_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }          \
                 if (b3dm_p_ & BCLS_SET)   { bcls_pass(0, (b3d) == 2 ? 5 : 3); DRAW; } \
                 if ((semi) >= 0) { glStencilMask(0x08); bcls_pass(0, 4); DRAW; } \
@@ -5577,7 +5602,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     if (n == 3 && (semi == 1 || semi == 3) && s_sc_on) {
         float rgb[3];
         emit_flat_rgb(cs, rgb);
-        sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb);
+        sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f);
     }
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
     const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d() ? 1
@@ -5736,7 +5761,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if ((semi == 1 || semi == 3) && s_sc_on) {
             float rgb[3];
             emit_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, rgb);
-            sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb);
+            sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f);
         }
         if (tdmode) {
             depth_before_tri();
@@ -11230,6 +11255,7 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
                             src_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
         postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
         s_sc_cx = (float)disp_x + (float)w * 0.5f; s_sc_cy = (float)disp_y + (float)h * 0.5f;
+        s_sc_nh = (float)h;
     }
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_VRAM_FBO,
@@ -11407,6 +11433,7 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
                       0, disp_y, g_wide_w, disp_h);
     s_sc_cx = (float)disp_x + (float)(g_wide_w - 2 * g_wide_off) * 0.5f;
     s_sc_cy = (float)disp_y + (float)disp_h * 0.5f;
+    s_sc_nh = (float)disp_h;
     if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
         postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
                            present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
