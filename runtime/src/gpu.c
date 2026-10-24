@@ -741,10 +741,18 @@ void gpu_set_overdraw(int x, int y) {
  * title clears it after that routine. 0, 0 = none. */
 static int ws_overdraw_ex = 0, ws_overdraw_ey = 0;
 static unsigned ws_overdraw_extras = 0;   /* times one was asked for (TCP shadow_cache) */
+/* the last extra asked for and when: the polygons it kept reach the GPU when
+ * the game sends its ordering table, after that routine (often a VBlank later) */
+static int ws_overdraw_lx = 0, ws_overdraw_ly = 0;
+static uint32_t ws_overdraw_lframe = 0;
 int gpu_set_overdraw_extra(int x, int y) {
     ws_overdraw_ex = x < 0 ? 0 : x > 256 ? 256 : x;
     ws_overdraw_ey = y < 0 ? 0 : y > 256 ? 256 : y;
-    if (ws_overdraw_ex || ws_overdraw_ey) ws_overdraw_extras++;
+    if (ws_overdraw_ex || ws_overdraw_ey) {
+        ws_overdraw_extras++;
+        ws_overdraw_lx = ws_overdraw_ex; ws_overdraw_ly = ws_overdraw_ey;
+        ws_overdraw_lframe = (uint32_t)s_frame_count;
+    }
     return ws_overdraw_x || ws_overdraw_y;
 }
 int psx_overdraw_x(void) { return ws_overdraw_x; }
@@ -756,6 +764,14 @@ static int ws_od(int axis) {
 }
 int psx_overdraw_axis(int axis) { return ws_od(axis); }
 static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_od(0); }
+/* the band the GPU keeps (draw_area_out_poly): the overdraw and the last extra
+ * asked for in the last few VBlanks */
+static int ws_od_gpu(int axis) {
+    const int base = axis ? ws_overdraw_y : ws_overdraw_x;
+    if (!ws_overdraw_x && !ws_overdraw_y) return base;
+    if ((uint32_t)s_frame_count - ws_overdraw_lframe > 8u) return base;
+    return base + (axis ? ws_overdraw_ly : ws_overdraw_lx);
+}
 
 /* [video.shadow]: while a post-effect chain reads `shadow` (the shadow map of
  * the scenery, gl_postfx.inc), each VBlank hands the renderer the game's
@@ -5638,7 +5654,7 @@ static inline int draw_area_out_poly(const int32_t *vx, const int32_t *vy, int n
     }
     int32_t left, right;
     draw_area_host_x_bounds(&left, &right);
-    const int32_t bx = ws_od(0), by = ws_od(1);
+    const int32_t bx = ws_od_gpu(0), by = ws_od_gpu(1);
     return maxx < left - bx || minx > right + bx
         || maxy < (int32_t)draw_area_top - by || miny > (int32_t)draw_area_bottom + by;
 }
