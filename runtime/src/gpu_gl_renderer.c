@@ -12607,6 +12607,7 @@ static int fg_op_kept(uint16_t op) {
     case RTH_TEX_RECT_SCALED: case RTH_LINE: case RTH_SHADED_LINE: case RTH_AREA:
     case RTH_OFFSET: case RTH_WIDE_VIEW: case RTH_WIDE_TARGET: case RTH_WIDE_DISABLE:
     case RTH_WIDE_CLEAR: case RTH_WIDE_CLEAR_MARGINS: case RTH_PROJ_TRI: case RTH_STATE:
+    case RTH_VRAM_WRITE:
         return 1;
     default:
         return 0;
@@ -13085,6 +13086,13 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
     fg_state_apply(&b->start, (b->start.wide_on && b->start.wide_base == disp[0]) ? gen_wide : 0);
     int pc_pending = 0, drawn = 0; int32_t pc[7];
     int seen_world = 0;
+    /* Texels the frame poked between its draws (gpu.c hides the game's blob
+     * shadow by making one CLUT entry see-through for one draw): poked again
+     * in order, so each draw sees VRAM as the real frame did, then put back
+     * as they are now, newest first. */
+    enum { FG_POKES = 256 };
+    static int32_t pokes[FG_POKES][3];
+    int npoke = 0;
     for (uint32_t r = 0; r < b->n; r++) {
         FgRec h;
         memcpy(&h, b->buf + b->off[r], sizeof h);
@@ -13117,6 +13125,14 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         case RTH_AREA:    glb_set_draw_area(v[0], v[1], v[2], v[3]); break;
         case RTH_OFFSET:  glb_set_draw_offset(v[0], v[1]); break;
         case RTH_STATE:   s_rths_flat_bd = v[0]; s_rths_vp_w = v[1]; s_rths_bg_full = v[2]; break;
+        case RTH_VRAM_WRITE:
+            if (s_vram && npoke < FG_POKES) {
+                pokes[npoke][0] = v[0]; pokes[npoke][1] = v[1];
+                pokes[npoke][2] = s_vram[(v[1] & (VRAM_H - 1)) * VRAM_W + (v[0] & (VRAM_W - 1))];
+                npoke++;
+                glb_vram_write(v[0], v[1], (uint16_t)v[2]);
+            }
+            break;
         case RTH_WIDE_VIEW: glb_wide_set_view(v[0], v[1], v[2], v[3]); break;
         case RTH_WIDE_TARGET:
             flush_flat_batch(); flush_tex_batch();
@@ -13253,6 +13269,10 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
     flush_flat_batch();
     flush_tex_batch();
     hiw_flush_queue();
+    while (npoke > 0) {
+        npoke--;
+        glb_vram_write(pokes[npoke][0], pokes[npoke][1], (uint16_t)pokes[npoke][2]);
+    }
 }
 
 /* The generated image composed like a real present (no hold-last, no
