@@ -13098,6 +13098,16 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
             placed = 1;
         }
     }
+    /* Each view's in-between camera (fg_view_affine, as fg_cam_place moves
+     * its vertices): a redrawn triangle's PGXP depth and perspective weights
+     * are the in-between camera's too. With the source frame's depth, a
+     * turning camera left the depth wrong across the picture (the shadow map
+     * saw the sides too near and too far: dark bands). */
+    float vw_a[FG_MAX_VIEWS][9], vw_b[FG_MAX_VIEWS][3];
+    int vw_ok[FG_MAX_VIEWS] = {0};
+    if (placed == 1)
+        for (uint32_t vi = 0; vi < s_fg_fit.nviews && vi < FG_MAX_VIEWS; vi++)
+            vw_ok[vi] = s_fg_fit.v[vi].ok && fg_view_affine(&s_fg_fit, (int)vi, t, vw_a[vi], vw_b[vi]);
     const float ddx = (float)(b->disp[0]), ddy = (float)(b->disp[1]);
     fg_state_apply(&b->start, (b->start.wide_on && b->start.wide_base == disp[0]) ? gen_wide : 0);
     int pc_pending = 0, drawn = 0; int32_t pc[7];
@@ -13270,6 +13280,23 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
                 for (int k = 0; k < 3; k++) { x[k] = pb->x[k]; y[k] = pb->y[k]; }
             }
             for (int k = 0; k < 3; k++) { x[k] += ddx; y[k] += ddy; }
+            if (placed == 1 && (s_pz_valid || s_pq_valid))
+                for (int k = 0; k < 3; k++) {   /* depth along: as far as the in-between camera sees it */
+                    const FgVert *fv = &s_fg_verts[3 * pi + k];
+                    const float *pn = pb->p[k];
+                    if (pn[2] < 1.0f) continue;
+                    float zt;
+                    if (fv->mode == FG_PLACE_CAMERA && fv->view >= 0 && fv->view < FG_MAX_VIEWS && vw_ok[fv->view]) {
+                        const float *A = vw_a[fv->view];
+                        zt = A[6] * pn[0] + A[7] * pn[1] + A[8] * pn[2] + vw_b[fv->view][2];
+                    } else if (fv->mode == FG_PLACE_OBJECT) {
+                        zt = fv->a[2] + (pn[2] - fv->a[2]) * (float)t;
+                    } else continue;
+                    if (zt < 1.0f) continue;
+                    const float r = zt / pn[2];
+                    if (s_pz_valid) s_pz[k] *= r;
+                    if (s_pq_valid) s_pq[k] /= r;
+                }
             drawn = 1;
             fg_draw_tri_at(h.op, v, pl, x, y);
             precise_consumed();
