@@ -51,6 +51,14 @@ int psx_input_host_action(int action);
  * comes later through the usual notification. 1 when requested. */
 int psx_input_savestate_submit(int slot, int save);
 
+/* The player's save states on (1, the default) or off (0), e.g. a launcher
+ * option. Off refuses the save state menu, its shortcuts and
+ * psx_input_savestate_submit with an OSD note; the title's own slot
+ * (SAVESTATE_QUIT_SLOT, which the title saves and loads itself) and the debug
+ * server still work. A player choice: not reset between sessions. */
+void psx_input_set_player_savestates(int on);
+int psx_input_player_savestates(void);
+
 #ifdef __cplusplus
 }
 #endif

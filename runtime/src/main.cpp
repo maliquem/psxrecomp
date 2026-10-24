@@ -8314,6 +8314,9 @@ static void apply_title_direct_shortcut(const std::string& shortcut,
 
 static int savestate_menu_open = 0;
 static int savestate_menu_slot = 0;
+/* The player's save states (psx_input_set_player_savestates): off refuses the
+ * menu and every slot submit but the title's own SAVESTATE_QUIT_SLOT. */
+static int g_player_savestates = 1;
 static int savestate_menu_ignore_toggle_release = 0;
 /* Set when the menu opens: controller buttons already held then (a shortcut
  * that includes a face button) act only after a release. */
@@ -8341,6 +8344,10 @@ static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
         savestate_menu_close();
         return;
     }
+    if (!g_player_savestates) {
+        host_osd_push("Save states are off", 1500);
+        return;
+    }
     savestate_menu_open = 1;
     savestate_menu_ignore_toggle_release = 1;
     savestate_menu_nav_fresh = 1;
@@ -8358,6 +8365,10 @@ static void savestate_menu_move(int delta) {
 }
 
 static int savestate_submit_slot(int slot, int save) {
+    if (!g_player_savestates && slot != SAVESTATE_QUIT_SLOT) {
+        host_osd_push("Save states are off", 1500);
+        return 0;
+    }
     if (savestate_title_blocked() || !psx_mod_netplay_savestates_supported()) {
         host_osd_push("Save states are unavailable in this game mode", 1800);
         return 0;
@@ -10495,6 +10506,13 @@ extern "C" int psx_input_savestate_submit(int slot, int save) {
     if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
     return savestate_submit_slot(slot, save);
 }
+
+extern "C" void psx_input_set_player_savestates(int on) {
+    g_player_savestates = on ? 1 : 0;
+    if (!g_player_savestates && savestate_menu_open) savestate_menu_close();
+}
+
+extern "C" int psx_input_player_savestates(void) { return g_player_savestates; }
 
 extern "C" void psx_video_current(PsxHostVideoSettings *v) {
     if (!v) return;
