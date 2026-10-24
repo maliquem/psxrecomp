@@ -272,6 +272,103 @@ int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod) {
     return 0;
 }
 
+int host_keymap_get(HostKeymapAction action, int *mods) {
+    if (mods) *mods = 0;
+    if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return 0;
+    if (s_actions[action].count <= 0) return 0;
+    if (mods) *mods = s_actions[action].binds[0].mods;
+    return s_actions[action].binds[0].scancode;
+}
+
+void host_keymap_set(HostKeymapAction action, int scancode, int mods) {
+    if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return;
+    s_actions[action].count = 0;
+    s_actions[action].explicit_unbound = 1;
+    if (scancode <= 0 || scancode >= SDL_NUM_SCANCODES) return;
+#if defined(PSX_SDL3)
+    const int key = (int)SDL_GetKeyFromScancode((SDL_Scancode)scancode, SDL_KMOD_NONE, false);
+#else
+    const int key = (int)SDL_GetKeyFromScancode((SDL_Scancode)scancode);
+#endif
+    add_bind(action, key, scancode, mods & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT));
+    s_actions[action].explicit_unbound = s_actions[action].count == 0;
+}
+
+void host_keymap_reset_defaults(void) {
+    clear_all();
+    apply_defaults();
+}
+
+static const char *const k_action_key[HOST_KEYMAP_ACTION_COUNT] = {
+    "Fullscreen", "Turbo", "VolumeUp", "VolumeDown", "DisplayPerf", "Rewind",
+    "SaveStateMenu", "Scanlines", "TurboToggle", "CaptureMark",
+};
+
+/* "Ctrl+Alt+Name,..." as parse_value reads it; "None" when unbound. */
+static void action_value(const HostKeyAction *a, char *out, size_t cap) {
+    size_t n = 0;
+    out[0] = 0;
+    for (int i = 0; i < a->count && n + 1 < cap; i++) {
+        const HostKeyBind *b = &a->binds[i];
+        n += (size_t)snprintf(out + n, cap - n, "%s%s%s%s%s", i ? "," : "",
+                              (b->mods & KMOD_CTRL) ? "Ctrl+" : "", (b->mods & KMOD_ALT) ? "Alt+" : "",
+                              (b->mods & KMOD_SHIFT) ? "Shift+" : "", SDL_GetKeyName((SDL_Keycode)b->keycode));
+    }
+    if (!out[0]) snprintf(out, cap, "None");
+}
+
+int host_keymap_save(const char *config_ini_path) {
+    if (!config_ini_path || !config_ini_path[0]) return 0;
+    /* the old file, without its [KeyMap] section */
+    char *keep = NULL;
+    size_t keep_n = 0, keep_cap = 0;
+    FILE *f = fopen(config_ini_path, "rb");
+    if (f) {
+        char line[512];
+        int in_keymap = 0;
+        while (fgets(line, sizeof line, f)) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '[') {
+                char name[64];
+                const char *end = strchr(p, ']');
+                size_t len = end ? (size_t)(end - p - 1) : 0;
+                if (len >= sizeof name) len = sizeof name - 1;
+                memcpy(name, p + 1, len);
+                name[len] = 0;
+                in_keymap = ieq(name, "KeyMap");
+            }
+            if (in_keymap) continue;
+            const size_t n = strlen(line);
+            if (keep_n + n + 1 > keep_cap) {
+                keep_cap = (keep_n + n + 1) * 2;
+                char *grown = (char *)realloc(keep, keep_cap);
+                if (!grown) { free(keep); fclose(f); return 0; }
+                keep = grown;
+            }
+            memcpy(keep + keep_n, line, n);
+            keep_n += n;
+        }
+        fclose(f);
+    }
+    f = fopen(config_ini_path, "wb");
+    if (!f) { free(keep); return 0; }
+    if (keep_n) {
+        fwrite(keep, 1, keep_n, f);
+        if (keep[keep_n - 1] != '\n') fputc('\n', f);
+    }
+    free(keep);
+    fprintf(f, "[KeyMap]\n");
+    for (int i = 0; i < HOST_KEYMAP_ACTION_COUNT; i++) {
+        char value[256];
+        action_value(&s_actions[i], value, sizeof value);
+        fprintf(f, "%s = %s\n", k_action_key[i], value);
+    }
+    const int ok = !ferror(f);
+    fclose(f);
+    return ok;
+}
+
 /* Rewind overlay FONT8 only draws ASCII 32..90 (space..Z); lowercase is
  * uppercased by the drawer. Map punctuation / odd SDL single-glyph names to
  * short tokens so binds like backtick don't render as "?". */

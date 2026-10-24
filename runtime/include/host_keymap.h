@@ -47,6 +47,18 @@ int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod);
  * Returns out, or "F8" / "" on empty action. Always NUL-terminates. */
 const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap);
 
+/* For a title's controls menu (psx_input_config.h): the first binding of
+ * `action` as a scancode and its Ctrl/Alt/Shift mods (*mods may be NULL);
+ * 0 when unbound. */
+int host_keymap_get(HostKeymapAction action, int *mods);
+/* Bind `action` to one key (scancode, mods); scancode 0 = unbound. */
+void host_keymap_set(HostKeymapAction action, int scancode, int mods);
+/* Every action back to its built-in default. */
+void host_keymap_reset_defaults(void);
+/* Write [KeyMap] (every action) into config_ini_path, keeping the file's
+ * other sections and lines. 1 on success. */
+int host_keymap_save(const char *config_ini_path);
+
 #ifdef __cplusplus
 }
 #endif
