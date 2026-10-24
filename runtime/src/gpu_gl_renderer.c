@@ -14505,6 +14505,31 @@ void gl_renderer_frame_gen_costs(uint64_t *generated, uint64_t *measured, uint64
     if (cost_ns) *cost_ns = cost;
 }
 
+int gl_renderer_frame_gen_prims_json(char *out, int cap, int only2d) {
+    GL_RT_SYNC("frame_gen_prims");
+    int k = 0;
+    const int which[2] = { s_fg_older, s_fg_newer };
+    const char *const name[2] = { "older", "newer" };
+    for (int w = 0; w < 2 && k < cap - 256; w++) {
+        const FgList *L = &s_fg_l[which[w]];
+        k += snprintf(out + k, (size_t)(cap - k), "%s\"%s\":{\"valid\":%d,\"n\":%u,\"disp\":[%d,%d,%d,%d],\"prims\":[",
+                      w ? "," : "", name[w], L->valid, L->prims.n,
+                      L->disp[0], L->disp[1], L->disp[2], L->disp[3]);
+        int first = 1;
+        for (uint32_t j = 0; j < L->prims.n && k < cap - 256; j++) {
+            const FgPrim *p = &L->prims.v[j];
+            const int vids = (p->vid[0] ? 1 : 0) | (p->vid[1] ? 2 : 0) | (p->vid[2] ? 4 : 0);
+            if (only2d && vids) continue;
+            k += snprintf(out + k, (size_t)(cap - k), "%s[%u,\"%08x\",\"%08x\",%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
+                          first ? "" : ",", j, p->key, p->view, vids,
+                          p->x[0], p->y[0], p->x[1], p->y[1], p->x[2], p->y[2]);
+            first = 0;
+        }
+        k += snprintf(out + k, (size_t)(cap - k), "]}");
+    }
+    return k;
+}
+
 int gl_renderer_frame_gen_json(char *out, int cap) {
     const double now = fg_now_s();
     const int open = s_fg_brk_init ? fg_breaker_open(&s_fg_brk, now) : 1;

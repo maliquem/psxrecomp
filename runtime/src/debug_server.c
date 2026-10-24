@@ -10910,7 +10910,13 @@ static void handle_render_thread(int id, const char *json)
  *   match counts, breaker. Not a sync point (render-thread counters, racy). */
 static void handle_frame_gen(int id, const char *json)
 {
-    (void)json;
+    const int prims = json_get_int(json, "prims", 0);
+    if (prims) {   /* 1: the 2D triangles only, 2: every triangle */
+        static char pbuf[1 << 20];
+        if (gl_renderer_frame_gen_prims_json(pbuf, (int)sizeof pbuf, prims == 1) <= 0) pbuf[0] = 0;
+        send_fmt("{\"id\":%d,\"ok\":true,%s}", id, pbuf[0] ? pbuf : "\"older\":null");
+        return;
+    }
     char buf[4096];
     if (gl_renderer_frame_gen_json(buf, sizeof buf) <= 0) buf[0] = 0;
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"enabled\":0");

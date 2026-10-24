@@ -508,6 +508,10 @@ int  gl_renderer_frame_generation_method(void);
 typedef enum { GL_FG_HOLD_STEP_DOWN = 0, GL_FG_HOLD_OVER_BUDGET = 1 } GlFgHold;
 void gl_renderer_frame_gen_hold(GlFgHold kind, double secs);
 int  gl_renderer_frame_gen_json(char *out, int cap);
+/* TCP frame_gen {"prims":1}: the older and newer closed lists' triangles
+ * (only those with no projection when only2d): index, key, view, which
+ * corners have a projection (bits), x, y. */
+int  gl_renderer_frame_gen_prims_json(char *out, int cap, int only2d);
 /* Smooth motion's atomically published running totals, for rate readouts. */
 void gl_renderer_frame_gen_counts(uint64_t *generated, uint64_t *real_presents);
 /* Generated frames so far, how many of them were timed, and the timed ones'
