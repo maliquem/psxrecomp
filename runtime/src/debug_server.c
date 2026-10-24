@@ -10917,7 +10917,7 @@ static void handle_frame_gen(int id, const char *json)
         send_fmt("{\"id\":%d,\"ok\":true,%s}", id, pbuf[0] ? pbuf : "\"older\":null");
         return;
     }
-    char buf[4096];
+    static char buf[16384];   /* with the timeline */
     if (gl_renderer_frame_gen_json(buf, sizeof buf) <= 0) buf[0] = 0;
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"enabled\":0");
 }

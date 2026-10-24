@@ -12454,6 +12454,17 @@ static uint64_t  s_fg_t0 = 0, s_fg_step_ns = 0, s_fg_flip_ns = 0;
 /* Any-rate presents: one global grid at the display's refresh (or its
  * panel maximum under VRR), never faster, across game frames. */
 static uint64_t  s_fg_due = 0, s_fg_last_present_ns = 0;
+/* TCP frame_gen "timeline": the last events (0 a real frame swapped, 1 a
+ * generated one, 2 a game frame arrived), their phase and time (rt_now_ns). */
+enum { FG_TL = 64 };
+static uint64_t  s_fg_tl_ns[FG_TL];
+static float     s_fg_tl_ph[FG_TL];
+static uint8_t   s_fg_tl_ty[FG_TL];
+static unsigned  s_fg_tl_n = 0;
+static void fg_tl_note(int type, double phase, uint64_t ns) {
+    const unsigned i = s_fg_tl_n++ % FG_TL;
+    s_fg_tl_ty[i] = (uint8_t)type; s_fg_tl_ph[i] = (float)phase; s_fg_tl_ns[i] = ns;
+}
 static void fg_note_present(uint64_t now) {
     s_fg_last_present_ns = now;
     s_fg_due = fg_next_due(s_fg_due, now, s_fg_step_ns);
@@ -14169,6 +14180,7 @@ static void fg_generate_timed(double t) {
         s_fg_presenting = 1;
         gl_swap_with_osd();
         s_fg_presenting = 0;
+        fg_tl_note(1, t, rt_now_ns());
     }
     s_rth_ov.valid = 0;
     if (ok) { s_fg_generated++; atomic_store(&s_fg_last_gen_ns, rt_now_ns()); }
@@ -14220,6 +14232,7 @@ static void fg_present_real(void) {
     gl_swap_now(0);
     s_fg_real_presents++;
     fg_note_present(rt_now_ns());
+    fg_tl_note(0, 1.0, s_fg_last_present_ns);
 }
 
 /* Present the waiting real frame now (generated frames still due are
@@ -14501,6 +14514,7 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
     s_fg_pa = s_fg_older; s_fg_pb = s_fg_newer;
     s_fg_n = n; s_fg_k = 1;
     s_fg_t0 = arrive_ns;
+    fg_tl_note(2, 0.0, arrive_ns);
     s_fg_flip_ns = (uint64_t)(flip_s * 1e9);
     s_fg_step_ns = (uint64_t)(fg_step_s(flip_s, rhz, n) * 1e9);
     if (s_fg_due < s_fg_t0 || s_fg_due > s_fg_t0 + s_fg_step_ns) s_fg_due = s_fg_t0;
@@ -14656,7 +14670,7 @@ int gl_renderer_frame_gen_prims_json(char *out, int cap, int only2d) {
 int gl_renderer_frame_gen_json(char *out, int cap) {
     const double now = fg_now_s();
     const int open = s_fg_brk_init ? fg_breaker_open(&s_fg_brk, now) : 1;
-    return snprintf(out, (size_t)cap,
+    int k = snprintf(out, (size_t)cap,
         "\"enabled\":%d,\"active\":%d,\"forced\":%d,\"generated\":%llu,\"real\":%llu,"
         "\"flips\":%llu,\"dups\":%llu,\"flushed\":%llu,\"not_planned\":%llu,"
         "\"last_n\":%d,\"slots\":%d,\"flip_vblanks\":%d,\"refresh_hz\":%.1f,"
@@ -14702,6 +14716,17 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
         (unsigned long long)s_fg_np_held, (unsigned long long)s_fg_np_room,
         (unsigned long long)s_fg_end_ahead, (unsigned long long)s_fg_end_bp,
         (unsigned long long)s_fg_end_phase);
+    if (k < 0 || k >= cap - 64) return k;
+    /* oldest first: type, phase, ms after the oldest */
+    const unsigned n = s_fg_tl_n < FG_TL ? s_fg_tl_n : FG_TL, first = s_fg_tl_n - n;
+    k += snprintf(out + k, (size_t)(cap - k), ",\"timeline\":[");
+    for (unsigned i = 0; i < n && k < cap - 48; i++) {
+        const unsigned j = (first + i) % FG_TL;
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%u,%.3f,%.3f]", i ? "," : "", s_fg_tl_ty[j], s_fg_tl_ph[j],
+                      (double)(s_fg_tl_ns[j] - s_fg_tl_ns[first % FG_TL]) * 1e-6);
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "]");
+    return k;
 }
 
 /* ---- the recording vtable ------------------------------------------------ */
