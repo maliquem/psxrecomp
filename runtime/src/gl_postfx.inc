@@ -572,6 +572,11 @@ static int pfx_depth_build(int fresh, int lw, int lh) {
  * sprites. */
 enum { UNC_MAX = 1024 };
 #define UNC_DIM 0.4f
+/* a glowing piece that is dim and grey (dust, smoke), not a light */
+static int emit_dim_grey(const float *e) {
+    const float mx = fmaxf(e[5], fmaxf(e[6], e[7])), mn = fminf(e[5], fminf(e[6], e[7]));
+    return mx * e[14] < UNC_DIM && mx - mn < 0.5f * mx;
+}
 static GLuint s_unc_prog = 0, s_unc_vao = 0, s_unc_vbo = 0;
 static float  s_unc_buf[UNC_MAX * 6];
 static int    s_unc_last = 0;   /* TCP shadow_cache "uncovered": the last mask's pieces */
@@ -583,8 +588,7 @@ static void pfx_mask_uncover(int lw, int lh) {
     int n = 0;
     for (int i = 0; i < sc->en && n < UNC_MAX; i++) {
         const float *e = sc->ev + (size_t)i * SC_EV;
-        const float mx = fmaxf(e[5], fmaxf(e[6], e[7])), mn = fminf(e[5], fminf(e[6], e[7]));
-        if (mx * e[14] >= UNC_DIM || mx - mn >= 0.5f * mx) continue;      /* a light */
+        if (!emit_dim_grey(e)) continue;                                     /* a light */
         if ((float)sc->n - e[4] < after_min) continue;                      /* over the scene */
         const float cx = (e[8] + e[10] + e[12]) / 3.0f, cy = (e[9] + e[11] + e[13]) / 3.0f;
         for (int v = 0; v < 3; v++) {   /* native px from the picture's centre -> NDC (y up) */
@@ -1808,6 +1812,9 @@ static void pfx_lights_update(void) {
              * party member standing behind the leader by drawing it additive
              * in black, which lit the field round them after a battle */
             if (fmaxf(e[5], fmaxf(e[6], e[7])) < LIT_DARK) continue;
+            /* nor does a dim grey one (dust, smoke: emit_dim_grey), however
+             * long it stays (a party member running on the spot) */
+            if (emit_dim_grey(e)) continue;
             const float x = e[0] - s_sc_cx, y = e[1] - s_sc_cy, z = e[2], a = fmaxf(e[3], 1.0f);
             int k = 0;
             for (; k < ng; k++) {
