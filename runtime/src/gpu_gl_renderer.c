@@ -12385,6 +12385,7 @@ typedef struct {
     FgState   start;                           /* draw state at the list start */
     int       valid, wide, disp[4];            /* closed: display rect it shows */
     int       wide_w, wide_off, scale, linear, force43;
+    uint64_t  vseq0;                           /* the VRAM upload log's number at its start */
 } FgList;
 static int rp_is_car(const FgList *L, uint32_t pi);
 /* Raw triangle captured while recording a list (absolute coords). */
@@ -12397,6 +12398,21 @@ static _Atomic int s_fg_late = 0;             /* emulation thread: a late frame 
 static const char *_Atomic s_fg_hold_reason = NULL;
 static _Atomic uint64_t s_fg_hold_until = 0;  /* rt_now_ns: no generation before */
 static FgList    s_fg_l[4];                   /* older, newer, capturing, spare */
+/* The uploads to VRAM (RTH_XFER_IN) while generation is on, each with the
+ * texels it overwrote, so a redraw samples its textures as its own frame
+ * did: the game uploads each frame's sprite poses over the last ones, and
+ * the next frame's drawing (its uploads too) goes on while the in-between
+ * frames run. Read with VRAM as it is now, a redrawn sprite showed another
+ * pose's texels in its pieces (sprites in shreds). fg_replay takes VRAM back
+ * to its list's start, makes the list's own uploads in order, then puts back
+ * what is there now. Oldest entries go first past VLOG_N or VLOG_BYTES. */
+enum { VLOG_N = 1024 };
+#define VLOG_BYTES (16u << 20)
+typedef struct { int x, y, w, h; uint64_t seq; uint16_t *old; } VLogEnt;
+static VLogEnt   s_vlog[VLOG_N];
+static uint64_t  s_vlog_seq = 0, s_vlog_first = 0;   /* next upload's number, oldest still logged */
+static size_t    s_vlog_bytes = 0;
+static uint64_t  s_vlog_rewinds = 0, s_vlog_missed = 0;   /* TCP frame_gen */
 static int       s_fg_older = 0, s_fg_newer = 1, s_fg_cur = 2;
 static int       s_fg_pa = -1, s_fg_pb = -1;  /* the pair a schedule draws from */
 static FgRaw    *s_fg_raw = NULL; static uint32_t s_fg_nraw = 0, s_fg_rawcap = 0;
@@ -12623,7 +12639,7 @@ static int fg_op_kept(uint16_t op) {
     case RTH_TEX_RECT_SCALED: case RTH_LINE: case RTH_SHADED_LINE: case RTH_AREA:
     case RTH_OFFSET: case RTH_WIDE_VIEW: case RTH_WIDE_TARGET: case RTH_WIDE_DISABLE:
     case RTH_WIDE_CLEAR: case RTH_WIDE_CLEAR_MARGINS: case RTH_PROJ_TRI: case RTH_STATE:
-    case RTH_VRAM_WRITE:
+    case RTH_VRAM_WRITE: case RTH_XFER_IN:
         return 1;
     default:
         return 0;
@@ -12779,8 +12795,80 @@ static void fg_rotate(void) {
     fg_list_open();
 }
 
+static void vlog_drop_oldest(void) {
+    VLogEnt *e = &s_vlog[s_vlog_first % VLOG_N];
+    s_vlog_bytes -= (size_t)e->w * (size_t)e->h * sizeof(uint16_t);
+    free(e->old); e->old = NULL;
+    s_vlog_first++;
+}
+/* An upload about to be made (its record, before it executes): the texels
+ * it overwrites. One that cannot be kept ends what can be taken back, and so
+ * does a big one (a save state's whole VRAM: taking it back rebuilt every
+ * surface, 50+ ms, for a list from before the load). */
+#define VLOG_MAX_TEXELS (128u * 1024u)
+static void vlog_note(const int32_t *v) {
+    const int w = v[2], h = v[3];
+    const size_t n = (w > 0 && h > 0 && w <= VRAM_W && h <= VRAM_H) ? (size_t)w * (size_t)h : 0;
+    uint16_t *old = n && s_vram && n <= VLOG_MAX_TEXELS ? (uint16_t *)malloc(n * sizeof(uint16_t)) : NULL;
+    if (!old) {
+        while (s_vlog_first < s_vlog_seq) vlog_drop_oldest();
+        s_vlog_first = ++s_vlog_seq;
+        return;
+    }
+    while (s_vlog_first < s_vlog_seq &&
+           (s_vlog_seq - s_vlog_first >= VLOG_N || s_vlog_bytes + n * sizeof(uint16_t) > VLOG_BYTES))
+        vlog_drop_oldest();
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            old[(size_t)j * (size_t)w + (size_t)i] =
+                s_vram[(size_t)((v[1] + j) & (VRAM_H - 1)) * VRAM_W + (size_t)((v[0] + i) & (VRAM_W - 1))];
+    VLogEnt *e = &s_vlog[s_vlog_seq % VLOG_N];
+    e->x = v[0]; e->y = v[1]; e->w = w; e->h = h; e->seq = s_vlog_seq; e->old = old;
+    s_vlog_bytes += n * sizeof(uint16_t);
+    s_vlog_seq++;
+}
+/* VRAM back to list l's start (fg_replay): every upload since, newest first,
+ * undone; what is there now is kept in *cur (one buffer per upload) for
+ * vlog_restore. 0: the log does not reach back that far (VRAM stays). */
+static int vlog_rewind(const FgList *l, uint16_t ***cur, uint64_t *from) {
+    *cur = NULL; *from = l->vseq0;
+    if (l->vseq0 < s_vlog_first || l->vseq0 > s_vlog_seq) { s_vlog_missed++; return 0; }
+    const uint64_t n = s_vlog_seq - l->vseq0;
+    if (!n) return 1;
+    uint16_t **keep = (uint16_t **)calloc((size_t)n, sizeof *keep);
+    if (!keep) { s_vlog_missed++; return 0; }
+    for (uint64_t s = l->vseq0; s < s_vlog_seq; s++) {
+        const VLogEnt *e = &s_vlog[s % VLOG_N];
+        uint16_t *k = (uint16_t *)malloc((size_t)e->w * (size_t)e->h * sizeof(uint16_t));
+        if (!k) { for (uint64_t q = 0; q < s - l->vseq0; q++) free(keep[q]); free(keep); s_vlog_missed++; return 0; }
+        for (int j = 0; j < e->h; j++)
+            for (int i = 0; i < e->w; i++)
+                k[(size_t)j * (size_t)e->w + (size_t)i] =
+                    s_vram[(size_t)((e->y + j) & (VRAM_H - 1)) * VRAM_W + (size_t)((e->x + i) & (VRAM_W - 1))];
+        keep[s - l->vseq0] = k;
+    }
+    for (uint64_t s = s_vlog_seq; s-- > l->vseq0;) {
+        const VLogEnt *e = &s_vlog[s % VLOG_N];
+        glb_vram_transfer_in(e->x, e->y, e->w, e->h, e->old);
+    }
+    *cur = keep;
+    s_vlog_rewinds++;
+    return 1;
+}
+/* What vlog_rewind kept, put back (VRAM as it is now). */
+static void vlog_restore(uint16_t **cur, uint64_t from) {
+    if (!cur) return;
+    for (uint64_t s = from; s < s_vlog_seq; s++) {
+        const VLogEnt *e = &s_vlog[s % VLOG_N];
+        glb_vram_transfer_in(e->x, e->y, e->w, e->h, cur[s - from]);
+        free(cur[s - from]);
+    }
+    free(cur);
+}
+
 /* Called for every replayed record (gl_rth_exec), before it executes. */
 static void fg_capture(const RtCmd *c, const void *payload) {
+    if (c->op == RTH_XFER_IN) vlog_note((const int32_t *)payload);
     if (c->op == RTH_FG_SRC) {
         memcpy(s_fg_src, payload, sizeof s_fg_src);
         s_fg_src_valid = 1;
@@ -12894,6 +12982,7 @@ static void fg_list_close(FgList *l, const int disp[4]) {
 static void fg_list_open(void) {
     FgList *l = &s_fg_l[s_fg_cur];
     fg_list_clear(l);
+    l->vseq0 = s_vlog_seq;
     fg_state_capture(&l->start);
     s_fg_nraw = 0;
     s_fg_pc_valid = 0;
@@ -13164,6 +13253,9 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
     if (placed == 1)
         for (uint32_t vi = 0; vi < s_fg_fit.nviews && vi < FG_MAX_VIEWS; vi++)
             vw_ok[vi] = s_fg_fit.v[vi].ok && fg_view_affine(&s_fg_fit, (int)vi, t, vw_a[vi], vw_b[vi]);
+    /* VRAM as at the list's start (its textures as its frame had them). */
+    uint16_t **vcur = NULL; uint64_t vfrom = 0;
+    const int vrew = vlog_rewind(b, &vcur, &vfrom);
     const float ddx = (float)(b->disp[0]), ddy = (float)(b->disp[1]);
     fg_state_apply(&b->start, (b->start.wide_on && b->start.wide_base == disp[0]) ? gen_wide : 0);
     int pc_pending = 0, drawn = 0; int32_t pc[7];
@@ -13207,6 +13299,9 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         case RTH_AREA:    glb_set_draw_area(v[0], v[1], v[2], v[3]); break;
         case RTH_OFFSET:  glb_set_draw_offset(v[0], v[1]); break;
         case RTH_STATE:   s_rths_flat_bd = v[0]; s_rths_vp_w = v[1]; s_rths_bg_full = v[2]; break;
+        case RTH_XFER_IN:   /* the list's own uploads, in order (VRAM rewound to its start) */
+            if (vrew) glb_vram_transfer_in(v[0], v[1], v[2], v[3], (const uint16_t *)(v + 4));
+            break;
         case RTH_VRAM_WRITE:
             if (s_vram && npoke < FG_POKES) {
                 pokes[npoke][0] = v[0]; pokes[npoke][1] = v[1];
@@ -13372,6 +13467,8 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         npoke--;
         glb_vram_write(pokes[npoke][0], pokes[npoke][1], (uint16_t)pokes[npoke][2]);
     }
+    vlog_restore(vcur, vfrom);
+    if (vrew) flush_cpu_upload();   /* the chains' reads (sprite cut-outs) see VRAM as it is now */
 }
 
 /* The chains of a generated frame build their inputs from the newer real
@@ -14824,7 +14921,9 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
         k += snprintf(out + k, (size_t)(cap - k), "%s[%u,%.3f,%.3f]", i ? "," : "", s_fg_tl_ty[j], s_fg_tl_ph[j],
                       (double)(s_fg_tl_ns[j] - s_fg_tl_ns[first % FG_TL]) * 1e-6);
     }
-    k += snprintf(out + k, (size_t)(cap - k), "]");
+    k += snprintf(out + k, (size_t)(cap - k), "],\"vlog\":{\"rewinds\":%llu,\"missed\":%llu,\"entries\":%llu,\"bytes\":%llu}",
+                  (unsigned long long)s_vlog_rewinds, (unsigned long long)s_vlog_missed,
+                  (unsigned long long)(s_vlog_seq - s_vlog_first), (unsigned long long)s_vlog_bytes);
     return k;
 }
 
