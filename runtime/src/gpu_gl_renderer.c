@@ -13053,6 +13053,61 @@ static int fg_rect_meets(int x, int y, int w, int h, const int *disp) {
 
 /* Redraw list b at phase t (0 = a's positions, 1 = b's) into the surfaces
  * currently bound as hr / the displayed wide surface. */
+/* The pieces of one sprite move together: rects that touch (2 px) and share
+ * their CLUT and page are one sprite, and take one displacement, their own
+ * when every piece has the same (within a pixel), else none (drawn as the
+ * newer frame has them). Piece by piece, a pose change (the party turning
+ * with the camera) matched some pieces in the older frame and not others:
+ * the head moved and the body stayed, and the sprite came apart. */
+static void fg_rect_groups(const FgList *b) {
+    enum { RG_MAX = 512 };
+    static int pi_of[RG_MAX], par[RG_MAX], box[RG_MAX][4], key[RG_MAX][2];
+    static float dx[RG_MAX], dy[RG_MAX];
+    int m = 0;
+    for (uint32_t r = 0; r < b->n && m < RG_MAX; r++) {
+        FgRec h;
+        memcpy(&h, b->buf + b->off[r], sizeof h);
+        if (h.op != RTH_TEX_RECT && h.op != RTH_TEX_RECT_SCALED) continue;
+        const int pi = b->rec2prim ? b->rec2prim[r] : -1;
+        if (pi < 0) continue;
+        const int32_t *v = (const int32_t *)(b->buf + b->off[r] + sizeof h);
+        const int ci = h.op == RTH_TEX_RECT ? 6 : 8;
+        pi_of[m] = pi; par[m] = m;
+        box[m][0] = v[0]; box[m][1] = v[1]; box[m][2] = v[0] + v[2]; box[m][3] = v[1] + v[3];
+        key[m][0] = v[ci] | (v[ci + 1] << 16); key[m][1] = v[ci + 2];
+        dx[m] = s_fg_px[3 * pi] - b->prims.v[pi].x[0];
+        dy[m] = s_fg_py[3 * pi] - b->prims.v[pi].y[0];
+        m++;
+    }
+    for (int i = 0; i < m; i++)
+        for (int j = i + 1; j < m; j++) {
+            if (key[i][0] != key[j][0] || key[i][1] != key[j][1]) continue;
+            if (box[j][0] > box[i][2] + 2 || box[j][2] < box[i][0] - 2 ||
+                box[j][1] > box[i][3] + 2 || box[j][3] < box[i][1] - 2) continue;
+            int ri = i, rj = j;
+            while (par[ri] != ri) ri = par[ri];
+            while (par[rj] != rj) rj = par[rj];
+            if (ri != rj) par[ri > rj ? ri : rj] = ri < rj ? ri : rj;
+        }
+    for (int i = 0; i < m; i++) {
+        int ri = i;
+        while (par[ri] != ri) ri = par[ri];
+        par[i] = ri;
+    }
+    for (int g = 0; g < m; g++) {
+        if (par[g] != g) continue;
+        int agree = 1;
+        for (int i = g + 1; i < m && agree; i++)
+            if (par[i] == g && (fabsf(dx[i] - dx[g]) > 1.0f || fabsf(dy[i] - dy[g]) > 1.0f)) agree = 0;
+        const float gx = agree ? dx[g] : 0.0f, gy = agree ? dy[g] : 0.0f;
+        for (int i = g; i < m; i++) {
+            if (par[i] != g) continue;
+            const FgPrim *p = &b->prims.v[pi_of[i]];
+            for (int k = 0; k < 3; k++) { s_fg_px[3 * pi_of[i] + k] = p->x[k] + gx; s_fg_py[3 * pi_of[i] + k] = p->y[k] + gy; }
+        }
+    }
+}
+
 static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wide) {
     /* b: the redrawn frame; a: the other one (its HUD motion only). */
     const int *disp = b->disp;
@@ -13095,6 +13150,7 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         if (s_fg_pos_cap >= b->prims.n) {
             fg_cam_place(&b->prims, &s_fg_fit, s_fg_verts, t, s_fg_px, s_fg_py, s_fg_margin);
             if (a) fg_hud_lerp(&b->prims, &a->prims, 1.0 - t, s_fg_px, s_fg_py, 24.0f);
+            fg_rect_groups(b);
             placed = 1;
         }
     }
