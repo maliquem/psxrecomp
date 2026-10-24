@@ -14787,20 +14787,17 @@ static uint64_t fg_tick(void *user, uint64_t now) {
     const uint64_t due = s_fg_due;
     if (now < due) return due;
     if (s_fg_k <= s_fg_n) {
-        /* The phase comes from the host clock: the in-between frame shows
-         * one display interval from now, so any refresh (also one that is no
-         * multiple of the game's 30 Hz) and a late tick both get the camera
-         * where it is when the frame is seen. Past the end of the game
-         * frame the rest are dropped and the real frame goes. */
-        /* Test (PSX_FG_FIXED_PHASE=1, to compare by eye): the plan's phases
-         * k / (n + 1) instead of the clock's, every one of them drawn. Even
-         * steps whatever the frame's arrival jitter; measured (perf_summary,
-         * tools fg_pacing) steadier phase steps and no in-between frame
-         * dropped past the end of the game frame. */
-        static int fixed = -1;
-        if (fixed < 0) { const char *e = getenv("PSX_FG_FIXED_PHASE"); fixed = e && e[0] == '1'; }
-        const double t = fixed ? (double)s_fg_k / (double)(s_fg_n + 1)
-                               : fg_clock_phase(now - s_fg_t0, s_fg_step_ns, s_fg_flip_ns);
+        /* The plan's phases k / (n + 1), every one of them drawn: even steps
+         * whatever the game frame's arrival jitter. Measured against phases
+         * from the host clock (the time since the arrival plus one display
+         * interval, the rest dropped past 0.985): phase steps' spread 0.000-
+         * 0.075 against 0.10-0.15, and the clock's lost the last in-between
+         * frame of many game frames (end_phase); chosen by eye as well.
+         * PSX_FG_CLOCK_PHASE=1 brings the clock's back (to compare). */
+        static int clock = -1;
+        if (clock < 0) { const char *e = getenv("PSX_FG_CLOCK_PHASE"); clock = e && e[0] == '1'; }
+        const double t = clock ? fg_clock_phase(now - s_fg_t0, s_fg_step_ns, s_fg_flip_ns)
+                               : (double)s_fg_k / (double)(s_fg_n + 1);
         if (t > 0.0) {
             fg_generate_timed(t);
             s_fg_k++;

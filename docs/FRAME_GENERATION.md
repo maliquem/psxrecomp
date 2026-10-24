@@ -88,9 +88,15 @@ has measured time to spare.
   touch is restored, so the real stream is unaffected.
 - **Schedule.** With `n` in-between frames per game frame, at the flip the
   real frame is composed and kept (its buffer may be drawn over before it is
-  shown), frames `t = k/(n+1)` are presented `flip/(n+1)` apart, then the
-  kept real frame. Timed work runs from the render-thread core's `tick`
-  hook between records and while idle.
+  shown), frames `t = k/(n+1)` are presented one display interval apart
+  (`fg_next_due`), then the kept real frame. Timed work runs from the
+  render-thread core's `tick` hook between records and while idle. The
+  phases are fixed, all `n` drawn: phases taken from the clock instead (the
+  time since the game frame arrived plus one interval, the rest dropped past
+  0.985; env `PSX_FG_CLOCK_PHASE=1`) stepped unevenly with the arrival jitter
+  and lost the last in-between frame of many game frames (TCP `frame_gen`
+  `end_phase`; a 30 fps game on 120 Hz: phase-step spread 0.10-0.15 against
+  0.000-0.075 fixed).
 - **Latency.** Interpolation shows a real frame after the in-between frames
   that lead to it: up to `n/(n+1)` of a game frame later than without
   generation (R4 at 30 Hz on 120 Hz: 25 ms at n = 3, 17 ms at n = 1).
