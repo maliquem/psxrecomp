@@ -464,10 +464,18 @@ SDL_Scancode psx_keybinds_get_button(int player, int button) {
 
 /* A key drives ONE input per player: clear it from every other primary and
  * alternate slot before it lands, or one press asserts two buttons. */
+/* A D-pad direction and the same left-stick direction may share a key (the
+ * defaults do: the arrows drive both). */
+static int dpad_stick_pair(int a, int b) {
+    if (a > b) { const int t = a; a = b; b = t; }
+    return a >= PSX_KB_UP && a <= PSX_KB_RIGHT && b == a + (PSX_KB_LS_UP - PSX_KB_UP);
+}
+
 static void take_key(int player, int button, int alt, SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return;
     if (player < 1 || player > PSXKB_MAX_PLAYERS) return;
     for (int i = 0; i < PSXKB_N; i++) {
+        if (dpad_stick_pair(i, button)) continue;
         SDL_Scancode *p = (SDL_Scancode *)((char *)&s_binds.player[player - 1] + s_buttons[i].offset);
         SDL_Scancode *a = (SDL_Scancode *)((char *)&s_alt_binds.player[player - 1] + s_buttons[i].offset);
         if (*p == sc && !(i == button && !alt)) *p = SDL_SCANCODE_UNKNOWN;
