@@ -109,6 +109,9 @@ unsigned psx_host_video_restart_bits(const PsxHostVideoSettings *boot,
 /* Runtime side (main.cpp). */
 unsigned psx_video_apply_live(const PsxHostVideoSettings *next);
 void     psx_video_current(PsxHostVideoSettings *out);
+/* Smooth motion (frame generation) on or off, live: on starts the render
+ * thread at the next VBlank when it is not running; saved as apply_live saves. */
+void     psx_video_set_smooth_motion(int on);
 
 /* Replace this process with a fresh copy started with the same arguments
  * (the in-game menu's quick relaunch for restart-only settings). Returns only

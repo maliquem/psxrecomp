@@ -3968,6 +3968,25 @@ extern "C" void psx_video_set_vsync(int on) {
     g_video_vsync = on ? 1 : 0;
     apply_present_cadence();
 }
+
+/* Smooth motion from a mod's menu, live: frame generation needs the render
+ * thread, which otherwise starts only at the first VBlank of a session; asked
+ * here, it starts at the next VBlank (render_thread_vblank, the same path),
+ * with frame generation then on. Off leaves the render thread running and
+ * turns frame generation off. Both are saved like the in-game menu's
+ * (psx_video_apply_live), so the next launch starts that way. */
+extern "C" void psx_video_set_smooth_motion(int on) {
+    PsxHostVideoSettings cur;
+    psx_video_current(&cur);
+    PsxHostVideoSettings next = cur;
+    next.frame_generation = on ? 1 : 0;
+    if (on && !g_render_thread) {
+        g_render_thread = 1;
+        s_render_thread_tried = 0;
+        next.render_thread = 1;
+    }
+    (void)psx_video_apply_live(&next);   /* sets g_frame_generation (the render thread's start reads it) */
+}
 extern "C" int psx_video_get_vsync(void) { return g_video_vsync != 0; }
 extern "C" void psx_video_set_window_size(int w, int h) {
     if (!sdl_window || w < 320 || h < 240) return;
