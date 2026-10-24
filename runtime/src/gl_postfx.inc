@@ -1267,6 +1267,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         s_spr_ss = !(ss && ss[0] < 0.5f);
         if (!s_spr_ss) { s_spr_n = s_spr_nx = 0; }
     }
+    {   /* TCP shadow_cache "presents" */
+        int *D = s_pfx_dbg[s_pfx_dbg_n++ & 31u];
+        D[0] = s_sc_gen_read; D[1] = !sc ? -1 : sc == &s_sc_held ? 9 : (int)(sc - s_sc); D[2] = sc ? sc->area[1] : -1;
+        D[3] = sc ? sc->n : -1; D[4] = sc ? sc->sn : -1; D[5] = sc ? sc->nanc : -1;
+        D[6] = s_spr_n / 3; D[7] = use_world; D[8] = (int)s_sc_cy;
+    }
     const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     int n = 0, nbase_all = 0;
     /* the sprites' own mapping (spr_own): across, up and along their light,

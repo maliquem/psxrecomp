@@ -834,6 +834,11 @@ static unsigned s_sc_use = 0;
 static int      s_spr_on = 0;
 static int      s_spr_ss = 1;      /* the reading pass's u_ss.x: sprite shadows on (off: the game's own blobs stay) */
 static unsigned s_spr_frames = 0, s_spr_last = 0;   /* frames with sprite casters; pieces in the last one */
+/* TCP shadow_cache "presents": the last shadow map builds' inputs (generated,
+ * slot, its area's y, triangles, 2D pieces, foot points, sprite casters,
+ * world used, picture centre y) */
+static int      s_pfx_dbg[32][9];
+static unsigned s_pfx_dbg_n = 0;
 static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foot point, touching one that is, none */
 static int      s_spr_stood[SC_ANC_MAX], s_spr_stood_n = 0;   /* the last build: pieces stood at each foot point */
 static float    s_spr_dbg_anc[SC_ANC_MAX][2];                  /* its foot points (picture px) */
@@ -851,6 +856,7 @@ static unsigned s_fcam_ver = 0;
 /* The scene's static geometry, world space (gl_renderer_shadow_world). */
 static float   *s_wg = NULL;
 static int      s_wg_n = 0, s_wg_cap = 0;
+static void sc_hold(ScSlot *sl);
 static ScSlot *sc_slot(const int area[4], int make) {
     ScSlot *lru = &s_sc[0];
     for (int i = 0; i < SC_SLOTS; i++) {
@@ -858,14 +864,40 @@ static ScSlot *sc_slot(const int area[4], int make) {
         if (s_sc[i].use < lru->use) lru = &s_sc[i];
     }
     if (!make) return NULL;
+    sc_hold(lru);
     memcpy(lru->area, area, sizeof lru->area);
     lru->n = 0; lru->conv = 0; lru->shown = 0; lru->sn = 0; lru->nanc = 0; lru->en = 0; lru->npts = 0;
     lru->atl_x = lru->atl_y = lru->atl_h = 0; lru->atl_key[0] = -1;
     if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
     return lru->cap ? lru : NULL;
 }
+/* Smooth motion: the generated frames that lead up to a real frame read its
+ * slot after that frame was composed, while the next frame's drawing goes on;
+ * it can start over in that same slot before they are all shown, which left
+ * them without the sprites' and part of the scenery's casters (shadows that
+ * blinked). So the shown slot's lists move here when it starts over (buffers
+ * swapped, nothing copied), and the generated frames read them. */
+static ScSlot        s_sc_held;
+static const ScSlot *s_sc_last_shown = NULL;
+static int           s_sc_held_ok = 0, s_sc_gen_read = 0;
+static void sc_hold(ScSlot *sl) {
+    if (!s_fg_on || s_sc_held_ok || sl != s_sc_last_shown) return;
+    if (!s_sc_held.cap) {
+        s_sc_held.v = (float *)malloc(4096 * 3 * SC_V * sizeof(float));
+        if (!s_sc_held.v) return;
+        s_sc_held.cap = 4096;
+    }
+    const ScSlot spare = s_sc_held;
+    s_sc_held = *sl;
+    sl->v = spare.v; sl->cap = spare.cap;
+    sl->sv = spare.sv; sl->sb = spare.sb; sl->scap = spare.scap;
+    sl->atl = spare.atl;
+    sl->ev = spare.ev; sl->ecap = spare.ecap;
+    s_sc_held_ok = 1;
+}
 /* A new frame in this list: it starts over and takes the foot points. */
 static void sc_restart(ScSlot *sl) {
+    sc_hold(sl);
     sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0; sl->en = 0;
     sl->atl_x = sl->atl_y = sl->atl_h = 0; sl->atl_key[0] = -1;
     memcpy(sl->anc, s_anc_pend, (size_t)s_anc_pend_n * sizeof s_anc_pend[0]);
@@ -1083,8 +1115,10 @@ static void sc_area_reset(int x1, int y1, int x2, int y2) {
     ScSlot *sl = sc_slot(area, 0);
     if (sl) sc_restart(sl);
 }
-/* The casters of the picture on screen: the list whose area holds its centre. */
+/* The casters of the picture on screen: the list whose area holds its centre
+ * (a generated frame: the real frame's, held when its slot started over). */
 static const ScSlot *sc_presented(void) {
+    if (s_sc_gen_read && s_sc_held_ok) return &s_sc_held;
     const ScSlot *best = NULL;
     for (int i = 0; i < SC_SLOTS; i++) {
         const ScSlot *sl = &s_sc[i];
@@ -1098,6 +1132,8 @@ static const ScSlot *sc_presented(void) {
 static void sc_mark_shown(void) {
     ScSlot *sl = (ScSlot *)sc_presented();
     if (sl) sl->shown = 1;
+    s_sc_last_shown = sl;
+    s_sc_held_ok = 0;
 }
 /* ---- Shadow caster memory (world space) --------------------------------
  * The PS1 only draws what is on screen, so a shadow map of one frame loses
@@ -1413,6 +1449,17 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
     return k;
 }
+static int pfx_dbg_json(char *out, int cap) {   /* appended to the stats */
+    const int at = (int)strlen(out);
+    int k = snprintf(out + at, (size_t)(cap - at), ",\"presents\":[");
+    for (unsigned i = 0; i < 32u && i < s_pfx_dbg_n; i++) {
+        const int *D = s_pfx_dbg[(s_pfx_dbg_n - 1u - i) & 31u];
+        k += snprintf(out + at + k, (size_t)(cap - at - k), "%s[%d,%d,%d,%d,%d,%d,%d,%d,%d]", i ? "," : "",
+                      D[0], D[1], D[2], D[3], D[4], D[5], D[6], D[7], D[8]);
+    }
+    k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
+    return k;
+}
 int gl_renderer_shadow_wanted(void) { return s_sc_on; }
 int gl_renderer_shadow_sun_wanted(void) { return s_sun_on; }
 /* c: r[9], t[3], of[2], h; NULL = no camera. */
@@ -1501,7 +1548,7 @@ int gl_renderer_shadow_cache_stats(char *out, int cap) {
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
         (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver, s_spr_frames, s_spr_last, s_spr_runs[0], s_spr_runs[1], s_spr_runs[2], s_spr_bent,
         s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
-        scc_log_json(out, cap);
+        scc_log_json(out, cap) + pfx_dbg_json(out, cap);
 }
 /* TCP sprite_dump: the picture on screen's foot points and 2D pieces, on the
  * picture (native px from its centre): pieces as [x0, y0, x1, y1, page x,
@@ -13255,7 +13302,9 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
         }
         s_pfx_src_gen = 1;
     }
+    s_sc_gen_read = 1;   /* the real frame's casters (sc_presented) */
     if (postfx_active()) postfx_present(0, 0, lx, ly, lw, lh);
+    s_sc_gen_read = 0;
     s_pfx_src_gen = 0;
     postfx_pillar_fill(lx, ly, lw, lh);
 }
