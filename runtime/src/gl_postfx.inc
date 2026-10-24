@@ -114,7 +114,7 @@ static GLuint s_dfill_fbo = 0, s_dfill_ctr_fbo = 0;
 static int    s_dfill[4], s_dfill_ctr[4], s_dfill_valid = 0, s_dfill_ctr_valid = 0;
 static float  s_dfill_ctr_x0 = 0.0f, s_dfill_ctr_x1 = 0.0f;
 static GLuint s_dep2_tex = 0, s_dep2_fbo = 0, s_dfill_prog = 0;
-static GLint  s_dfill_uMode = -1, s_dfill_uD = -1;
+static GLint  s_dfill_uMode = -1, s_dfill_uD = -1, s_dfill_uA = -1, s_dfill_uB = -1, s_dfill_uNat = -1, s_dfill_uH = -1;
 static int    s_dep2_w = 0, s_dep2_h = 0;
 static GLuint s_mask_tex = 0, s_mask_fbo = 0, s_mask_prog = 0, s_mask_map_prog = 0;
 static GLint  s_mask_uUv = -1, s_mask_uV = -1;
@@ -400,15 +400,45 @@ static GLuint s_dep_tex = 0, s_dep_fbo = 0;
 static int    s_dep_w = 0, s_dep_h = 0, s_dep_ok = 0;
 /* s_dep_tex's holes (still the clear depth, 1.0) take s_dep2_tex's depth:
  * the holes are marked in s_dep_tex's stencil (a quad at depth 1.0 passes
- * GL_EQUAL there), then a quad writes the other depth where marked. */
+ * GL_EQUAL there), then a quad writes the other depth where marked. With the
+ * in-between camera's map (s_pfx_vx_on, mode 2) a hole pixel takes the point
+ * of the real frame that the in-between camera sees there (found by a few
+ * steps: its depth, to view space, through the map, back on the picture,
+ * moved by what is left), at the in-between camera's depth: the real
+ * frame's depth as it was lit the uncovered strips along the edges wrong
+ * while the camera turned (a seam that blinked). Depth <-> view z as the
+ * chains read it: SZ = 256 / (1 - d) - 256. */
 static void pfx_depth_fill(int lw, int lh) {
     if (!s_dfill_prog) {
         s_dfill_prog = build_program(PRESENT_VS,
             "#version 330\nin vec2 v_uv; out vec4 o; uniform int u_mode; uniform sampler2D u_d;\n"
-            "void main(){ gl_FragDepth = u_mode == 0 ? 1.0 : texelFetch(u_d, ivec2(gl_FragCoord.xy), 0).r; o = vec4(0.0); }\n");
+            "uniform vec3 u_A0, u_A1, u_A2, u_B; uniform vec2 u_nat; uniform float u_H;\n"
+            "vec3 pos_at(vec2 uv, float z) { return vec3((uv - 0.5) * u_nat * z / u_H, z); }\n"
+            "vec3 vx(vec3 p) { return vec3(dot(u_A0, p), dot(u_A1, p), dot(u_A2, p)) + u_B; }\n"
+            "void main(){\n"
+            "  o = vec4(0.0);\n"
+            "  if (u_mode == 0) { gl_FragDepth = 1.0; return; }\n"
+            "  if (u_mode == 1) { gl_FragDepth = texelFetch(u_d, ivec2(gl_FragCoord.xy), 0).r; return; }\n"
+            "  vec2 sz = vec2(textureSize(u_d, 0)), uv = gl_FragCoord.xy / sz, su = uv;\n"
+            "  for (int i = 0; i < 4; i++) {\n"
+            "    float d = textureLod(u_d, su, 0.0).r;\n"
+            "    if (d >= 0.99999) break;\n"
+            "    vec3 g = vx(pos_at(su, 256.0 / (1.0 - d) - 256.0));\n"
+            "    if (g.z < 1.0) break;\n"
+            "    su = clamp(su + uv - (g.xy * u_H / (g.z * u_nat) + 0.5), vec2(0.0), vec2(1.0));\n"
+            "  }\n"
+            "  float d = textureLod(u_d, su, 0.0).r;\n"
+            "  if (d >= 0.99999) { gl_FragDepth = 1.0; return; }\n"
+            "  vec3 g = vx(pos_at(su, 256.0 / (1.0 - d) - 256.0));\n"
+            "  gl_FragDepth = g.z < 1.0 ? d : 1.0 - 256.0 / (g.z + 256.0);\n"
+            "}\n");
         if (!s_dfill_prog) return;
         s_dfill_uMode = p_glGetUniformLocation(s_dfill_prog, "u_mode");
         s_dfill_uD = p_glGetUniformLocation(s_dfill_prog, "u_d");
+        s_dfill_uA = p_glGetUniformLocation(s_dfill_prog, "u_A0");   /* u_A1, u_A2 follow by name */
+        s_dfill_uB = p_glGetUniformLocation(s_dfill_prog, "u_B");
+        s_dfill_uNat = p_glGetUniformLocation(s_dfill_prog, "u_nat");
+        s_dfill_uH = p_glGetUniformLocation(s_dfill_prog, "u_H");
     }
     if (s_dep2_w != lw || s_dep2_h != lh) {
         if (!s_dep2_tex) glGenTextures(1, &s_dep2_tex);
@@ -460,8 +490,18 @@ static void pfx_depth_fill(int lw, int lh) {
     glStencilFunc(GL_ALWAYS, 1, 0xFF);
     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    /* the real frame's depth there */
-    p_glUniform1i(s_dfill_uMode, 1);
+    /* the real frame's depth there (at the in-between camera's, mode 2) */
+    const int remap = s_pfx_vx_on && s_cam_h > 0.0f;
+    p_glUniform1i(s_dfill_uMode, remap ? 2 : 1);
+    if (remap) {
+        static const char *const an[3] = {"u_A0", "u_A1", "u_A2"};
+        for (int r = 0; r < 3; r++)
+            p_glUniform3f(r ? p_glGetUniformLocation(s_dfill_prog, an[r]) : s_dfill_uA,
+                          s_pfx_vx_a[3 * r], s_pfx_vx_a[3 * r + 1], s_pfx_vx_a[3 * r + 2]);
+        p_glUniform3f(s_dfill_uB, s_pfx_vx_b[0], s_pfx_vx_b[1], s_pfx_vx_b[2]);
+        p_glUniform2f(s_dfill_uNat, 240.0f * (float)lw / (float)lh, 240.0f);
+        p_glUniform1f(s_dfill_uH, s_cam_h);
+    }
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_dep2_tex);
     p_glUniform1i(s_dfill_uD, 0);

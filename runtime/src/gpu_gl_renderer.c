@@ -13563,7 +13563,20 @@ static void fg_strip_copy(GLuint src, GLuint dst, int sx, int sy, int sx0, int s
  * to the picture's: the redrawn list's motion at its phase tl (fg_view_affine,
  * GTE camera space), after the older list's camera when that list is the one
  * redrawn; then y up. 0: no fit for the main view. */
+static int fg_newer_to_between(double tl, float A[9], float b[3]);
 static int fg_effects_view(double tl, float A[9], float b[3]) {
+    float G[9], g[3];
+    if (!fg_newer_to_between(tl, G, g)) return 0;
+    static const float s[3] = {1.0f, -1.0f, 1.0f};
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) A[3 * r + c] = G[3 * r + c] * s[r] * s[c];
+        b[r] = g[r] * s[r];
+    }
+    return 1;
+}
+/* The main view's map from the newer real frame's camera space to the
+ * in-between camera's (GTE: y down): P' = A P + b. */
+static int fg_newer_to_between(double tl, float A[9], float b[3]) {
     const int vi = (int)fg_main_view(&s_fg_fit);
     float At[9], bt[3], G[9], g[3];
     if (!s_fg_fit.ok || !s_fg_fit.v[vi].ok || !fg_view_affine(&s_fg_fit, vi, tl, At, bt)) return 0;
@@ -13579,11 +13592,7 @@ static int fg_effects_view(double tl, float A[9], float b[3]) {
     } else {
         memcpy(G, At, sizeof G); memcpy(g, bt, sizeof g);
     }
-    static const float s[3] = {1.0f, -1.0f, 1.0f};
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) A[3 * r + c] = G[3 * r + c] * s[r] * s[c];
-        b[r] = g[r] * s[r];
-    }
+    memcpy(A, G, sizeof G); memcpy(b, g, sizeof g);
     return 1;
 }
 
@@ -14157,6 +14166,86 @@ static int rp_allocated(void) {
     return any;
 }
 
+/* The edge strips the in-between camera uncovers, filled from the newer real
+ * frame pixel by pixel: each strip pixel the redraw left without depth takes
+ * the newer frame's pixel that the in-between camera sees there, found from
+ * that frame's PGXP depth (a few steps: its depth, to camera space, through
+ * the map, back on the picture, moved by what is left), from the strip's
+ * estimated offset (fg_edge_offsets) as the start. One offset per strip piece
+ * left a seam where the depth changes across it (a turning camera moves the
+ * near ground more than the far). Where the newer frame has no depth (2D)
+ * the start stays; past its view, the strip's own place. Depth: SZ = 256 /
+ * (1 - d) - 256, as the chains read it. */
+static GLuint s_fgw_prog = 0, s_fgw_dtex = 0, s_fgw_dfbo = 0;
+static int    s_fgw_dw = 0, s_fgw_dh = 0, s_fgw_failed = 0;
+static GLint  s_fgw_u[12];
+static uint64_t s_fgw_strips = 0;   /* TCP frame_gen: strips filled this way */
+static const char *FGW_FS =
+    "#version 330\nin vec2 v_uv; out vec4 o;\n"
+    "uniform sampler2D u_src; uniform sampler2D u_dep;\n"
+    "uniform vec2 u_dorg, u_sorg, u_zorg, u_guess; uniform float u_S;\n"
+    "uniform vec3 u_view; uniform vec3 u_A0, u_A1, u_A2, u_B; uniform vec4 u_area;\n"
+    "vec3 vx(vec3 p) { return vec3(dot(u_A0, p), dot(u_A1, p), dot(u_A2, p)) + u_B; }\n"
+    "float dep(vec2 s) { return texelFetch(u_dep, ivec2(u_zorg + s * u_S), 0).r; }\n"
+    "void main(){\n"
+    "  vec2 q = (gl_FragCoord.xy - u_dorg) / u_S, s = q - u_guess;\n"
+    "  for (int i = 0; i < 6; i++) {\n"
+    "    if (s.x < u_area.x || s.y < u_area.y || s.x >= u_area.z || s.y >= u_area.w) break;\n"
+    "    float d = dep(s);\n"
+    "    if (d >= 0.99999) break;\n"
+    "    float Z = 256.0 / (1.0 - d) - 256.0;\n"
+    "    vec3 g = vx(vec3((s - u_view.xy) * Z / u_view.z, Z));\n"
+    "    if (g.z < 1.0) break;\n"
+    "    s += q - (u_view.xy + u_view.z * g.xy / g.z);\n"
+    "  }\n"
+    "  if (s.x < u_area.x || s.y < u_area.y || s.x >= u_area.z || s.y >= u_area.w) s = q;\n"
+    "  o = texelFetch(u_src, ivec2(u_sorg + s * u_S), 0);\n"
+    "  gl_FragDepth = 0.99998;\n"
+    "}\n";
+enum { FGW_SRC, FGW_DEP, FGW_DORG, FGW_SORG, FGW_ZORG, FGW_GUESS, FGW_S, FGW_VIEW, FGW_A0, FGW_B, FGW_AREA, FGW_A1 };
+/* Ready to fill: the program, and the newer frame's depth over the picture
+ * (surface px: x0, y0, w, h of src_fbo) in a texture. */
+static int fgw_prepare(GLuint src_fbo, int x0, int y0, int w, int h) {
+    if (s_fgw_failed || w <= 0 || h <= 0) return 0;
+    if (!s_fgw_prog) {
+        s_fgw_prog = build_program(PRESENT_VS, FGW_FS);
+        if (!s_fgw_prog) { s_fgw_failed = 1; return 0; }
+        static const char *const nm[12] = {"u_src", "u_dep", "u_dorg", "u_sorg", "u_zorg", "u_guess", "u_S",
+                                           "u_view", "u_A0", "u_B", "u_area", "u_A1"};
+        for (int i = 0; i < 12; i++) s_fgw_u[i] = p_glGetUniformLocation(s_fgw_prog, nm[i]);
+    }
+    if (s_fgw_dw != w || s_fgw_dh != h) {
+        if (!s_fgw_dtex) glGenTextures(1, &s_fgw_dtex);
+        glBindTexture(GL_TEXTURE_2D, s_fgw_dtex);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_DEPTH24_STENCIL8, w, h, 0,
+                     0x84F9 /*DEPTH_STENCIL*/, 0x84FA /*UNSIGNED_INT_24_8*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (!s_fgw_dfbo) p_glGenFramebuffers(1, &s_fgw_dfbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fgw_dfbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s_fgw_dtex, 0);
+        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        s_fgw_dw = w; s_fgw_dh = h;
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_fgw_dfbo);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(x0, y0, x0 + w, y0 + h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    return 1;
+}
+/* One strip piece (dst surface px rect), the shader's inputs set by the caller. */
+static void fgw_strip(int x, int y, int w, int h, float gx, float gy) {
+    if (w <= 0 || h <= 0) return;
+    glScissor(x, y, w, h);
+    p_glUniform2f(s_fgw_u[FGW_GUESS], gx, gy);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    s_fgw_strips++;
+}
+
 static int fg_generate(double t, int swap) {
     if (s_fg_pa < 0 || s_fg_pb < 0) return 0;
     FgList *a = &s_fg_l[s_fg_pa], *b = &s_fg_l[s_fg_pb];
@@ -14283,7 +14372,17 @@ static int fg_generate(double t, int swap) {
         const int bx0 = iw >= 0 ? 0 : L->disp[0], sdy = dy - ly;   /* source rows: the newer frame's */
         float eo[FG_MAX_VIEWS][4][FG_ESEG][2];
         fg_edge_offsets(L, tl, eo);
+        /* the main view's strips pixel by pixel (fgw_*): its map, the newer
+         * frame's depth, a redraw that cleared its own depth (holes = 1.0) */
+        const int vmain = (int)fg_main_view(&s_fg_fit);
+        float wA[9], wb[3], vpv[4][4];
+        const int warp = s_depth_clears != real_dclears && fg_newer_to_between(tl, wA, wb) &&
+                         fgw_prepare(src, bx0 * S, (L->disp[1] + sdy) * S, sw * S, lh * S);
+        if (warp) rp_view_params(L, vpv);
+        int wr[4 * FG_ESEG][4], nwr = 0;
+        float wg[4 * FG_ESEG][2];
         for (uint32_t vi = 0; vi < s_fg_fit.nviews && vi < FG_MAX_VIEWS; vi++) {
+            const int vw = warp && (int)vi == vmain && vpv[vi][3] > 0.5f;
             const float *ar = s_fg_fit.v[vi].area, *m = s_fg_margin[vi];
             int x1 = (int)floorf(ar[0]) + ox, x2 = (int)ceilf(ar[2]) + 1 + ox;
             int y1 = L->disp[1] + (int)ar[1], y2 = L->disp[1] + (int)ar[3] + 1;
@@ -14309,10 +14408,21 @@ static int fg_generate(double t, int swap) {
                 if (fabsf(ex) > lim || fabsf(ey) > lim) ex = ey = 0.0f; \
                 { float *D_ = s_fg_sdbg[s_fg_sdbg_n++ % FG_SDBG]; D_[0] = (float)(e); D_[1] = (float)(sg); D_[2] = m[e]; \
                   D_[3] = eo[vi][e][sg][0]; D_[4] = eo[vi][e][sg][1]; D_[5] = ex; D_[6] = ey; D_[7] = (float)(X); D_[8] = (float)((Y) + sdy); } \
-                fg_strip_copy(src, dst, (X) * S - (int)lrintf(ex * (float)S), \
+                if (vw && nwr < 4 * FG_ESEG) { \
+                    wr[nwr][0] = (X) * S; wr[nwr][1] = (Y) * S; wr[nwr][2] = (W) * S; wr[nwr][3] = (H) * S; \
+                    wg[nwr][0] = ex; wg[nwr][1] = ey; nwr++; \
+                } else fg_strip_copy(src, dst, (X) * S - (int)lrintf(ex * (float)S), \
                               ((Y) + sdy) * S - (int)lrintf(ey * (float)S), \
                               (X) * S, ((Y) + sdy) * S, (X) * S, (Y) * S, (W) * S, (H) * S, vb); \
             } while (0)
+            /* pixel by pixel only the holes are written: a little wider */
+            const int slack = vw ? 2 : 0;
+            if (vw) {
+                if (ml) ml = ml + slack > w ? w : ml + slack;
+                if (mr) mr = mr + slack > w ? w : mr + slack;
+                if (mt) mt = mt + slack > h ? h : mt + slack;
+                if (mb) mb = mb + slack > h ? h : mb + slack;
+            }
             for (int sg = 0; sg < FG_ESEG; sg++) {
                 const int ya = y1 + h * sg / FG_ESEG, yb = y1 + h * (sg + 1) / FG_ESEG;
                 const int xa = x1 + w * sg / FG_ESEG, xb = x1 + w * (sg + 1) / FG_ESEG;
@@ -14322,6 +14432,50 @@ static int fg_generate(double t, int swap) {
                 if (mb) FG_STRIP(3, sg, bx0 + xa, y2 - mb, xb - xa, mb);
             }
 #undef FG_STRIP
+            if (vw && nwr) {
+                const float *ar2 = ar;
+                GLint dfunc = GL_LESS, unit1 = 0;
+                GLboolean dmask = GL_TRUE;
+                glGetIntegerv(GL_DEPTH_FUNC, &dfunc);
+                glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
+                p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &unit1);
+                glBindTexture(GL_TEXTURE_2D, s_fgw_dtex);
+                p_glActiveTexture(PSXGL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, iw >= 0 ? wt : t0);
+                p_glBindFramebuffer(PSXGL_FRAMEBUFFER, dst);
+                glViewport(0, 0, (iw >= 0 ? g_wide_w : VRAM_W) * S, VRAM_H * S);
+                glDisable(GL_BLEND); glDisable(GL_STENCIL_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); glDepthMask(GL_FALSE);
+                glEnable(GL_SCISSOR_TEST);
+                p_glUseProgram(s_fgw_prog);
+                p_glBindVertexArray(s_empty_vao);
+                p_glUniform1i(s_fgw_u[FGW_SRC], 0);
+                p_glUniform1i(s_fgw_u[FGW_DEP], 1);
+                p_glUniform1f(s_fgw_u[FGW_S], (float)S);
+                const float OX = (float)(bx0 + ox);
+                p_glUniform2f(s_fgw_u[FGW_DORG], OX * (float)S, (float)L->disp[1] * (float)S);
+                p_glUniform2f(s_fgw_u[FGW_SORG], OX * (float)S, (float)(L->disp[1] + sdy) * (float)S);
+                p_glUniform2f(s_fgw_u[FGW_ZORG], (float)ox * (float)S, 0.0f);
+                p_glUniform3f(s_fgw_u[FGW_VIEW], vpv[vi][0], vpv[vi][1], vpv[vi][2]);
+                p_glUniform3f(s_fgw_u[FGW_A0], wA[0], wA[1], wA[2]);
+                p_glUniform3f(s_fgw_u[FGW_A1], wA[3], wA[4], wA[5]);
+                p_glUniform3f(p_glGetUniformLocation(s_fgw_prog, "u_A2"), wA[6], wA[7], wA[8]);
+                p_glUniform3f(s_fgw_u[FGW_B], wb[0], wb[1], wb[2]);
+                p_glUniform4f(s_fgw_u[FGW_AREA], ar2[0], ar2[1], ar2[2] + 1.0f, ar2[3] + 1.0f);
+                for (int k = 0; k < nwr; k++) fgw_strip(wr[k][0], wr[k][1], wr[k][2], wr[k][3], wg[k][0], wg[k][1]);
+                glDisable(GL_SCISSOR_TEST);
+                glDisable(GL_DEPTH_TEST); glDepthFunc((GLenum)dfunc); glDepthMask(dmask);
+                p_glBindVertexArray(0);
+                p_glUseProgram(0);
+                p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+                glBindTexture(GL_TEXTURE_2D, (GLuint)unit1);
+                p_glActiveTexture(PSXGL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+                nwr = 0;
+            }
         }
     }
     s_fg_reprojected_now = reproj;
@@ -15030,7 +15184,8 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
     k += snprintf(out + k, (size_t)(cap - k), "],\"vlog\":{\"rewinds\":%llu,\"missed\":%llu,\"entries\":%llu,\"bytes\":%llu}",
                   (unsigned long long)s_vlog_rewinds, (unsigned long long)s_vlog_missed,
                   (unsigned long long)(s_vlog_seq - s_vlog_first), (unsigned long long)s_vlog_bytes);
-    k += snprintf(out + k, (size_t)(cap - k), ",\"src_older\":%d,\"strips\":[", s_fg_src_older);
+    k += snprintf(out + k, (size_t)(cap - k), ",\"src_older\":%d,\"warp_strips\":%llu,\"strips\":[", s_fg_src_older,
+                  (unsigned long long)s_fgw_strips);
     {
         const unsigned sn = s_fg_sdbg_n < FG_SDBG ? s_fg_sdbg_n : FG_SDBG;
         for (unsigned i = 0; i < sn && k < cap - 96; i++) {
