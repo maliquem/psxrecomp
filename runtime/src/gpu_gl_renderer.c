@@ -14067,7 +14067,23 @@ static int fg_generate(double t, int swap) {
     }
     s_fg_reprojected_now = reproj;
     s_pfx_vx_on = s_fg_marks && !reproj && fg_effects_view(tl, s_pfx_vx_a, s_pfx_vx_b);
+    if (s_fg_marks && !reproj) {
+        /* What the redraw left without depth shows the newer real frame's
+         * pixels (the copy it started from): the chains take that frame's
+         * depth there (postfx_note_fill), from its own surfaces. */
+        if (iw >= 0) {
+            const float wext = (was > s_out_scale && s_out_scale >= 1) ? (float)was / (float)s_out_scale : 1.0f;
+            postfx_note_fill(wf, wt, (float)g_wide_w * wext, (float)VRAM_H * wext, 0, b->disp[1], g_wide_w, b->disp[3]);
+            if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
+                postfx_note_fill_center(f0, t0, present_alloc_extent(VRAM_W, s_hr_scale), present_alloc_extent(VRAM_H, s_hr_scale),
+                                        b->disp[0], b->disp[1], g_wide_w - 2 * g_wide_off, b->disp[3], g_wide_off, g_wide_w);
+        } else {
+            postfx_note_fill(f0, t0, present_alloc_extent(VRAM_W, s_hr_scale), present_alloc_extent(VRAM_H, s_hr_scale),
+                             b->disp[0], b->disp[1], b->disp[2], b->disp[3]);
+        }
+    }
     fg_compose(L, iw >= 0 ? s_fg_w_fbo : 0, iw >= 0 ? s_fg_w_tex : 0, b->linear, b->force43);
+    s_dfill_valid = s_dfill_ctr_valid = 0;
     s_pfx_vx_on = 0;
     s_fg_reprojected_now = 0;
     s_fg_drawing = 0;

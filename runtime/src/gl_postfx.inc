@@ -105,6 +105,17 @@ static GLuint s_mask_ctr_fbo = 0, s_mask_ctr_rb = 0;
 static int    s_mask_ctr_tw = 0, s_mask_ctr_th = 0;
 static int    s_mask_ctr[4], s_mask_ctr_valid = 0;
 static float  s_mask_ctr_x0 = 0.0f, s_mask_ctr_x1 = 0.0f;   /* fractions of the displayed width */
+/* A Smooth motion generated frame: where its redraw left no depth (what the
+ * in-between camera uncovers shows the newer real frame's pixels, copied),
+ * the depth input takes that real frame's depth there (postfx_note_fill*):
+ * without it the effects saw no scene there and left it unlit (a dark band
+ * that blinked while the camera turned). Source rects as s_mask_src/ctr. */
+static GLuint s_dfill_fbo = 0, s_dfill_ctr_fbo = 0;
+static int    s_dfill[4], s_dfill_ctr[4], s_dfill_valid = 0, s_dfill_ctr_valid = 0;
+static float  s_dfill_ctr_x0 = 0.0f, s_dfill_ctr_x1 = 0.0f;
+static GLuint s_dep2_tex = 0, s_dep2_fbo = 0, s_dfill_prog = 0;
+static GLint  s_dfill_uMode = -1, s_dfill_uD = -1;
+static int    s_dep2_w = 0, s_dep2_h = 0;
 static GLuint s_mask_tex = 0, s_mask_fbo = 0, s_mask_prog = 0, s_mask_map_prog = 0;
 static GLint  s_mask_uUv = -1, s_mask_uV = -1;
 static GLint  s_mmap_uUv = -1, s_mmap_uS = -1, s_mmap_uSrc = -1, s_mmap_uDst = -1;
@@ -272,6 +283,46 @@ static void postfx_note_source(GLuint fbo, GLuint tex, float tex_w, float tex_h,
     s_mask_src_valid = 1;
 }
 
+/* A generated frame (s_pfx_vx_on): what the chains get in the real frame's
+ * view space, in the picture's. A direction turns; a point turns and moves;
+ * a mapping row (dot(xyz, P) - w) keeps its value at the same scene point. */
+static void pfx_vx_dir(const float *d, float *o) {
+    const float *A = s_pfx_vx_a;
+    const float x = d[0], y = d[1], z = d[2];
+    for (int r = 0; r < 3; r++) o[r] = A[r * 3] * x + A[r * 3 + 1] * y + A[r * 3 + 2] * z;
+}
+static void pfx_vx_point(const float *p, float *o) {
+    pfx_vx_dir(p, o);
+    for (int r = 0; r < 3; r++) o[r] += s_pfx_vx_b[r];
+}
+static void pfx_vx_row(const float *row, float *o) {
+    pfx_vx_dir(row, o);
+    o[3] = row[3] + o[0] * s_pfx_vx_b[0] + o[1] * s_pfx_vx_b[1] + o[2] * s_pfx_vx_b[2];
+}
+
+/* The holes' depth for the next present only (a generated frame's newer real
+ * frame, as postfx_note_source / postfx_note_center take theirs). */
+static void postfx_note_fill(GLuint fbo, GLuint tex, float tex_w, float tex_h, int x, int y, int w, int h) {
+    s_dfill_valid = 0;
+    s_dfill_ctr_valid = 0;
+    if (!s_dep_on || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
+    int tw, th;
+    pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_dfill, &tw, &th);
+    s_dfill_fbo = fbo;
+    s_dfill_valid = 1;
+}
+static void postfx_note_fill_center(GLuint fbo, GLuint tex, float tex_w, float tex_h,
+                                    int x, int y, int w, int h, int off, int wide_w) {
+    s_dfill_ctr_valid = 0;
+    if (!s_dfill_valid || !fbo || !tex || wide_w <= 0) return;
+    int tw, th;
+    pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_dfill_ctr, &tw, &th);
+    s_dfill_ctr_fbo = fbo;
+    s_dfill_ctr_x0 = (float)off / (float)wide_w;
+    s_dfill_ctr_x1 = (float)(off + w) / (float)wide_w;
+    s_dfill_ctr_valid = 1;
+}
+
 static void pfx_tex_alloc(GLuint *t, int w, int h, int fmt, int nearest) {
     if (!*t) glGenTextures(1, t);
     glBindTexture(GL_TEXTURE_2D, *t);
@@ -347,6 +398,87 @@ static void pfx_mask_map(int k, const int r[4], int x0, int x1, int lh) {
  * native-wide centre from the hr surface over its columns. */
 static GLuint s_dep_tex = 0, s_dep_fbo = 0;
 static int    s_dep_w = 0, s_dep_h = 0, s_dep_ok = 0;
+/* s_dep_tex's holes (still the clear depth, 1.0) take s_dep2_tex's depth:
+ * the holes are marked in s_dep_tex's stencil (a quad at depth 1.0 passes
+ * GL_EQUAL there), then a quad writes the other depth where marked. */
+static void pfx_depth_fill(int lw, int lh) {
+    if (!s_dfill_prog) {
+        s_dfill_prog = build_program(PRESENT_VS,
+            "#version 330\nin vec2 v_uv; out vec4 o; uniform int u_mode; uniform sampler2D u_d;\n"
+            "void main(){ gl_FragDepth = u_mode == 0 ? 1.0 : texelFetch(u_d, ivec2(gl_FragCoord.xy), 0).r; o = vec4(0.0); }\n");
+        if (!s_dfill_prog) return;
+        s_dfill_uMode = p_glGetUniformLocation(s_dfill_prog, "u_mode");
+        s_dfill_uD = p_glGetUniformLocation(s_dfill_prog, "u_d");
+    }
+    if (s_dep2_w != lw || s_dep2_h != lh) {
+        if (!s_dep2_tex) glGenTextures(1, &s_dep2_tex);
+        glBindTexture(GL_TEXTURE_2D, s_dep2_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_DEPTH24_STENCIL8, lw, lh, 0,
+                     0x84F9 /*DEPTH_STENCIL*/, 0x84FA /*UNSIGNED_INT_24_8*/, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (!s_dep2_fbo) p_glGenFramebuffers(1, &s_dep2_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_dep2_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s_dep2_tex, 0);
+        glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+        s_dep2_w = lw; s_dep2_h = lh;
+    }
+    /* the real frame's depth, mapped to the window as the source's */
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_dep2_fbo);
+    glDepthMask(GL_TRUE);
+    glClearDepth(1.0);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_dfill_fbo);
+    p_glBlitFramebuffer(s_dfill[0], s_dfill[1], s_dfill[2], s_dfill[3], 0, lh, lw, 0, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    if (s_dfill_ctr_valid) {
+        const int c0 = (int)lrintf(s_dfill_ctr_x0 * (float)lw), c1 = (int)lrintf(s_dfill_ctr_x1 * (float)lw);
+        if (c1 > c0) {
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_dfill_ctr_fbo);
+            p_glBlitFramebuffer(s_dfill_ctr[0], s_dfill_ctr[1], s_dfill_ctr[2], s_dfill_ctr[3],
+                                c0, lh, c1, 0, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    GLint dfunc = GL_LESS;
+    glGetIntegerv(GL_DEPTH_FUNC, &dfunc);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_dep_fbo);
+    glDrawBuffer(GL_NONE);
+    glViewport(0, 0, lw, lh);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glStencilMask(0xFF);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    p_glUseProgram(s_dfill_prog);
+    p_glBindVertexArray(s_empty_vao);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_STENCIL_TEST);
+    /* the holes: stencil 1 */
+    p_glUniform1i(s_dfill_uMode, 0);
+    glDepthFunc(GL_EQUAL);
+    glDepthMask(GL_FALSE);
+    glStencilFunc(GL_ALWAYS, 1, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    /* the real frame's depth there */
+    p_glUniform1i(s_dfill_uMode, 1);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_dep2_tex);
+    p_glUniform1i(s_dfill_uD, 0);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glStencilFunc(GL_EQUAL, 1, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthFunc((GLenum)dfunc);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
 static int pfx_depth_build(int fresh, int lw, int lh) {
     if (s_dep_w != lw || s_dep_h != lh) {
         if (!s_dep_tex) glGenTextures(1, &s_dep_tex);
@@ -381,6 +513,7 @@ static int pfx_depth_build(int fresh, int lw, int lh) {
         }
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
         p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+        if (s_dfill_valid) pfx_depth_fill(lw, lh);
         s_dep_ok = 1;
     }
     return s_dep_ok;
@@ -1375,7 +1508,13 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             if (o[0] < x0) x0 = o[0]; if (o[0] > x1) x1 = o[0];
             if (o[1] < y0) y0 = o[1]; if (o[1] > y1) y1 = o[1];
             if (o[2] < d0) d0 = o[2]; if (o[2] > d1) d1 = o[2];
-            if (fabsf(scr[0]) <= hw && fabsf(scr[1]) <= hh) {
+            int on = fabsf(scr[0]) <= hw && fabsf(scr[1]) <= hh;
+            if (!on && s_pfx_vx_on) {   /* a generated frame: on its own picture too (a turning camera sees past the real one's) */
+                float g[3];
+                pfx_vx_point(P, g);
+                on = g[2] > 1.0f && fabsf(s_cam_h * g[0] / g[2]) <= hw && fabsf(s_cam_h * g[1] / g[2]) <= hh;
+            }
+            if (on) {
                 if (o[0] < sx0) sx0 = o[0]; if (o[0] > sx1) sx1 = o[0];
                 if (o[1] < sy0) sy0 = o[1]; if (o[1] > sy1) sy1 = o[1];
             }
@@ -1828,22 +1967,6 @@ static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
  * w the reach), u_fls0, u_fls1 their place on the picture (uv; z 1 = lit),
  * u_flc0, u_flc1 their colours (w their strength), u_flmap (face px,
  * lights, row pairs). */
-/* A generated frame (s_pfx_vx_on): what the chains get in the real frame's
- * view space, in the picture's. A direction turns; a point turns and moves;
- * a mapping row (dot(xyz, P) - w) keeps its value at the same scene point. */
-static void pfx_vx_dir(const float *d, float *o) {
-    const float *A = s_pfx_vx_a;
-    const float x = d[0], y = d[1], z = d[2];
-    for (int r = 0; r < 3; r++) o[r] = A[r * 3] * x + A[r * 3 + 1] * y + A[r * 3 + 2] * z;
-}
-static void pfx_vx_point(const float *p, float *o) {
-    pfx_vx_dir(p, o);
-    for (int r = 0; r < 3; r++) o[r] += s_pfx_vx_b[r];
-}
-static void pfx_vx_row(const float *row, float *o) {
-    pfx_vx_dir(row, o);
-    o[3] = row[3] + o[0] * s_pfx_vx_b[0] + o[1] * s_pfx_vx_b[1] + o[2] * s_pfx_vx_b[2];
-}
 static void pfx_fire_uniforms(GLuint prog) {
     static const char *const pn[FIRE_MAX] = {"u_fl0", "u_fl1"}, *const sn[FIRE_MAX] = {"u_fls0", "u_fls1"};
     static const char *const cn[FIRE_MAX] = {"u_flc0", "u_flc1"};
@@ -2211,6 +2334,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if (i == PFX_STAGE_AA || i == PFX_STAGE_HQ) s_paa_passes++;
     }
     s_mask_src_valid = 0; s_mask_ctr_valid = 0;
+    s_dfill_valid = s_dfill_ctr_valid = 0;
     if (mark_shown) sc_mark_shown();
     pfx_state_restore(&saved);
 }
