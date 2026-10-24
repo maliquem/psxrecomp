@@ -1665,6 +1665,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
  * Out: s_lit (world, GTE axes), for the lights that cast (steps to come) and
  * TCP shadow_cache "lights". */
 enum { LIT_MAX = 16, LIT_JOIN = 24, LIT_STEADY = 30, LIT_GONE = 20 };
+#define LIT_DARK 0.02f   /* a glowing piece's brightest channel below this adds nothing */
 #define LIT_MATCH 160.0f
 typedef struct { float w[3]; float sx, sy, z, size, after, c[3]; unsigned hits, seen; int active; } PfxLight;
 static PfxLight s_lit[LIT_MAX];
@@ -1683,6 +1684,10 @@ static void pfx_lights_update(void) {
         int ng = 0;
         for (int i = 0; i < sc->en; i++) {
             const float *e = sc->ev + (size_t)i * SC_EV;
+            /* a piece that adds nothing (black) gives no light: BoF4 hides the
+             * party member standing behind the leader by drawing it additive
+             * in black, which lit the field round them after a battle */
+            if (fmaxf(e[5], fmaxf(e[6], e[7])) < LIT_DARK) continue;
             const float x = e[0] - s_sc_cx, y = e[1] - s_sc_cy, z = e[2], a = fmaxf(e[3], 1.0f);
             int k = 0;
             for (; k < ng; k++) {
