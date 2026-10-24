@@ -5980,6 +5980,12 @@ static uint16_t controller_pad_buttons(const ControllerMap& map,
                 source.id >= 0 && source.id < 32 &&
                 (claimed_buttons & (1u << source.id)))
                 continue;
+            if (claimed_buttons && source.kind == ControllerSource::Kind::AxisPositive &&
+                ((source.id == SDL_CONTROLLER_AXIS_TRIGGERLEFT &&
+                  (claimed_buttons & (1u << PSX_HOTKEY_PAD_LT_BIT))) ||
+                 (source.id == SDL_CONTROLLER_AXIS_TRIGGERRIGHT &&
+                  (claimed_buttons & (1u << PSX_HOTKEY_PAD_RT_BIT)))))
+                continue;   /* a claimed trigger (psx_hotkey_pad.h) */
             if (!controller_source_pressed_h(h, source, deadzone_raw)) continue;
             if (entry.bit)
                 buttons &= (uint16_t)~entry.bit;
@@ -8032,9 +8038,16 @@ static int normalize_hotkey_pad_binding(int binding, int fallback) {
 static int p1_host_button_down(void*, int code) {
     uint16_t word;
     uint8_t st[4], lt, rt;
-    if (host_pad_layer(&word, st, &lt, &rt))
+    const int trigger = code == PSX_HOTKEY_PAD_LT_BIT ? SDL_CONTROLLER_AXIS_TRIGGERLEFT
+                      : code == PSX_HOTKEY_PAD_RT_BIT ? SDL_CONTROLLER_AXIS_TRIGGERRIGHT : -1;
+    if (host_pad_layer(&word, st, &lt, &rt)) {
+        if (trigger >= 0) return (trigger == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? lt : rt) >= 128;
         return (host_layer_sdl_held(word) >> code) & 1u;
+    }
     SDL_GameController* h = g_players[0].handle;
+    if (trigger >= 0)   /* a trigger as a button (psx_hotkey_pad.h) */
+        return h && SDL_GameControllerGetAxis(h, (SDL_GameControllerAxis)trigger) >=
+                        PSX_HOTKEY_PAD_TRIGGER_HELD;
     if (!h || code < 0 || code >= SDL_CONTROLLER_BUTTON_MAX) return 0;
     return SDL_GameControllerGetButton(h, (SDL_GameControllerButton)code) != 0;
 }
@@ -8103,6 +8116,8 @@ static void direct_shortcut_claim_update(void) {
         if (b >= 0) claimed |= 1u << b;
     }
     for (int code = 0; code < SDL_CONTROLLER_BUTTON_MAX && code < 32; ++code)
+        if (p1_host_button_down(nullptr, code)) held |= 1u << code;
+    for (int code = PSX_HOTKEY_PAD_LT_BIT; code <= PSX_HOTKEY_PAD_RT_BIT; ++code)
         if (p1_host_button_down(nullptr, code)) held |= 1u << code;
     g_p1_claimed_buttons =
         psx_hotkey_claim_update(&g_p1_claim_latched, claimed, held);

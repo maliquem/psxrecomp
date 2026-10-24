@@ -4,7 +4,10 @@
  * Encodings (shared with recomp-ui): 0 unbound; 1..99 one button (code+1),
  * always chorded with Select (legacy); 100..999 an axis direction, chorded
  * with Select; >= 1000 a button combination (1000 + mask of SDL
- * GameController button codes), every button held.
+ * GameController button codes), every button held. In a combination the two
+ * triggers count as buttons too, past every SDL button code: bits
+ * PSX_HOTKEY_PAD_LT_BIT / PSX_HOTKEY_PAD_RT_BIT, held when pressed past half
+ * way (a trigger is an axis to SDL, so L2 / R2 alone can be a shortcut).
  *
  * A ONE-button combination is a direct shortcut only while the running title
  * allows it for that shortcut (psx_mod_allow_direct_shortcut); otherwise it
@@ -18,6 +21,9 @@ extern "C" {
 #endif
 
 #define PSX_HOTKEY_PAD_COMBO_BASE 1000
+#define PSX_HOTKEY_PAD_LT_BIT 24
+#define PSX_HOTKEY_PAD_RT_BIT 25
+#define PSX_HOTKEY_PAD_TRIGGER_HELD 16384   /* half of the axis range */
 
 typedef int (*PsxHotkeyButtonDown)(void *ctx, int sdl_button);
 typedef int (*PsxHotkeyAxisValue)(void *ctx, int sdl_axis);
