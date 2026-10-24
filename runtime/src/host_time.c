@@ -79,6 +79,31 @@ void psx_host_sleep_micros(unsigned usec)
     Sleep((DWORD)(usec / 1000u));
 }
 
+static uint64_t filetime_ns(const FILETIME *f)
+{
+    return (((uint64_t)f->dwHighDateTime << 32) | f->dwLowDateTime) * 100ull;
+}
+uint64_t psx_host_thread_cpu_ns(void)
+{
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        return 0;
+    return filetime_ns(&k) + filetime_ns(&u);
+}
+uint64_t psx_host_process_cpu_ns(void)
+{
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+        return 0;
+    return filetime_ns(&k) + filetime_ns(&u);
+}
+int psx_host_cpu_count(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+}
+
 #else /* !_WIN32 */
 
 #include <errno.h>
@@ -110,6 +135,30 @@ void psx_host_sleep_micros(unsigned usec)
             break;
         req = rem;
     }
+}
+
+uint64_t psx_host_thread_cpu_ns(void)
+{
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+    return 0;
+}
+uint64_t psx_host_process_cpu_ns(void)
+{
+#if defined(CLOCK_PROCESS_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+    return 0;
+}
+int psx_host_cpu_count(void)
+{
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
 }
 
 #endif /* _WIN32 */

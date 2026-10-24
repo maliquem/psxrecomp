@@ -130,7 +130,7 @@ static Uint32   s_expire_ms;
 static int      s_active;
 static int      s_img_dirty = 1;
 
-static char     s_status_msg[OSD_MAX_CHARS];
+static char     s_status_msg[3 * OSD_MAX_CHARS + 3];   /* up to three '\n' lines */
 static int      s_status_active;
 static int      s_status_dirty = 1;
 static char     s_diagnostic_msg[2][OSD_MAX_CHARS];

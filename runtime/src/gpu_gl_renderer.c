@@ -10848,6 +10848,58 @@ static void gl_swap_with_osd(void) {
     gl_swap_now(s_fg_presenting);
 }
 
+/* Performance summary (gl_renderer_present_pacing): every swap's time
+ * (rt_now_ns) and kind, newest last, and the swapping thread's CPU time. */
+enum { PERF_TL = 1024 };
+static uint64_t          s_perf_tl[PERF_TL];
+static uint8_t           s_perf_gen[PERF_TL];
+static _Atomic unsigned  s_perf_tl_n = 0;
+static _Atomic uint64_t  s_perf_gl_cpu_ns = 0;
+static void perf_note_swap(int generated) {
+    const unsigned i = atomic_load_explicit(&s_perf_tl_n, memory_order_relaxed);
+    s_perf_tl[i % PERF_TL] = rt_now_ns();
+    s_perf_gen[i % PERF_TL] = (uint8_t)(generated != 0);
+    atomic_store_explicit(&s_perf_tl_n, i + 1, memory_order_release);
+    atomic_store_explicit(&s_perf_gl_cpu_ns, psx_host_thread_cpu_ns(), memory_order_relaxed);
+}
+static int perf_u64_cmp(const void *a, const void *b) {
+    const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+int gl_renderer_present_pacing(double window_s, GlPacing *out) {
+    memset(out, 0, sizeof *out);
+    const unsigned n = atomic_load_explicit(&s_perf_tl_n, memory_order_acquire);
+    const uint64_t now = rt_now_ns(), from = now - (uint64_t)(window_s * 1e9);
+    static uint64_t iv[PERF_TL];
+    int k = 0, gen = 0, cnt = 0;
+    uint64_t prev = 0;
+    for (unsigned j = n > PERF_TL ? n - PERF_TL + 1 : 0; j < n; j++) {
+        const uint64_t t = s_perf_tl[j % PERF_TL];
+        if (t < from || t > now) { prev = t; continue; }
+        cnt++; gen += s_perf_gen[j % PERF_TL];
+        if (prev && t > prev && prev >= from) iv[k++] = t - prev;
+        prev = t;
+    }
+    out->presents = cnt;
+    out->generated = gen;
+    out->fps = (double)cnt / window_s;
+    if (k > 0) {
+        double sum = 0.0;
+        for (int i = 0; i < k; i++) sum += (double)iv[i];
+        qsort(iv, (size_t)k, sizeof iv[0], perf_u64_cmp);
+        out->avg_ms = sum / k * 1e-6;
+        out->p99_ms = (double)iv[(k - 1) * 99 / 100] * 1e-6;
+        out->max_ms = (double)iv[k - 1] * 1e-6;
+        /* "1% low": the frame rate of the slowest 1% of the intervals */
+        const int slow = k / 100 > 0 ? k / 100 : 1;
+        double s2 = 0.0;
+        for (int i = k - slow; i < k; i++) s2 += (double)iv[i];
+        out->low1_fps = s2 > 0.0 ? 1e9 * slow / s2 : 0.0;
+    }
+    return cnt;
+}
+uint64_t gl_renderer_gl_thread_cpu_ns(void) { return atomic_load(&s_perf_gl_cpu_ns); }
+
 /* The swap itself (and its accounting). */
 static void gl_swap_now(int generated) {
     (void)generated;
@@ -10860,6 +10912,7 @@ static void gl_swap_now(int generated) {
     uint64_t t0 = s_dyn_on ? SDL_GetPerformanceCounter() : 0;
     const uint64_t rthf_t0 = rth_replaying() ? host_now_ns_rthf() : 0;
     gl_present_swap();
+    perf_note_swap(generated);
     if (rthf_t0) {
         const uint64_t sw = host_now_ns_rthf() - rthf_t0;
         s_rthf_swap_ns += sw;
@@ -12355,6 +12408,15 @@ void gl_renderer_render_thread_costs(GlRthCosts *out) {
     out->gpu_ns = atomic_load(&s_rthf_gpu_ns);
     out->gpu_frames = atomic_load(&s_rthf_gpu_frames);
     out->dropped = atomic_load(&s_rthf_dropped);
+}
+
+/* Generated frames' GPU time (fg_gen_cost_poll), running totals. */
+static _Atomic uint64_t s_perf_gen_frames = 0, s_perf_gen_ns = 0;
+void gl_renderer_gpu_totals(GlGpuTotals *out) {
+    out->real_frames = atomic_load(&s_rthf_gpu_frames);
+    out->real_ns = atomic_load(&s_rthf_gpu_ns);
+    out->gen_frames = atomic_load(&s_perf_gen_frames);
+    out->gen_ns = atomic_load(&s_perf_gen_ns);
 }
 
 /* ---- frame generation ([video] frame_generation) ---------------------------
@@ -14595,6 +14657,8 @@ static void fg_gen_cost_poll(void) {
         fg_gen_cost_publish((uint64_t)(c * 1e9));
         s_fg_gen_gpu_ms = (double)ns * 1e-6;
         s_fg_gen_cpu_ms = (double)s_fg_q_cpu[i] * 1e-6;
+        atomic_fetch_add(&s_perf_gen_ns, (uint64_t)ns);
+        atomic_fetch_add(&s_perf_gen_frames, 1);
         s_fg_qt++;
     }
 }

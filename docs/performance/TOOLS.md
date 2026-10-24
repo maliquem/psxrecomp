@@ -4,6 +4,24 @@ These tools begin P0-1 in the [campaign](../PERFORMANCE_CAMPAIGN.md). They colle
 diagnostic evidence, not an automatic optimization acceptance verdict. See the
 [experiment ledger](EXPERIMENTS.md) for verified local artifacts and limitations.
 
+## Live summary (F, TCP `perf_summary`)
+
+The FPS readout (F, or `PSX_FPS_TELEMETRY=1`) shows three lines, refreshed
+once a second; TCP `perf_summary` returns the same figures as JSON (its first
+request starts the measuring, so `valid` is 0 for about a second):
+
+| Line / JSON | What |
+| --- | --- |
+| `game_fps`, `speed` | emulated VBlanks per second, against the video standard |
+| `display` | swaps per second (generated ones among them), interval mean / 99th percentile / longest, "1% low" (the rate of the slowest 1% of intervals) |
+| `cpu` | emulation thread and render thread (% of one core, from the threads' CPU time: busy waits count), the process over all cores |
+| `gpu_time` | render thread only: a game frame's GPU elapsed time (from its first record, so it includes waits for records still to come) and a generated frame's |
+| `gpu` | this process's share of the 3D engine and every process's (Windows "GPU Engine" counters, any vendor; `PSX_GPU_ENGINE_STATS=0` skips them), this process's video memory and budget (DXGI); the whole GPU's load, clock, P-state and memory (NVML, NVIDIA only) |
+
+The GPU figures come from a sampler thread (`host_gpu_stats.c`); a summary
+read never waits on a driver. The whole-GPU counters include every other
+program; compare runs with the same desktop load.
+
 ## Scoped host budget
 
 Use a native Windows Python, not an MSYS path shim. For example, from the

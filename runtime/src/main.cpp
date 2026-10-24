@@ -88,6 +88,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "netplay_bios_settle.h"
 #include "netplay_exit_reason.h"
 #include "host_time.h"
+#include "host_gpu_stats.h"
 #if defined(PSX_HAS_RECOMP_NET)
 #include "recomp_net/auth.h"
 #include "recomp_netplay_account.h"   /* shared recomp-ui account sync */
@@ -653,6 +654,100 @@ static void fps_telemetry_toggle(void) {
         host_osd_set_status(NULL);
     s_fps_base_title.clear();
     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
+}
+
+/* ---- Performance summary (TCP perf_summary, the performance OSD line) -----
+ * Once a second on the emulation thread: the game's frame rate, what the
+ * window shows (swaps per second, their intervals: mean, 99th percentile,
+ * longest, the 1% low rate; generated ones among them), CPU (this thread, the
+ * render thread when it runs, the process over all cores), our frames' GPU
+ * time (render thread) and the GPU's own figures (our 3D engine share, every
+ * process's, load, clock, P-state, VRAM: host_gpu_stats.h). Runs while the
+ * FPS readout (F) is on or once TCP perf_summary has asked. */
+struct PerfSummary {
+    int valid = 0;
+    double window_s = 0, game_fps = 0, speed = 0;
+    GlPacing pace{};
+    double emu_cpu_pct = 0, render_cpu_pct = 0, process_cpu_pct = 0;
+    int cores = 1, render_thread = 0;
+    /* GPU time of our own frames (gl_renderer_gpu_totals, render thread):
+     * per game frame (elapsed, waits for records included) and per generated
+     * frame. The GPU's busy share is gpu.proc_3d_pct. */
+    int gpu_timed = 0, real_timed = 0, gen_timed = 0;
+    double real_gpu_ms = 0, gen_gpu_ms = 0;
+    PsxGpuStats gpu{};
+};
+static PerfSummary s_perf;
+static int      s_perf_wanted = 0;   /* TCP perf_summary asked once: keep measuring */
+static Uint64   s_perf_last_qpc = 0;
+static uint64_t s_perf_last_frame = 0, s_perf_last_emu_cpu = 0, s_perf_last_gl_cpu = 0, s_perf_last_proc_cpu = 0;
+static GlGpuTotals s_perf_last_gpu{};
+static void perf_summary_reset(void) {
+    s_perf_last_qpc = 0;
+    s_perf.valid = 0;
+}
+static void perf_summary_tick(uint64_t frame_count, double standard_hz) {
+    const Uint64 now = SDL_GetPerformanceCounter(), freq = SDL_GetPerformanceFrequency();
+    if (!freq) return;
+    if (!s_perf_last_qpc) {
+        s_perf_last_qpc = now; s_perf_last_frame = frame_count;
+        s_perf_last_emu_cpu = psx_host_thread_cpu_ns();
+        s_perf_last_gl_cpu = gl_renderer_gl_thread_cpu_ns();
+        s_perf_last_proc_cpu = psx_host_process_cpu_ns();
+        gl_renderer_gpu_totals(&s_perf_last_gpu);
+        return;
+    }
+    if (now - s_perf_last_qpc < freq) return;
+    const double secs = (double)(now - s_perf_last_qpc) / (double)freq;
+    const uint64_t emu = psx_host_thread_cpu_ns(), gl = gl_renderer_gl_thread_cpu_ns(), proc = psx_host_process_cpu_ns();
+    GlGpuTotals gt;
+    gl_renderer_gpu_totals(&gt);
+    PerfSummary p;
+    {
+        const GlGpuTotals &g0 = s_perf_last_gpu;
+        p.real_timed = (int)(gt.real_frames - g0.real_frames);
+        p.gen_timed = (int)(gt.gen_frames - g0.gen_frames);
+        if (p.real_timed > 0) p.real_gpu_ms = (double)(gt.real_ns - g0.real_ns) * 1e-6 / p.real_timed;
+        if (p.gen_timed > 0) p.gen_gpu_ms = (double)(gt.gen_ns - g0.gen_ns) * 1e-6 / p.gen_timed;
+        p.gpu_timed = p.real_timed > 0 || p.gen_timed > 0;
+    }
+    s_perf_last_gpu = gt;
+    p.window_s = secs;
+    p.game_fps = (double)(frame_count - s_perf_last_frame) / secs;
+    p.speed = standard_hz > 0 ? p.game_fps / standard_hz : 0;
+    p.cores = psx_host_cpu_count();
+    p.emu_cpu_pct = (double)(emu - s_perf_last_emu_cpu) * 1e-9 / secs * 100.0;
+    p.render_thread = gl_renderer_render_thread_active();
+    p.render_cpu_pct = p.render_thread ? (double)(gl - s_perf_last_gl_cpu) * 1e-9 / secs * 100.0 : 0.0;
+    p.process_cpu_pct = (double)(proc - s_perf_last_proc_cpu) * 1e-9 / secs * 100.0 / p.cores;
+    (void)gl_renderer_present_pacing(secs < 1.0 ? 1.0 : secs, &p.pace);
+    (void)psx_host_gpu_stats(&p.gpu);
+    p.valid = 1;
+    s_perf = p;
+    s_perf_last_qpc = now; s_perf_last_frame = frame_count;
+    s_perf_last_emu_cpu = emu; s_perf_last_gl_cpu = gl; s_perf_last_proc_cpu = proc;
+}
+/* The last second's summary as a JSON object body (TCP perf_summary). */
+extern "C" int psx_perf_summary_json(char *out, int cap) {
+    s_perf_wanted = 1;
+    const PerfSummary &p = s_perf;
+    return std::snprintf(out, (size_t)cap,
+        "\"valid\":%d,\"window_s\":%.2f,\"game_fps\":%.2f,\"speed\":%.3f,"
+        "\"display\":{\"fps\":%.1f,\"presents\":%d,\"generated\":%d,\"interval_avg_ms\":%.2f,"
+        "\"interval_p99_ms\":%.2f,\"interval_max_ms\":%.2f,\"low1_fps\":%.1f},"
+        "\"cpu\":{\"emu_thread_pct\":%.1f,\"render_thread_pct\":%.1f,\"render_thread\":%d,"
+        "\"process_pct_of_all\":%.1f,\"cores\":%d},"
+        "\"gpu_time\":{\"timed\":%d,\"real_frames\":%d,\"real_elapsed_ms\":%.3f,\"gen_frames\":%d,\"gen_ms\":%.3f},"
+        "\"gpu\":{\"engine_ok\":%d,\"proc_3d_pct\":%.1f,\"all_3d_pct\":%.1f,"
+        "\"ok\":%d,\"name\":\"%s\",\"util_pct\":%u,\"mem_util_pct\":%u,\"clock_mhz\":%u,\"pstate\":%d,"
+        "\"vram_used_mb\":%u,\"vram_total_mb\":%u,\"proc_ok\":%d,\"proc_vram_mb\":%u,\"proc_budget_mb\":%u}",
+        p.valid, p.window_s, p.game_fps, p.speed,
+        p.pace.fps, p.pace.presents, p.pace.generated, p.pace.avg_ms, p.pace.p99_ms, p.pace.max_ms, p.pace.low1_fps,
+        p.emu_cpu_pct, p.render_cpu_pct, p.render_thread, p.process_cpu_pct, p.cores,
+        p.gpu_timed, p.real_timed, p.real_gpu_ms, p.gen_timed, p.gen_gpu_ms,
+        p.gpu.engine_ok, p.gpu.proc_3d_pct, p.gpu.all_3d_pct,
+        p.gpu.ok, p.gpu.name, p.gpu.util_pct, p.gpu.mem_util_pct, p.gpu.clock_mhz, p.gpu.pstate,
+        p.gpu.vram_used_mb, p.gpu.vram_total_mb, p.gpu.proc_ok, p.gpu.proc_vram_mb, p.gpu.proc_budget_mb);
 }
 
 /* Hold-to-act host hotkeys must not fire while the game window does not hold
@@ -8854,6 +8949,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     RuntimePerfFrameScope runtime_perf_frame_scope;
     runtime_perf_diag_tick();
 
+    {   /* The performance summary runs with the FPS readout or for TCP. */
+        extern uint64_t s_frame_count;
+        if (fps_telemetry_enabled() || s_perf_wanted)
+            perf_summary_tick(s_frame_count, guest_video_standard_hz());
+        else
+            perf_summary_reset();
+    }
+
     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
      * than presents so turbo and skipped-frame modes still report game speed.
      * Skip during netplay post-load barrier — admit is stalled and the window
@@ -8892,8 +8995,44 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 SDL_SetWindowTitle(sdl_window, title);
             }
             if (!g_headless) {
-                char osd[96];
-                if (display_fps > 0.0) {
+                char osd[200];
+                const PerfSummary &p = s_perf;
+                if (p.valid) {
+                    /* Three lines: the rates; the display's intervals and our
+                     * frames' GPU time (game / generated, share of the time);
+                     * CPU (emulation, render thread), the GPU's own counters
+                     * (whole GPU) and this process's video memory. */
+                    char gen[16] = "";
+                    if (p.pace.generated > 0) snprintf(gen, sizeof(gen), " (%d gen)", p.pace.generated);
+                    char gtime[24] = "";
+                    if (p.gen_timed > 0) snprintf(gtime, sizeof(gtime), " | gen %.1fms", p.gen_gpu_ms);
+                    char cpu[32];
+                    if (p.render_thread)
+                        snprintf(cpu, sizeof(cpu), "CPU %.0f%% rnd %.0f%%", p.emu_cpu_pct, p.render_cpu_pct);
+                    else
+                        snprintf(cpu, sizeof(cpu), "CPU %.0f%%", p.emu_cpu_pct);
+                    /* GPU: our 3D engine share (all processes'), clock, P-state */
+                    char gpu[48] = "";
+                    int gn = 0;
+                    if (p.gpu.engine_ok) {
+                        gn = snprintf(gpu, sizeof(gpu), " | GPU %.0f%%", p.gpu.proc_3d_pct);
+                        if (p.gpu.all_3d_pct >= 0.0)
+                            gn += snprintf(gpu + gn, sizeof(gpu) - (size_t)gn, " (all %.0f%%)", p.gpu.all_3d_pct);
+                    } else if (p.gpu.ok) {
+                        gn = snprintf(gpu, sizeof(gpu), " | GPU all %u%%", p.gpu.util_pct);
+                    }
+                    if (p.gpu.ok && gn > 0 && gn < (int)sizeof(gpu))
+                        snprintf(gpu + gn, sizeof(gpu) - (size_t)gn, " %uMHz P%d", p.gpu.clock_mhz, p.gpu.pstate);
+                    char vram[24] = "";
+                    if (p.gpu.proc_ok) snprintf(vram, sizeof(vram), " | VRAM %.2fG", p.gpu.proc_vram_mb / 1024.0);
+                    snprintf(osd, sizeof(osd),
+                             "Game %.0f FPS  %.2fx | Display %.0f FPS%s\n"
+                             "Frame %.1fms p99 %.1f max %.1f 1%% %.0f%s\n"
+                             "%s%s%s",
+                             fps, speed, p.pace.presents > 0 ? p.pace.fps : display_fps, gen,
+                             p.pace.avg_ms, p.pace.p99_ms, p.pace.max_ms, p.pace.low1_fps, gtime,
+                             cpu, gpu, vram);
+                } else if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
                              "Game %.0f FPS  %.2fx | Display %.0f FPS",
                              fps, speed, display_fps);

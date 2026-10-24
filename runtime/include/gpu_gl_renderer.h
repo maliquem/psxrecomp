@@ -508,6 +508,22 @@ int  gl_renderer_frame_generation_method(void);
 typedef enum { GL_FG_HOLD_STEP_DOWN = 0, GL_FG_HOLD_OVER_BUDGET = 1 } GlFgHold;
 void gl_renderer_frame_gen_hold(GlFgHold kind, double secs);
 int  gl_renderer_frame_gen_json(char *out, int cap);
+/* The swaps of the last window_s seconds (performance summary): how many
+ * (generated ones among them), per second, the mean, 99th percentile and
+ * longest interval between them, and the "1% low" rate (that of the slowest
+ * 1% of the intervals). Returns the swaps counted. */
+typedef struct { int presents, generated; double fps, avg_ms, p99_ms, max_ms, low1_fps; } GlPacing;
+int  gl_renderer_present_pacing(double window_s, GlPacing *out);
+/* CPU time (ns) of the thread that swaps (the render thread, else the
+ * emulation thread), as of its last swap. */
+uint64_t gl_renderer_gl_thread_cpu_ns(void);
+/* GPU time of this renderer's own frames, running totals (ns, read back
+ * without waiting; render thread only): game frames (its per-frame query
+ * while it measures, for dynamic resolution or Smooth motion: the span from
+ * the frame's first record to its end, so it also holds the GPU's waits for
+ * records still to come) and generated frames (drawn in one go). */
+typedef struct { uint64_t real_frames, real_ns, gen_frames, gen_ns; } GlGpuTotals;
+void gl_renderer_gpu_totals(GlGpuTotals *out);
 /* TCP frame_gen {"prims":1}: the older and newer closed lists' triangles
  * (only those with no projection when only2d): index, key, view, which
  * corners have a projection (bits), x, y. */

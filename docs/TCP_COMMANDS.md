@@ -494,9 +494,9 @@ between Play and TCP availability.
 
 ## Complete command index (generated)
 
-**376 commands registered** — 363 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**385 commands registered** — 372 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-84 of 376 have prose above; **292 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+85 of 385 have prose above; **300 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -602,6 +602,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `event_ring_dump` | ✓ |  |  |
 | `event_ring_tail` | ✓ |  |  |
 | `exc_ring` |  | ✓ |  |
+| `extra_shader` | ✓ |  |  |
 | `first_failure` | ✓ | ✓ | ✓ |
 | `fmv_chroma` | ✓ |  | ✓ |
 | `fmv_enhance` | ✓ |  | ✓ |
@@ -731,6 +732,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `pc_probe_arm` | ✓ |  |  |
 | `pc_probe_clear` | ✓ |  |  |
 | `pc_probe_dump` | ✓ |  |  |
+| `perf_summary` | ✓ |  |  |
 | `pgxp` | ✓ |  | ✓ |
 | `pgxp_miss_ring` | ✓ |  |  |
 | `pgxp_shadow` | ✓ |  |  |
@@ -740,6 +742,9 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `phase_profile` | ✓ |  | ✓ |
 | `ping` | ✓ | ✓ | ✓ |
 | `post_aa` | ✓ |  | ✓ |
+| `post_shader` | ✓ |  |  |
+| `post_uniform` | ✓ |  |  |
+| `postfx_timing` | ✓ |  |  |
 | `present_image_ring_get` | ✓ |  |  |
 | `present_image_ring_stats` | ✓ |  |  |
 | `present_ring` | ✓ |  |  |
@@ -785,6 +790,8 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `segment_misses` | ✓ |  |  |
 | `set_input` | ✓ | ✓ | ✓ |
 | `set_snapshot` | ✓ | ✓ | ✓ |
+| `shadow_cache` | ✓ |  |  |
+| `shadow_hide` | ✓ |  |  |
 | `sio_arm_audit` | ✓ |  |  |
 | `sio_burst_stats` | ✓ |  |  |
 | `sio_ctrl_reg_clear` | ✓ |  |  |
@@ -801,6 +808,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `sio_write_window` |  | ✓ |  |
 | `snapshot_status` | ✓ |  | ✓ |
 | `sp_ring` | ✓ |  |  |
+| `sprite_dump` | ✓ |  |  |
 | `spu_events` | ✓ | ✓ |  |
 | `spu_events_reset` | ✓ |  |  |
 | `spu_ram` | ✓ |  |  |

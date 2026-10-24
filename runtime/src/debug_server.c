@@ -10922,6 +10922,22 @@ static void handle_frame_gen(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"enabled\":0");
 }
 
+/* Performance summary of the last second (main.cpp; also the FPS readout, F):
+ *   {"cmd":"perf_summary"} -> valid, game_fps, speed, display {fps, presents,
+ *   generated, interval avg / p99 / max ms, low1_fps}, cpu {emu thread %,
+ *   render thread %, process % of all cores}, gpu_time {our game / generated
+ *   frames' GPU ms, their share of the time}, gpu {whole GPU: util, clock,
+ *   P-state, VRAM; this process's VRAM and budget}.
+ *   The first request starts the measuring: valid is 0 for about a second. */
+int psx_perf_summary_json(char *out, int cap);
+static void handle_perf_summary(int id, const char *json)
+{
+    (void)json;
+    char buf[2048];
+    if (psx_perf_summary_json(buf, sizeof buf) <= 0) buf[0] = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"valid\":0");
+}
+
 /* Presented-image ring (see present_image_ring.h):
  *   {"cmd":"present_image_ring_stats"} -> oldest, newest, count, frozen
  *   {"cmd":"present_image_ring_get","frame":N,"path":"x.png"} */
@@ -16094,6 +16110,7 @@ static const CmdEntry s_commands[] = {
     { "present_image_ring_stats", handle_present_image_ring_stats },
     { "render_thread",     handle_render_thread },
     { "frame_gen",         handle_frame_gen },
+    { "perf_summary",      handle_perf_summary },
     { "present_image_ring_get",   handle_present_image_ring_get },
     { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
