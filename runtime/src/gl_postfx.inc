@@ -2099,9 +2099,13 @@ static void pfx_state_restore(const PfxGlState *st) {
 }
 
 /* fresh: the noted source is this present's (0: reuse the last mask).
- * with_aa: a real frame (runs AA too); 0: a Smooth motion generated frame. */
+ * with_aa: a real frame (runs AA too); 0: a Smooth motion generated frame.
+ * s_pfx_src_gen: a generated frame noted its own surfaces (fg_compose): its
+ * marks and depth are built from them, the rest stays a generated frame's
+ * (no light tracking step, no slot marked shown). */
+static int s_pfx_src_gen = 0;
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh) {
-    const int src_fresh = fresh;
+    const int src_fresh = fresh || s_pfx_src_gen;
     s_pfx_presents++;
     if (fresh) pfx_lights_update();
     if (!s_ctx) { s_mask_src_valid = 0; return; }

@@ -427,6 +427,10 @@ static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread()
 /* Frame generation (defined with the render-thread code near the end). */
 static int       s_fg_on;
 static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
+/* A generated frame's draws mark its own surfaces (fg_generate copied the
+ * real frame's marks under them): a chain that reads the marks or the depth
+ * then sees the picture it is given, not the real frame's. */
+static int       s_fg_marks;
 static void      fg_capture(const RtCmd *c, const void *payload);
 static int       fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stale);
 static void      fg_flush(void);
@@ -4480,7 +4484,7 @@ static int b3dm_passes(int semi, int b3d) {
  * keeps glowing. */
 #define BCLS_DRAW(semi, dmode, mask, check, b3d, DRAW) do {                    \
         DRAW;                                                                 \
-        if ((s_bcls_on || s_b3d_on) && (dmode) != 2 && !s_fg_drawing) {      \
+        if ((s_bcls_on || s_b3d_on) && (dmode) != 2 && (!s_fg_drawing || s_fg_marks)) { \
             if (s_bcls_on) {                                                  \
                 const int bcls_p_ = bcls_passes((semi), (b3d) == 2 ? 0 : (b3d)); \
                 bcls_begin(0, (semi) == 1 || (semi) == 3, 0x02);              \
@@ -4545,7 +4549,7 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         p_glUniform1i(s_uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
     }
-    if ((s_bcls_on || s_b3d_on) && !s_fg_drawing) {
+    if ((s_bcls_on || s_b3d_on) && (!s_fg_drawing || s_fg_marks)) {
         if (s_bcls_on) {
             const int bp = bcls_passes(semi, b3d == 2 ? 0 : b3d);
             bcls_begin(1, 0, 0x02);
@@ -12908,6 +12912,16 @@ static void fg_blit2(GLuint src, GLuint dst, int sx, int sy, int dx, int dy, int
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 }
+/* The marks (stencil) of the same rect: only while a chain reads them
+ * (s_fg_marks), for the depth-stencil blit's cost (fg_blit2). */
+static void fg_blit2_stencil(GLuint src, GLuint dst, int sx, int sy, int dx, int dy, int w, int h) {
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
 static void fg_blit(GLuint src, GLuint dst, int x, int y, int w, int h) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
@@ -13224,11 +13238,25 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
                             b->disp[2], b->disp[3], linear, lx, ly, lw, lh, 1, 1, s_out_scale);
     }
     /* A generated frame is the same picture: the same chains (AA stays on
-     * real frames only, as before the pipeline). It takes the newer real
-     * frame's mask: no stencil copies into the generation surfaces (a
-     * depth-stencil blit costs the CPU milliseconds on macOS) and no marking
-     * while they are drawn. */
+     * real frames only, as before the pipeline). Its marks and depth are its
+     * own when fg_generate gave it them (s_fg_marks: the generation surfaces,
+     * bound as hr / wide here, allocated at the scale); else (reprojection)
+     * it takes the newer real frame's. */
+    if (s_fg_marks && !s_fg_reprojected_now) {
+        if (b->wide) {
+            postfx_note_source(wide_fbo, wide_tex, (float)g_wide_w, (float)VRAM_H,
+                               0, b->disp[1], g_wide_w, b->disp[3]);
+            if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
+                postfx_note_center(s_hr_fbo, s_hr_tex, (float)VRAM_W, (float)VRAM_H, b->disp[0], b->disp[1],
+                                   g_wide_w - 2 * g_wide_off, b->disp[3], g_wide_off, g_wide_w);
+        } else {
+            postfx_note_source(s_hr_fbo, s_hr_tex, (float)VRAM_W, (float)VRAM_H,
+                               b->disp[0], b->disp[1], b->disp[2], b->disp[3]);
+        }
+        s_pfx_src_gen = 1;
+    }
     if (postfx_active()) postfx_present(0, 0, lx, ly, lw, lh);
+    s_pfx_src_gen = 0;
     postfx_pillar_fill(lx, ly, lw, lh);
 }
 
@@ -13807,6 +13835,18 @@ static int fg_generate(double t, int swap) {
         fg_blit2(s_hr_fbo, s_fg_hr_fbo, b->disp[0] * S, dy * S, L->disp[0] * S, ly * S, b->disp[2] * S, dh * S);
         if (iw >= 0) fg_blit2(s_wide_fbo[iw], s_fg_w_fbo, 0, dy * S, 0, ly * S, g_wide_w * S, dh * S);
     }
+    /* A chain reads the marks or the depth: the generated frame gets its own.
+     * The real frame's marks go under the copied image, the redraw marks over
+     * them (s_fg_marks) and draws its own depth, and fg_compose hands both to
+     * the chains; reusing the real frame's while the picture came from another
+     * camera put shadows, light and AO where the picture no longer is (they
+     * flickered between the real and the generated frames). */
+    s_fg_marks = 0;
+    if (!will_rp && (s_bcls_on || s_b3d_on || s_dep_on)) {
+        fg_blit2_stencil(s_hr_fbo, s_fg_hr_fbo, b->disp[0] * S, dy * S, L->disp[0] * S, ly * S, b->disp[2] * S, dh * S);
+        if (iw >= 0) fg_blit2_stencil(s_wide_fbo[iw], s_fg_w_fbo, 0, dy * S, 0, ly * S, g_wide_w * S, dh * S);
+        s_fg_marks = 1;
+    }
     GLuint t0 = s_hr_tex, f0 = s_hr_fbo, r0 = s_hr_rb;
     s_hr_tex = s_fg_hr_tex; s_hr_fbo = s_fg_hr_fbo; s_hr_rb = s_fg_hr_rb;
     GLuint wt = 0, wf = 0, wr = 0; int was = 0;
@@ -13873,6 +13913,7 @@ static int fg_generate(double t, int swap) {
     fg_compose(L, iw >= 0 ? s_fg_w_fbo : 0, iw >= 0 ? s_fg_w_tex : 0, b->linear, b->force43);
     s_fg_reprojected_now = 0;
     s_fg_drawing = 0;
+    s_fg_marks = 0;
     if (swap) {
         s_fg_presenting = 1;
         gl_swap_with_osd();
