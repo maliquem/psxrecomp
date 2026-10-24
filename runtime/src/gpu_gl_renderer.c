@@ -467,7 +467,8 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_FCAM, RTH_ANCHOR
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_FCAM, RTH_ANCHOR,
+    RTH_BACKFACES, RTH_SCAM
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -1322,9 +1323,27 @@ static void scc_ingest(void) {
 }
 /* The faces the game culled this frame (gte.cpp NCLIP via gpu.c): shadow-only
  * casters appended to the list of the area they belong to (a closed object's
- * far side, the underside of a hull), so its shadow is whole. */
+ * far side, the underside of a hull), so its shadow is whole. On a render
+ * thread they are recorded with the drawing (RTH_BACKFACES: the n faces' nine
+ * floats, then their areas) and added in stream order, where a sync would have
+ * added them: an acquire every frame was a sync point, which restarted Smooth
+ * motion's lists every frame. */
+static void backfaces_apply(const float *v9, const int *area4, int n);
 void gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n) {
-    GL_RT_SYNC("shadow_backfaces");
+    if (n <= 0) return;
+    if (rth_record_mode()) {
+        int32_t *p = (int32_t *)rt_cmd_begin(RTH_BACKFACES, 0, (uint32_t)n * 13u * 4u);
+        if (p) {
+            memcpy(p, v9, (size_t)n * 9u * sizeof(float));
+            memcpy(p + (size_t)n * 9u, area4, (size_t)n * 4u * sizeof(int));
+            rt_cmd_commit();
+            return;
+        }
+        gl_rth_acquire("shadow_backfaces");
+    }
+    backfaces_apply(v9, area4, n);
+}
+static void backfaces_apply(const float *v9, const int *area4, int n) {
     if (!s_sc_on) return;
     for (int i = 0; i < n; i++) {
         ScSlot *sl = sc_slot(area4 + i * 4, 1);
@@ -1343,8 +1362,25 @@ void gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n) 
     }
 }
 int gl_renderer_shadow_front_sign(void) { return s_scc_front; }
+/* Recorded with the drawing on a render thread (RTH_SCAM, as RTH_FCAM): it is
+ * handed over every VBlank, so a sync here was another per-frame sync point. */
+static void scam_apply(const float *rot, const float *tr, float ofx, float ofy, float h);
 void gl_renderer_shadow_camera(const float rot[9], const float tr[3], float ofx, float ofy, float h) {
-    GL_RT_SYNC("shadow_camera");
+    if (rth_record_mode()) {
+        int32_t v[16] = {0};
+        v[0] = rot != NULL;
+        if (rot) {
+            float c[15];
+            memcpy(c, rot, 9 * sizeof(float)); memcpy(c + 9, tr, 3 * sizeof(float));
+            c[12] = ofx; c[13] = ofy; c[14] = h;
+            memcpy(&v[1], c, sizeof c);
+        }
+        if (rth_rec_ints(RTH_SCAM, 0, 16, v)) return;
+        gl_rth_acquire("shadow_camera");
+    }
+    scam_apply(rot, tr, ofx, ofy, h);
+}
+static void scam_apply(const float *rot, const float *tr, float ofx, float ofy, float h) {
     if (!rot) { s_cam_ok = 0; s_cam_ring_n = 0; if (s_scc) scc_clear(); return; }   /* off: forget the scenery */
     memmove(&s_cam_ring[1], &s_cam_ring[0], 2 * sizeof s_cam_ring[0]);
     ScCam *cm = &s_cam_ring[0];
@@ -14745,6 +14781,18 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         float w[3];
         memcpy(w, v, sizeof w);
         if (v[3]) point_apply(w); else anchor_apply(w);
+        break;
+    }
+    case RTH_BACKFACES: {   /* n faces: 9n floats, then 4n ints */
+        const int n = (int)(c->payload / (13u * 4u));
+        backfaces_apply((const float *)v, (const int *)(v + (size_t)n * 9u), n);
+        break;
+    }
+    case RTH_SCAM: {
+        float sc[15];
+        memcpy(sc, &v[1], sizeof sc);
+        if (v[0]) scam_apply(sc, sc + 9, sc[12], sc[13], sc[14]);
+        else scam_apply(NULL, NULL, 0.0f, 0.0f, 0.0f);
         break;
     }
     case RTH_FILL:      glb_fill_rect(v[0], v[1], v[2], v[3], (uint16_t)v[4]); break;
