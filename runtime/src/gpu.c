@@ -246,6 +246,8 @@ static WsRepeatRectTag ws_repeat_rect_tags[WS_REPEAT_RECT_TAG_TABLE_SIZE];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
 static uint32_t ws_phase_stretch_stamp = (uint32_t)-1000; /* frame of newest stretched phase backdrop */
+static uint32_t ws_prim_pred_stamp = (uint32_t)-1000;     /* ... of a polygon the title's predicate stretched */
+static int (*s_ws_wide_prim_predicate)(uint32_t op, uint32_t ot_rank, uint32_t flags);
 static int ws_nw_phase_backdrop;   /* [widescreen] nw_phase_backdrop (set below) */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
@@ -497,7 +499,7 @@ static void ws_reset_scene_history(void) {
     memset(&ws_scene_latch, 0, sizeof ws_scene_latch);
     ws_bdx_reset(&ws_bdx);
     ws_last_tag_stamp = ws_last_3d_stamp = ws_last_gte_stamp = expired;
-    ws_phase_stretch_stamp = expired;
+    ws_phase_stretch_stamp = ws_prim_pred_stamp = expired;
     ws_last_world3d_stamp = ws_sust_world3d_stamp = expired;
     ws_last_ovh_stamp = ws_sust_ovh_stamp = expired;
     ws_gte_frame = ws_ovh_frame = (uint32_t)-1;
@@ -3077,8 +3079,10 @@ int gpu_ws_background_requires_full_composite(void) {
     /* A stretched phase backdrop (psx_ws_prim_in_backdrop) differs inside the
      * canonical view too: the centre is drawn again, not copied, so the
      * stretched picture has no seam at the 4:3 edges. */
-    return ws_nw_phase_backdrop && ws_native_wide_configured() &&
-           (uint32_t)s_frame_count - ws_phase_stretch_stamp <= 2u;
+    if (!ws_native_wide_configured()) return 0;
+    if (ws_nw_phase_backdrop && (uint32_t)s_frame_count - ws_phase_stretch_stamp <= 2u) return 1;
+    /* so does a polygon the title's predicate stretched (gpu_ws_set_wide_prim_predicate) */
+    return (uint32_t)s_frame_count - ws_prim_pred_stamp <= 2u;
 }
 
 static int ws_nw_explicit_background(void) {
@@ -3337,6 +3341,9 @@ static int ws_tagged_anchor(int32_t *out_ax) {
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
 static int ws_nw_phase_backdrop = 0;
 void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
+void gpu_ws_set_wide_prim_predicate(int (*predicate)(uint32_t op, uint32_t ot_rank, uint32_t flags)) {
+    s_ws_wide_prim_predicate = predicate;
+}
 static int ws_nw_textured_edges = 0;
 int g_ws_tex_edge_pct = 0;
 void gpu_ws_set_nw_textured_edges(int on, int scale_pct) {
@@ -3441,6 +3448,23 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    /* The title's own answer for this primitive (gpu_ws_set_wide_prim_predicate):
+     * 4 = stretched, unmarked; 3 = only the vertices on or past the edges;
+     * KEEP = none of the rules below. */
+    if (s_ws_wide_prim_predicate && ws_native_wide_active()) {
+        const uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+        if (op >= 0x20u && op <= 0x7Fu) {
+            const uint32_t f = (uint32_t)s_frame_count;
+            const uint32_t flags = (ws_bg_phase_over() ? 0u : GPU_WS_WIDE_PRIM_BACKDROP) |
+                (f - ws_last_gte_stamp <= 4u || f - ws_last_world3d_stamp <= 4u ? GPU_WS_WIDE_PRIM_WORLD3D : 0u);
+            const int r = s_ws_wide_prim_predicate(op, gp0_ot_rank, flags);
+            if (r == GPU_WS_WIDE_PRIM_KEEP) return 0;
+            if ((r == GPU_WS_WIDE_PRIM_STRETCH || r == GPU_WS_WIDE_PRIM_EDGES) && op <= 0x3Fu) {
+                ws_prim_pred_stamp = f;
+                return r == GPU_WS_WIDE_PRIM_STRETCH ? 4 : 3;
+            }
+        }
+    }
     /* Explicit title provenance outranks the legacy draw-order heuristic.
      * Early-sorted world sprites must not be stretched into the reveal. */
     if (ws_tagged_world_primitive()) return 0;

@@ -603,6 +603,32 @@ void gpu_ws_set_nw_flat_backdrop(int on);
 int  gpu_ws_nw_flat_backdrop_enabled(void);
 /* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
 void gpu_ws_set_nw_phase_backdrop(int on);
+/* Title-owned native-wide stretch per primitive, for screens a title knows (a
+ * 2D menu's painted backdrop, an iris wipe). While a native-wide frame is drawn
+ * the predicate is asked about each polygon, line and rectangle (op 0x20..0x7F,
+ * its GP0 command byte),
+ * ot_rank = its ordering-table rank in the linked list being drawn (0xFFFF
+ * outside one), flags = GPU_WS_WIDE_PRIM_BACKDROP while no shaded polygon has
+ * been drawn yet this frame, | GPU_WS_WIDE_PRIM_WORLD3D while the GTE projected
+ * a 3D world in the last few frames. It answers
+ *   GPU_WS_WIDE_PRIM_DEFAULT: the other native-wide rules decide;
+ *   GPU_WS_WIDE_PRIM_STRETCH: stretched about the display centre to the wide
+ *     view (not marked as a painted 3D backdrop for the post effects);
+ *   GPU_WS_WIDE_PRIM_EDGES: only its vertices on or past the picture's left
+ *     or right edge are scaled about the centre to the wide view, so a
+ *     screen-covering effect covers the wide view while what lies inside the
+ *     picture keeps its place (the software renderer stretches it whole);
+ *   GPU_WS_WIDE_PRIM_KEEP: never stretched (a window drawn in the backdrop
+ *     phase, which nw_phase_backdrop would stretch).
+ * STRETCH and EDGES apply to polygons. Render-only: guest VRAM and the
+ * canonical 4:3 picture are untouched, 4:3 never asks. The pure, cheap
+ * predicate runs on the emulation thread: no GPU calls, allocation or guest
+ * writes. NULL removes it. */
+#define GPU_WS_WIDE_PRIM_BACKDROP 1u
+#define GPU_WS_WIDE_PRIM_WORLD3D  2u
+enum { GPU_WS_WIDE_PRIM_DEFAULT = 0, GPU_WS_WIDE_PRIM_STRETCH = 1, GPU_WS_WIDE_PRIM_EDGES = 2,
+       GPU_WS_WIDE_PRIM_KEEP = 3 };
+void gpu_ws_set_wide_prim_predicate(int (*predicate)(uint32_t op, uint32_t ot_rank, uint32_t flags));
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the

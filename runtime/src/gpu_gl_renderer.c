@@ -2642,7 +2642,10 @@ static const char *GEO_VS =
     "  v_col = vec4(a_col.rgb, m); v_col_p = a_col.rgb; v_cp = int(cp);\n"
     "  v_b3d = (a >= 0.0 && sz > 0.5) ? 1.0 : 0.0;\n"
     "  float xb = a_pos.x;\n"
-    "  if (u_xscale < 0.0) {\n"
+    "  if (u_xscale >= 1000.0) {   /* 1000 + s: only vertices on or past the edges, about the centre */\n"
+    "    float s = u_xscale - 1000.0; float h = u_xhalf / s;\n"
+    "    if (xb <= u_xcenter - h || xb >= u_xcenter + h) xb = (xb - u_xcenter)*s + u_xcenter;\n"
+    "  } else if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
     "    float l = u_xcenter - h, r = u_xcenter + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
@@ -2730,7 +2733,10 @@ static const char *TEX_VS =
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
     "  float xb = a_pos.x;\n"
-    "  if (u_xscale < 0.0) {\n"
+    "  if (u_xscale >= 1000.0) {   /* 1000 + s: only vertices on or past the edges, about the centre */\n"
+    "    float s = u_xscale - 1000.0; float h = u_xhalf / s;\n"
+    "    if (xb <= u_xcenter - h || xb >= u_xcenter + h) xb = (xb - u_xcenter)*s + u_xcenter;\n"
+    "  } else if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
     "    float l = u_xcenter - h, r = u_xcenter + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
@@ -4292,6 +4298,8 @@ static void wide_bd_scale(int gate, float *out_scale, float *out_center) {
                 scale = g_ws_tex_edge_pct > 0
                       ? (float)g_ws_tex_edge_pct / 100.0f : scale;
                 scale = -scale; /* shader: expand only beyond canonical edges */
+            } else if (gate == 3) {
+                scale += 1000.0f; /* shader: vertices on or past the edges, about the centre */
             }
             center = (float)g_wide_cur_base + (float)native_w / 2.0f;
         }
@@ -12084,7 +12092,8 @@ static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 
 #define RTHF_PRIM      0x0001u
 #define RTHF_TAGGED    0x0002u
-#define RTHF_BD_SHIFT  2          /* bits 2-3: psx_ws_prim_in_backdrop() 0..3 */
+#define RTHF_BD_SHIFT  2          /* bits 2-4: psx_ws_prim_in_backdrop() 0..4 */
+#define RTHF_BD_MASK   7u
 
 static void rth_mirror_resync(void) {
     s_rthm_scale = s_out_scale;
@@ -12145,11 +12154,11 @@ static void rth_send_state(void) {
 static uint16_t rth_prim_flags(void) {
     if (s_rthm_wide_w <= 0 || !g_ws_bd_stretch_on) {
         if (!s_b3d_on) return 0;
-        return (uint16_t)(RTHF_PRIM | ((psx_ws_prim_in_backdrop() & 3) << RTHF_BD_SHIFT));
+        return (uint16_t)(RTHF_PRIM | ((psx_ws_prim_in_backdrop() & RTHF_BD_MASK) << RTHF_BD_SHIFT));
     }
     uint16_t f = RTHF_PRIM;
     if (g_ws_bd_phase_mode != 0)
-        f |= (uint16_t)((psx_ws_prim_in_backdrop() & 3) << RTHF_BD_SHIFT);
+        f |= (uint16_t)((psx_ws_prim_in_backdrop() & RTHF_BD_MASK) << RTHF_BD_SHIFT);
     else if (psx_ws_prim_is_tagged())
         f |= RTHF_TAGGED;
     return f;
@@ -13385,7 +13394,7 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         const int32_t *v = (const int32_t *)pl;
         s_rthx_prim = (h.flags & RTHF_PRIM) != 0;
         s_rthx_tagged = (h.flags & RTHF_TAGGED) != 0;
-        s_rthx_backdrop = (h.flags >> RTHF_BD_SHIFT) & 3;
+        s_rthx_backdrop = (h.flags >> RTHF_BD_SHIFT) & RTHF_BD_MASK;
         const int area[4] = { s_area_x1, s_area_y1, s_area_x2, s_area_y2 };
         const int in = !s_fg_replay_objects_only && fg_area_meets(area, disp);
         switch (h.op) {
@@ -15581,7 +15590,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     const int32_t *v = (const int32_t *)payload;
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
-    s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & 3;
+    s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & RTHF_BD_MASK;
     if (c->op == RTH_FRAME) { rthf_end(); return; }
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
