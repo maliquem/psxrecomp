@@ -11,12 +11,15 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
+#else
+#include <sys/stat.h>
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -504,6 +507,28 @@ static int hb_format_cpu_scratchpad(char *out, size_t cap) {
     return n;
 }
 
+/* Where the full dumps go (tens of MB each, up to two per run): the folder
+ * PSX_FREEZE_DUMP_DIR names, else freeze_dumps/ in the working directory,
+ * made on demand, so they pile up apart from the executable's own files
+ * (a folder that can be moved to a roomier disk). An empty
+ * PSX_FREEZE_DUMP_DIR keeps them in the working directory itself. */
+static int freeze_dump_full_path(char *out, size_t cap, const char *name) {
+    const char *dir = getenv("PSX_FREEZE_DUMP_DIR");
+    if (!dir) dir = "freeze_dumps";
+    int n;
+    if (!*dir) {
+        n = snprintf(out, cap, "%s", name);
+    } else {
+#ifdef _WIN32
+        (void)CreateDirectoryA(dir, NULL);
+#else
+        (void)mkdir(dir, 0777);
+#endif
+        n = snprintf(out, cap, "%s/%s", dir, name);
+    }
+    return n > 0 && (size_t)n < cap;
+}
+
 static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
                              uint64_t exc_reentry, uint32_t cur_fn,
                              uint32_t last_store, uint32_t i_stat_v,
@@ -526,9 +551,10 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         return 0;
 #endif
 
-    char path[128];
+    char name[128], path[512];
     uint32_t sequence = s_dump_sequence++;
-    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
+    if (!freeze_dump_format_path(name, sizeof(name), s_backend, wall, sequence) ||
+        !freeze_dump_full_path(path, sizeof(path), name)) {
         freeze_dump_unlock();
         return 0;
     }
