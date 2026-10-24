@@ -70,6 +70,13 @@ static uint32_t *s_canvas;
 static int s_canvas_w, s_canvas_on;
 static int s_win_w = 4, s_win_h = 3;
 
+/* A title's page (shares the canvas: never open with the menu) and its HUD
+ * (own canvas, kept while a page or the menu covers it). */
+static PsxTitleCanvasRenderer s_page, s_hud;
+static int s_page_dirty, s_page_on;
+static uint32_t *s_hud_canvas;
+static int s_hud_w, s_hud_dirty, s_hud_on;
+
 static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
 {
     int x, y;
@@ -315,7 +322,7 @@ void psx_savestate_menu_note_slots_changed(void)
 
 int psx_savestate_menu_needs_present(void)
 {
-    return s_open;
+    return s_open || s_page;
 }
 
 void psx_savestate_menu_set_renderer(PsxSaveStateMenuRenderer renderer)
@@ -330,36 +337,101 @@ void psx_savestate_menu_set_window(int w, int h)
     s_win_w = w;
     s_win_h = h;
     s_dirty = 1;
+    s_page_dirty = 1;
+    s_hud_dirty = 1;
+}
+
+void psx_savestate_menu_set_page(PsxTitleCanvasRenderer page)
+{
+    s_page = page;
+    s_page_dirty = 1;
+    s_dirty = 1;       /* the menu's canvas is shared */
+    s_hud_dirty = 1;
+}
+
+void psx_savestate_menu_page_redraw(void)
+{
+    s_page_dirty = 1;
+}
+
+void psx_savestate_menu_set_hud(PsxTitleCanvasRenderer hud)
+{
+    s_hud = hud;
+    s_hud_dirty = 1;
+    if (!hud) s_hud_on = 0;
+}
+
+void psx_savestate_menu_hud_redraw(void)
+{
+    s_hud_dirty = 1;
 }
 
 int psx_savestate_menu_overlay_blend(void)
 {
-    return s_open && s_canvas_on;
+    if (s_open) return s_canvas_on;
+    return (s_page && s_page_on) || (!s_page && s_hud_on);
+}
+
+static int canvas_width(void)
+{
+    int cw = (int)((int64_t)SSM_CANVAS_H * s_win_w / s_win_h);
+    if (cw < 320) cw = 320;
+    if (cw > SSM_CANVAS_MAX_W) cw = SSM_CANVAS_MAX_W;
+    return cw;
+}
+
+static uint32_t *canvas_buffer(uint32_t **buf)
+{
+    if (!*buf) *buf = (uint32_t *)malloc((size_t)SSM_CANVAS_MAX_W * SSM_CANVAS_H * sizeof(uint32_t));
+    return *buf;
 }
 
 /* The title's canvas, when it has a renderer and draws this time. */
 static int render_canvas(void)
 {
-    int cw = (int)((int64_t)SSM_CANVAS_H * s_win_w / s_win_h);
-    if (!s_renderer) return 0;
-    if (cw < 320) cw = 320;
-    if (cw > SSM_CANVAS_MAX_W) cw = SSM_CANVAS_MAX_W;
-    if (!s_canvas) {
-        s_canvas = (uint32_t *)malloc((size_t)SSM_CANVAS_MAX_W * SSM_CANVAS_H * sizeof(uint32_t));
-        if (!s_canvas) return 0;
-    }
+    const int cw = canvas_width();
+    if (!s_renderer || !canvas_buffer(&s_canvas)) return 0;
     memset(s_canvas, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
     s_canvas_w = cw;
     return s_renderer(s_selected, s_canvas, cw, SSM_CANVAS_H) != 0;
 }
 
+static int title_canvas(PsxTitleCanvasRenderer fn, uint32_t **buf, int *bw)
+{
+    const int cw = canvas_width();
+    if (!fn || !canvas_buffer(buf)) return 0;
+    memset(*buf, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    *bw = cw;
+    return fn(*buf, cw, SSM_CANVAS_H) != 0;
+}
+
+static int give(const uint32_t *px, int pw, int ph, const uint32_t **pixels, int *w, int *h)
+{
+    if (pixels) *pixels = px;
+    if (w) *w = pw;
+    if (h) *h = ph;
+    return px != NULL;
+}
+
 int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
 {
     if (!s_open) {
-        if (pixels) *pixels = NULL;
-        if (w) *w = 0;
-        if (h) *h = 0;
-        return 0;
+        if (s_page) {
+            if (s_page_dirty) {
+                s_page_on = title_canvas(s_page, &s_canvas, &s_canvas_w);
+                s_page_dirty = 0;
+            }
+            return s_page_on ? give(s_canvas, s_canvas_w, SSM_CANVAS_H, pixels, w, h)
+                             : give(NULL, 0, 0, pixels, w, h);
+        }
+        if (s_hud) {
+            if (s_hud_dirty) {
+                s_hud_on = title_canvas(s_hud, &s_hud_canvas, &s_hud_w);
+                s_hud_dirty = 0;
+            }
+            if (s_hud_on) return give(s_hud_canvas, s_hud_w, SSM_CANVAS_H, pixels, w, h);
+        }
+        return give(NULL, 0, 0, pixels, w, h);
     }
     if (s_dirty) {
         s_canvas_on = render_canvas();

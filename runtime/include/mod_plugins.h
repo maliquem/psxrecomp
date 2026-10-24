@@ -1155,6 +1155,45 @@ void psx_mod_set_savestate_load_blocked(int blocked);
 void psx_mod_set_fast_forward_blocked(int blocked);
 void psx_mod_set_debug_tools_restricted(int restricted);
 
+/* A title's own page over the frozen game (e.g. an achievements list), run
+ * like the save state menu: while it is open the guest is held at the vblank
+ * present and audio pauses; `render` draws the page's canvas (as the save
+ * state menu renderer's: 240 lines, as wide as the window's aspect gives,
+ * ARGB, alpha blended over the frozen picture, after every effect) when
+ * psx_mod_title_page_redraw() asked; `input` runs every host tick (~8 ms)
+ * with P1's controller as PSX_MOD_PAGE_* bits (pressed this tick, directions
+ * repeating while held, and held; what was held at opening counts only after
+ * a release) and, once per key press or repeat, its SDL keycode and modifiers
+ * (key 0 otherwise). input returns 0 to close the page. Open from a VBlank or
+ * hook callback; the page starts at the next vblank present. Refused (0)
+ * while the save state menu, rewind or netplay is up. Closed at each
+ * session's activation. */
+enum {
+    PSX_MOD_PAGE_UP = 1u << 0, PSX_MOD_PAGE_DOWN = 1u << 1,
+    PSX_MOD_PAGE_LEFT = 1u << 2, PSX_MOD_PAGE_RIGHT = 1u << 3,
+    PSX_MOD_PAGE_SOUTH = 1u << 4, PSX_MOD_PAGE_EAST = 1u << 5,   /* Cross, Circle */
+    PSX_MOD_PAGE_WEST = 1u << 6, PSX_MOD_PAGE_NORTH = 1u << 7,   /* Square, Triangle */
+    PSX_MOD_PAGE_L1 = 1u << 8, PSX_MOD_PAGE_R1 = 1u << 9,
+    PSX_MOD_PAGE_L2 = 1u << 10, PSX_MOD_PAGE_R2 = 1u << 11,
+    PSX_MOD_PAGE_START = 1u << 12, PSX_MOD_PAGE_SELECT = 1u << 13
+};
+typedef int (*PSXModCanvasRenderer)(uint32_t *argb, int w, int h);
+typedef int (*PSXModTitlePageInput)(uint32_t pressed, uint32_t held, int key, int key_mods);
+int  psx_mod_open_title_page(PSXModCanvasRenderer render, PSXModTitlePageInput input);
+int  psx_mod_title_page_open(void);
+void psx_mod_title_page_redraw(void);
+/* A title's HUD over the running game (e.g. a notification), the same kind
+ * of canvas, drawn after every effect and over the OSD when no menu or page
+ * covers it: `render` runs when psx_mod_title_hud_redraw() asked (call it
+ * every VBlank while it animates) and returns 0 when there is nothing to
+ * show. NULL removes; cleared at each session's activation. */
+void psx_mod_set_title_hud(PSXModCanvasRenderer render);
+void psx_mod_title_hud_redraw(void);
+/* Save the next presented picture (with the OSD, a page or HUD, as shown) as
+ * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
+ * One request at a time: a newer one replaces a pending one. */
+int  psx_mod_request_screenshot(const char* path);
+
 /* Path of the disc the player picked, never a disc-patching mod's private
  * image: identifies the stock title to outside services (e.g. an achievement
  * hash). Returns 0 (empty string) when unknown or `cap` is too small. */

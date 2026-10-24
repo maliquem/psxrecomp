@@ -8867,6 +8867,128 @@ static void savestate_menu_host_pause_loop(void) {
     savestate_input_guard_arm();
 }
 
+/* A title's page (psx_mod_open_title_page): drawn through the save state
+ * menu's canvas, run by its own pause loop. */
+static PSXModTitlePageInput g_title_page_input = nullptr;
+static int g_title_page_open = 0;
+
+static void title_page_close(void) {
+    g_title_page_open = 0;
+    g_title_page_input = nullptr;
+    psx_savestate_menu_set_page(nullptr);
+}
+
+extern "C" int psx_mod_open_title_page(PSXModCanvasRenderer render, PSXModTitlePageInput input) {
+    if (!render || !input || g_title_page_open) return 0;
+    if (savestate_menu_open || psx_rewind_is_open() || psx_netplay_active()) return 0;
+    g_title_page_input = input;
+    g_title_page_open = 1;
+    psx_savestate_menu_set_page(render);
+    return 1;
+}
+extern "C" int psx_mod_title_page_open(void) { return g_title_page_open; }
+extern "C" void psx_mod_title_page_redraw(void) { psx_savestate_menu_page_redraw(); }
+extern "C" void psx_mod_set_title_hud(PSXModCanvasRenderer render) { psx_savestate_menu_set_hud(render); }
+extern "C" void psx_mod_title_hud_redraw(void) { psx_savestate_menu_hud_redraw(); }
+extern "C" int psx_mod_request_screenshot(const char* path) { return present_shot_request(path); }
+
+/* P1's controller as PSX_MOD_PAGE_* bits (the debug host layer too). */
+static uint32_t title_page_buttons(void) {
+    if (!p1_host_present()) return 0;
+    const int dz = 16000;
+    const int lx = p1_host_axis_value(nullptr, SDL_CONTROLLER_AXIS_LEFTX);
+    const int ly = p1_host_axis_value(nullptr, SDL_CONTROLLER_AXIS_LEFTY);
+    uint32_t b = 0;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_UP) || ly < -dz) b |= PSX_MOD_PAGE_UP;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || ly > dz) b |= PSX_MOD_PAGE_DOWN;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || lx < -dz) b |= PSX_MOD_PAGE_LEFT;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || lx > dz) b |= PSX_MOD_PAGE_RIGHT;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_A)) b |= PSX_MOD_PAGE_SOUTH;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_B)) b |= PSX_MOD_PAGE_EAST;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_X)) b |= PSX_MOD_PAGE_WEST;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_Y)) b |= PSX_MOD_PAGE_NORTH;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) b |= PSX_MOD_PAGE_L1;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) b |= PSX_MOD_PAGE_R1;
+    if (p1_host_axis_value(nullptr, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > dz) b |= PSX_MOD_PAGE_L2;
+    if (p1_host_axis_value(nullptr, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > dz) b |= PSX_MOD_PAGE_R2;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_START)) b |= PSX_MOD_PAGE_START;
+    if (p1_host_button_down(nullptr, SDL_CONTROLLER_BUTTON_BACK)) b |= PSX_MOD_PAGE_SELECT;
+    return b;
+}
+
+static void title_page_host_pause_loop(void) {
+    const uint32_t dirs = PSX_MOD_PAGE_UP | PSX_MOD_PAGE_DOWN | PSX_MOD_PAGE_LEFT | PSX_MOD_PAGE_RIGHT;
+    jogcon_ffb_neutral_all();
+    psx_local_mouse_begin(sdl_window, false);
+    psx_local_mouse_reset();
+    freeze_heartbeat_set_paused(1);
+    psx_sdl_audio_set_paused(sdl_audio_device, 1);
+    uint32_t prev = title_page_buttons();
+    uint32_t ignore = prev;      /* held at opening (the shortcut): only after a release */
+    uint32_t repeat_at = 0;
+    while (g_title_page_open) {
+#ifndef PSX_NO_DEBUG_TOOLS
+        debug_server_poll();
+#endif
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            (void)psx_local_mouse_event(ev);
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                refresh_player_devices();
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                close_controller();
+                refresh_player_devices();
+            } else if (ev.type == SDL_KEYDOWN && g_title_page_open) {
+#if defined(PSX_SDL3)
+                const int mod = (int)ev.key.mod;
+                const int key = (int)ev.key.key;
+#else
+                const int mod = (int)ev.key.keysym.mod;
+                const int key = (int)ev.key.keysym.sym;
+#endif
+                if (!g_title_page_input(0, prev, key, mod)) title_page_close();
+            }
+        }
+        if (!g_title_page_open) break;
+        const uint32_t now = (uint32_t)SDL_GetTicks();
+        uint32_t held = title_page_buttons();
+        ignore &= held;
+        held &= ~ignore;
+        uint32_t pressed = held & ~prev;
+        if (pressed & dirs) {
+            repeat_at = now + 320;
+        } else if ((held & dirs) && (int32_t)(now - repeat_at) >= 0) {
+            pressed |= held & dirs;
+            repeat_at = now + 70;
+        }
+        prev = held;
+        if (!g_title_page_input(pressed, held, 0, 0)) {
+            title_page_close();
+            break;
+        }
+        {
+            int ww = 0, wh = 0;   /* a resized window redraws the canvas */
+            if (sdl_window) SDL_GetWindowSize(sdl_window, &ww, &wh);
+            psx_savestate_menu_set_window(ww, wh);
+        }
+        rewind_pause_present();
+        starvation_watchdog_heartbeat();
+        SDL_Delay(8);
+    }
+    psx_sdl_audio_set_paused(sdl_audio_device, 0);
+    freeze_heartbeat_set_paused(0);
+    /* Resume as host_pause_loop does: re-anchor pacing, audio and dynamic
+     * resolution, and keep the closing press from reaching the game. */
+    present_session_reset();
+    g_audio_cycle_resync = 1;
+    dynres_note_savestate_loaded();
+    savestate_input_guard_arm();
+}
+
 /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
  * is destroyed — episode snap load longjmps via psx_netplay_rb_flush_resume and
  * must not cross non-trivial destructors (UB / guest crash). */
@@ -9327,6 +9449,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
         if (savestate_menu_open)
             savestate_menu_host_pause_loop();
+        if (g_title_page_open)
+            title_page_host_pause_loop();
         if (psx_rewind_is_open())
             rewind_host_pause_loop();
         if (psx_host_pause_depth() > 0)
@@ -9738,6 +9862,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_pause_service();
                 // A hotkey acquired during pacing may open a host menu.
                 if (savestate_menu_open) savestate_menu_host_pause_loop();
+                if (g_title_page_open) title_page_host_pause_loop();
                 if (psx_rewind_is_open()) rewind_host_pause_loop();
                 if (psx_host_pause_depth() > 0) host_pause_loop();
                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
@@ -20307,6 +20432,8 @@ int main(int argc, char** argv) {
         savestate_set_title_blocked(0);
         savestate_set_title_load_blocked(0);
         g_mod_fast_forward_blocked = 0;
+        title_page_close();
+        psx_savestate_menu_set_hud(nullptr);
         debug_server_set_restricted(0);
         psx_savestate_menu_set_renderer(nullptr);
         for (auto& policy : g_mod_controller_policy)
