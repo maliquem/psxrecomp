@@ -13317,11 +13317,15 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
             g_wide_cur_base = v[0];
             break;
         case RTH_WIDE_DISABLE: glb_wide_disable_target(); break;
+        /* The wide surface's clears before anything is drawn are not redrawn,
+         * as the fills below: what the in-between camera uncovers at the sides
+         * shows the newer real frame there, not the clear colour (black
+         * patches along the screen edges while the camera turned). */
         case RTH_WIDE_CLEAR:
-            if (v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only) glb_wide_clear(v[0], v[1], v[2], (uint16_t)v[3]);
+            if (drawn && v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only) glb_wide_clear(v[0], v[1], v[2], (uint16_t)v[3]);
             break;
         case RTH_WIDE_CLEAR_MARGINS:
-            if (v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only)
+            if (drawn && v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only)
                 glb_wide_clear_margins(v[0], v[1], v[2], (uint16_t)v[3], v[4]);
             break;
         case RTH_FILL:
