@@ -12603,6 +12603,20 @@ static int fg_tri_geom(uint16_t op, const void *payload, const int32_t *pc,
         pc = NULL;
         break;
     }
+    /* A textured rectangle (a sprite: gpu.c draws an axis-aligned 2D quad as
+     * one) is a 2D primitive too: its top-left corner and its two edges, the
+     * key what it draws. Redraw only: fg_hud_lerp moves it, fg_replay draws it
+     * translated whole. Reprojection keeps its own rules for 2D. */
+    case RTH_TEX_RECT:          /* x, y, w, h, u, v, clut x, clut y, page */
+    case RTH_TEX_RECT_SCALED:   /* x, y, w, h, u0, v0, u1, v1, clut x, clut y, page */
+        if (s_fg_reproject) return 0;
+        x[0] = (float)v[0]; y[0] = (float)v[1];
+        x[1] = (float)(v[0] + v[2]); y[1] = (float)v[1];
+        x[2] = (float)v[0]; y[2] = (float)(v[1] + v[3]);
+        kw[k++] = op;
+        for (int i = 2; i < (op == RTH_TEX_RECT ? 9 : 11); i++) kw[k++] = v[i];
+        pc = NULL;
+        break;
     default:
         return 0;
     }
@@ -12746,7 +12760,7 @@ static void fg_capture(const RtCmd *c, const void *payload) {
         /* The identities belong to this triangle only if it is drawn where
          * they were looked up (a culled triangle leaves its record behind). */
         for (int k = 0; k < 3; k++) raw.vid[k] = 0;
-        if (s_fg_src_valid) {
+        if (s_fg_src_valid && c->op != RTH_TEX_RECT && c->op != RTH_TEX_RECT_SCALED) {
             int at = 1;
             for (int k = 0; k < 3; k++)
                 if (fabsf(raw.x[k] - (float)s_fg_src[3 + 2 * k]) > 1.5f ||
@@ -13069,16 +13083,25 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
             drawn |= in;
             if (in) glb_draw_flat_rect(v[0], v[1], v[2], v[3], (uint16_t)v[4]);
             break;
-        case RTH_TEX_RECT:
+        case RTH_TEX_RECT: case RTH_TEX_RECT_SCALED: {
+            /* A sprite fg_hud_lerp matched in the other frame: translated
+             * whole to its in-between place, on the native pixel grid (the
+             * pixel art stays as sharp as the real frames draw it). */
+            int ox = 0, oy = 0;
+            const int pi = placed == 1 && b->rec2prim ? b->rec2prim[r] : -1;
+            if (pi >= 0) {
+                ox = (int)lrintf(s_fg_px[3 * pi] - b->prims.v[pi].x[0]);
+                oy = (int)lrintf(s_fg_py[3 * pi] - b->prims.v[pi].y[0]);
+            }
             drawn |= in;
-            if (in) glb_draw_textured_rect(v[0], v[1], v[2], v[3], v[4], v[5],
-                                           (uint16_t)v[6], (uint16_t)v[7], (uint16_t)v[8]);
+            if (in && h.op == RTH_TEX_RECT)
+                glb_draw_textured_rect(v[0] + ox, v[1] + oy, v[2], v[3], v[4], v[5],
+                                       (uint16_t)v[6], (uint16_t)v[7], (uint16_t)v[8]);
+            else if (in)
+                glb_draw_textured_rect_scaled(v[0] + ox, v[1] + oy, v[2], v[3], v[4], v[5], v[6], v[7],
+                                              (uint16_t)v[8], (uint16_t)v[9], (uint16_t)v[10]);
             break;
-        case RTH_TEX_RECT_SCALED:
-            drawn |= in;
-            if (in) glb_draw_textured_rect_scaled(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                                                  (uint16_t)v[8], (uint16_t)v[9], (uint16_t)v[10]);
-            break;
+        }
         case RTH_LINE:
             drawn |= in;
             if (in) glb_draw_line(v[0], v[1], v[2], v[3], (uint16_t)v[4]);
