@@ -920,8 +920,12 @@ static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth
     }
     for (int c = 0; c < 3; c++) rgb[c] = (w > 0.0f ? s[c] / w : 1.0f) * m[c];
 }
+/* A Smooth motion generated frame redraws a recorded list: the slots belong to
+ * the real frames (their pieces, foot points, lights), so its draws leave them
+ * alone. Restarting a shown slot there took the next real frame's foot points
+ * and left the real frame's picture without its sprites' shadows. */
 static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int *ys, const float *rgb) {
-    if (!s_sc_on) return;   /* needs the 3D triangles counted (sl->n) */
+    if (!s_sc_on || s_fg_drawing) return;   /* needs the 3D triangles counted (sl->n) */
     s_emit_seen[!s_pz_valid ? 2 : s_pc_valid ? 0 : 1]++;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
@@ -953,7 +957,7 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
  * pieces drawn around a foot point can stand there in the shadow map. */
 static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, const int *ys,
                               const int *us, const int *vs, const float *tex6, int semi) {
-    if (!s_spr_on) return;
+    if (!s_spr_on || s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
@@ -1043,7 +1047,7 @@ static int sc_atlas_rows(const ScSlot *sl) { return sl && sl->atl ? sl->atl_y + 
 /* tex: NULL = untextured, else {u0,v0,u1,v1,u2,v2, page x, page y, clut x,
  * clut y, depth, window}. */
 static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
-    if (!s_sc_on || !s_pz_valid || !s_pc_valid) return;
+    if (!s_sc_on || !s_pz_valid || !s_pc_valid || s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
@@ -1070,6 +1074,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
 }
 /* A new frame starts in this area: its list starts over. */
 static void sc_area_reset(int x1, int y1, int x2, int y2) {
+    if (s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 0);
     if (sl) sc_restart(sl);
