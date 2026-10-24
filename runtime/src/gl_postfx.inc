@@ -1453,11 +1453,15 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
      * sprite vertex's bias (as the scenery's sprites get theirs below) */
     float A2[3] = {0}, B2[3] = {0}, X0 = 1e30f, X1 = -1e30f, Y0 = 1e30f, Y1 = -1e30f, D0 = 1e30f, D1 = -1e30f, sbias = 0.0f, slam = 0.0f;
     float a[3], b[3], x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, d0 = 1e30f, d1 = -1e30f;
-    /* the scenery memory only where no map is given: a map set aside (a
-     * cutscene drawing its own floor, wg_agree) leaves the frame's own
-     * triangles; the memory would keep a moving object (the sandflier in a
-     * chase) at its past places, a trail of shadow behind it */
-    const int use_store = !use_world && s_wg_n <= 0 && s_cam_ok && s_scc_alive > 0;
+    /* the scenery memory where no map is given, and with the map for what
+     * stands on it off the picture (a bush, a rock: the map has the ground
+     * and its cliffs only, and the game draws what is on screen, so their
+     * shadows went with them at the edges); not with a map set aside (a
+     * cutscene drawing its own floor, wg_agree): the memory would keep a
+     * moving object (the sandflier in a chase) at its past places, a trail
+     * of shadow behind it */
+    const int use_store = (use_world || s_wg_n <= 0) && s_cam_ok && s_scc_alive > 0;
+    const int store_off_only = use_world;   /* with the map: off the picture only (the frame has the rest) */
     if (H > 0.0f && ll > 1e-6f && (sc || use_store) && s_sm_prog) {
         L[0] /= ll; L[1] /= ll; L[2] /= ll;
         /* a: across the light, level in view space when it can be */
@@ -1480,8 +1484,13 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             for (int e = 0; e < s_scc_n && npick < pick_cap; e++) {
                 const ScCached *c = &s_scc[e];
                 if (!c->alive) continue;
+                if (c->seen == s_scc_stamp && store_off_only) continue;
                 if (c->seen != s_scc_stamp) {
                     if (c->hits < SCC_STATIC) continue;
+                    /* with the map: whatever static the frame did not draw (the
+                     * game culls its objects at the picture's edge, inside the
+                     * overdraw band) */
+                    if (store_off_only) { pick[npick++] = e; continue; }
                     float V[3], cxs = 0.0f, cys = 0.0f; int behind = 0;
                     for (int j = 0; j < 3; j++) {
                         scc_view(c->w + j * 3, V);
@@ -1493,9 +1502,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
                 pick[npick++] = e;
             }
         }
-        /* world geometry first (nw vertices), then the frame's own triangles */
+        /* world geometry first (nw vertices), then the frame's own triangles
+         * (nf; in the memory itself without a map), then the memory's (ns) */
         const int nw = use_world ? s_wg_n * 3 : 0;
-        const int nbase = use_store ? npick * 3 : nw + sc->n * 3;   /* then the sprites standing */
+        const int nf = use_store && !store_off_only ? 0 : sc->n * 3;
+        const int ns = use_store ? npick * 3 : 0;
+        const int nbase = nw + nf + ns;   /* then the sprites standing */
         n = nbase + s_spr_n + s_spr_nx;
         nbase_all = nbase;
         if (n > s_sm_cap) {
@@ -1524,7 +1536,7 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
                 if (V[2] > 1.0f) { scr[0] = s_cam_h * V[0] / V[2]; scr[1] = s_cam_h * V[1] / V[2]; }
                 else scr[0] = scr[1] = 1e30f;   /* behind the camera: casts, never on screen */
                 o[3] = o[4] = o[5] = o[6] = o[7] = o[8] = o[10] = 0.0f; o[9] = -1.0f;   /* solid */
-            } else if (use_store) {
+            } else if (i >= nw + nf) {
                 const ScCached *c = &s_scc[pick[ci]];
                 const int j = i % 3;
                 float V[3]; scc_view(c->w + j * 3, V);
