@@ -89,6 +89,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "netplay_exit_reason.h"
 #include "host_time.h"
 #include "host_gpu_stats.h"
+#include "psx_input_config.h"
 #if defined(PSX_HAS_RECOMP_NET)
 #include "recomp_net/auth.h"
 #include "recomp_netplay_account.h"   /* shared recomp-ui account sync */
@@ -5484,11 +5485,14 @@ static std::string default_input_ini_text(void) {
         "rs_right = rightx+\n";
 }
 
+static std::filesystem::path g_input_ini_path;   /* psx_input_map_save */
+
 static void load_input_config(const char* argv0) {
     set_default_controller_mapping();
 
     namespace fs = std::filesystem;
     fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
+    g_input_ini_path = config_path;
     std::error_code ec;
     if (!fs::exists(config_path, ec)) {
         std::ofstream out(config_path, std::ios::binary);
@@ -5568,6 +5572,128 @@ static void load_input_config(const char* argv0) {
      * first run). The launcher may have just edited+saved this file; we re-read
      * it here so the runtime always reflects the current bindings. */
     psx_keybinds_init(argv0);
+}
+
+/* ---- psx_input_config.h: the controller map for a title's controls menu ---- */
+static std::string controller_source_name(const ControllerSource& s) {
+    if (s.kind == ControllerSource::Kind::Button) {
+        const char* n = SDL_GameControllerGetStringForButton((SDL_GameControllerButton)s.id);
+        return n ? n : "";
+    }
+    if (s.kind == ControllerSource::Kind::AxisPositive || s.kind == ControllerSource::Kind::AxisNegative) {
+        const char* n = SDL_GameControllerGetStringForAxis((SDL_GameControllerAxis)s.id);
+        if (!n) return "";
+        if (s.id == SDL_CONTROLLER_AXIS_TRIGGERLEFT || s.id == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
+            return n;   /* as the defaults write a trigger */
+        return std::string(n) + (s.kind == ControllerSource::Kind::AxisPositive ? "+" : "-");
+    }
+    return "";
+}
+static std::string controller_sources_text(const std::vector<ControllerSource>& sources) {
+    std::string out;
+    for (const auto& s : sources) {
+        const std::string n = controller_source_name(s);
+        if (n.empty()) continue;
+        if (!out.empty()) out += ",";
+        out += n;
+    }
+    return out;
+}
+static PsxButtonMap* controller_map_entry(ControllerMap& map, const char* name) {
+    for (auto& entry : map)
+        if (name && std::strcmp(entry.ini_name, name) == 0) return &entry;
+    return nullptr;
+}
+
+extern "C" int psx_input_map_get(const char* psx_input, char* out, int cap) {
+    PsxButtonMap* e = controller_map_entry(controller_map, psx_input);
+    if (!e || !out || cap <= 0) return 0;
+    std::snprintf(out, (size_t)cap, "%s", controller_sources_text(e->sources).c_str());
+    return 1;
+}
+
+extern "C" int psx_input_map_set(const char* psx_input, const char* sources) {
+    PsxButtonMap* e = controller_map_entry(controller_map, psx_input);
+    if (!e) return 0;
+    e->sources = parse_source_list(sources ? sources : "");
+    for (auto& kv : controller_maps_by_guid)
+        if (PsxButtonMap* g = controller_map_entry(kv.second, psx_input)) g->sources = e->sources;
+    return 1;
+}
+
+/* input.ini rewritten line by line: a mapping key's value replaced by the
+ * current map, missing [mapping] keys added at the end of that section, every
+ * other line (comments, [controller], unknown keys) kept. */
+extern "C" int psx_input_map_save(void) {
+    namespace fs = std::filesystem;
+    if (g_input_ini_path.empty()) return 0;
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(g_input_ini_path);
+        if (in) {
+            std::string l;
+            while (std::getline(in, l)) {
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                lines.push_back(l);
+            }
+        } else {
+            std::stringstream ss(default_input_ini_text());
+            std::string l;
+            while (std::getline(ss, l)) lines.push_back(l);
+        }
+    }
+    std::vector<std::string> out;
+    std::string section;
+    ControllerMap* target = nullptr;
+    std::vector<bool> seen(controller_map.size(), false);
+    auto flush_missing = [&]() {
+        if (section != "mapping") return;
+        for (size_t i = 0; i < controller_map.size(); ++i)
+            if (!seen[i])
+                out.push_back(std::string(controller_map[i].ini_name) + " = " +
+                              controller_sources_text(controller_map[i].sources));
+        std::fill(seen.begin(), seen.end(), true);
+    };
+    bool had_mapping = false;
+    for (const std::string& raw : lines) {
+        const std::string t = trim_copy(raw);
+        if (!t.empty() && t.front() == '[' && t.back() == ']') {
+            flush_missing();
+            section = lower_copy(trim_copy(t.substr(1, t.size() - 2)));
+            target = nullptr;
+            if (section == "mapping") { target = &controller_map; had_mapping = true; }
+            else if (section.rfind("mapping.", 0) == 0) {
+                auto it = controller_maps_by_guid.find(section.substr(8));
+                if (it != controller_maps_by_guid.end()) target = &it->second;
+            }
+            out.push_back(raw);
+            continue;
+        }
+        const size_t eq = t.find('=');
+        bool replaced = false;
+        if (target && eq != std::string::npos && t[0] != ';' && t[0] != '#') {
+            const std::string key = lower_copy(trim_copy(t.substr(0, eq)));
+            for (size_t i = 0; i < target->size() && !replaced; ++i)
+                if (key == (*target)[i].ini_name) {
+                    out.push_back(key + " = " + controller_sources_text((*target)[i].sources));
+                    if (target == &controller_map) seen[i] = true;
+                    replaced = true;
+                }
+        }
+        if (!replaced) out.push_back(raw);
+    }
+    flush_missing();
+    if (!had_mapping) {
+        out.push_back("");
+        out.push_back("[mapping]");
+        section = "mapping";
+        std::fill(seen.begin(), seen.end(), false);
+        flush_missing();
+    }
+    std::ofstream f(g_input_ini_path, std::ios::binary | std::ios::trunc);
+    if (!f) return 0;
+    for (const std::string& l : out) f << l << "\n";
+    return f.good() ? 1 : 0;
 }
 
 static PsxJogconFfbBackend player_ffb_backend(PlayerInput& p) {
@@ -10258,8 +10384,62 @@ static void dynres_setup(void) {
 
 /* ---- Live video apply (host_overlay.h P4) ------------------------------- */
 static std::filesystem::path g_overlay_settings_path;  /* settings.toml */
+static std::filesystem::path g_user_settings_path;     /* the same, every build */
 static PsxHostVideoSettings g_video_boot;              /* as the session booted */
 static bool g_video_boot_valid = false;
+
+/* ---- psx_input_config.h: controller shortcut bindings ([hotkeys] *_pad) ---- */
+extern "C" int psx_input_pad_shortcut_get(int shortcut) {
+    const int* slot = hotkey_pad_binding_slot(shortcut);
+    return slot ? *slot : 0;
+}
+
+extern "C" int psx_input_pad_shortcut_set(int shortcut, int binding) {
+    int* slot = hotkey_pad_binding_slot(shortcut);
+    if (!slot || normalize_hotkey_pad_binding(binding, -1) != binding) return 0;
+    *slot = binding;
+    return 1;
+}
+
+extern "C" int psx_input_pad_shortcuts_save(void) {
+    if (g_user_settings_path.empty()) return 0;
+    PSXRecompV4::UserSettings us = PSXRecompV4::load_user_settings(g_user_settings_path);
+    us.hotkey_pad_rewind = g_hotkey_pad_rewind;                         us.has_hotkey_pad_rewind = true;
+    us.hotkey_pad_save_state_menu = g_hotkey_pad_save_state_menu;       us.has_hotkey_pad_save_state_menu = true;
+    us.hotkey_pad_fast_forward = g_hotkey_pad_fast_forward;             us.has_hotkey_pad_fast_forward = true;
+    us.hotkey_pad_fast_forward_toggle = g_hotkey_pad_fast_forward_toggle;
+    us.has_hotkey_pad_fast_forward_toggle = true;
+    return PSXRecompV4::save_user_settings(g_user_settings_path, us) ? 1 : 0;
+}
+
+static std::string g_host_keymap_path;   /* the config.ini [KeyMap] came from */
+extern "C" int psx_input_host_keys_save(void) {
+    return g_host_keymap_path.empty() ? 0 : host_keymap_save(g_host_keymap_path.c_str());
+}
+
+/* ---- psx_input_config.h: host actions for a title's own shortcuts --------- */
+extern "C" int psx_input_host_pad_button(int code) {
+    return p1_host_present() ? p1_host_button_down(nullptr, code) : 0;
+}
+
+extern "C" int psx_input_host_action(int action) {
+    switch (action) {
+    case PSX_INPUT_ACTION_SAVE_STATE_MENU:
+        if (psx_rewind_is_open()) return 0;
+        savestate_menu_toggle(0);
+        return 1;
+    case PSX_INPUT_ACTION_FAST_FORWARD_LOCK:
+        fast_forward_toggle_flip();
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+extern "C" int psx_input_savestate_submit(int slot, int save) {
+    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    return savestate_submit_slot(slot, save);
+}
 
 extern "C" void psx_video_current(PsxHostVideoSettings *v) {
     if (!v) return;
@@ -18328,6 +18508,7 @@ int main(int argc, char** argv) {
     {
         std::filesystem::path settings_path =
             exe_dir_from_argv(argv[0]) / "settings.toml";
+        g_user_settings_path = settings_path;
 #if defined(RECOMP_LAUNCHER)
         g_lnch_settings_path = settings_path;
         g_overlay_settings_path = settings_path;
@@ -21364,9 +21545,11 @@ session_reboot:
         namespace fs = std::filesystem;
         const fs::path exe_cfg = exe_dir_from_argv(argv[0]) / "config.ini";
         std::error_code ec;
+        g_host_keymap_path = exe_cfg.string();   /* psx_input_host_keys_save */
         if (fs::is_regular_file(exe_cfg, ec)) {
             host_keymap_load(exe_cfg.string().c_str());
         } else if (fs::is_regular_file(fs::path("config.ini"), ec)) {
+            g_host_keymap_path = "config.ini";
             host_keymap_load("config.ini");
         } else {
             host_keymap_load(nullptr);
