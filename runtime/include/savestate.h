@@ -36,6 +36,10 @@ extern "C" {
  * main resets this before each mod activation (including soft returns). */
 void savestate_set_title_blocked(int blocked);
 int savestate_title_blocked(void);
+/* Same policy for loads only (saving stays available), e.g. an achievement
+ * hardcore mode. Blocking cancels a pending load; reset with the above. */
+void savestate_set_title_load_blocked(int blocked);
+int savestate_title_load_blocked(void);
 
 /* Configure the slot directory + integrity key (from main, after config load).
  *

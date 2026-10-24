@@ -8256,15 +8256,15 @@ static void handle_pad_status(int id, const char *json)
              s_host_lt, s_host_rt);
 }
 
-static void handle_clear_input(int id, const char *json)
+/* port: 0 = both, 1 or 2. */
+static void clear_input_overrides(int port)
 {
-    const int port = json_get_int(json, "port", 0);   /* 0 = both */
     if (port == 0 || port == 2) {
         s_pad_connected_override[1] = -1;
         s_input_override_p2 = -1;
         s_input_frames_p2 = 0;
     }
-    if (port == 2) { send_ok(id); return; }
+    if (port == 2) return;
     s_input_route_active = 0;
     s_input_route_index = 0;
     s_input_route_remaining = 0;
@@ -8278,6 +8278,11 @@ static void handle_clear_input(int id, const char *json)
     s_host_buttons = 0xFFFF;
     s_host_axes[0] = s_host_axes[1] = s_host_axes[2] = s_host_axes[3] = 0x80;
     s_host_lt = s_host_rt = 0;
+}
+
+static void handle_clear_input(int id, const char *json)
+{
+    clear_input_overrides(json_get_int(json, "port", 0));
     send_ok(id);
 }
 
@@ -16445,6 +16450,34 @@ static const CmdEntry s_commands[] = {
     { NULL, NULL }
 };
 
+/* psx_mod_set_debug_tools_restricted (e.g. an achievement hardcore mode):
+ * only commands that neither read nor change guest state nor drive input.
+ * Saving stays possible; savestate.c refuses loads on its own then. */
+static int s_restricted;
+
+void debug_server_set_restricted(int restricted)
+{
+    /* Nothing the tools set may outlive the switch: injected input, turbo. */
+    if (restricted && !s_restricted) {
+        clear_input_overrides(0);
+        s_turbo_enabled = 0;
+    }
+    s_restricted = restricted != 0;
+}
+
+static int restricted_allows(const char *cmd)
+{
+    static const char *const ok[] = {
+        "ping", "frame", "quit", "savestate", "savestate_status",
+        "mod_counters", "perf_summary", "frame_perf",
+        "present_shot", "present_shot_seq", "screenshot", "screenshot_hires",
+        NULL
+    };
+    for (int i = 0; ok[i]; i++)
+        if (strcmp(cmd, ok[i]) == 0) return 1;
+    return 0;
+}
+
 static void process_command(const char *line)
 {
     char cmd[64];
@@ -16457,6 +16490,11 @@ static void process_command(const char *line)
     }
 
     int id = json_get_int(line, "id", 0);
+
+    if (s_restricted && !restricted_allows(cmd)) {
+        send_err(id, "debug tools are off in this game mode");
+        return;
+    }
 
     for (const CmdEntry *e = s_commands; e->name; e++) {
         if (strcmp(cmd, e->name) == 0) {

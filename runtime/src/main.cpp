@@ -1606,6 +1606,30 @@ extern "C" int psx_mod_set_host_rumble(uint32_t player, uint32_t small,
 extern "C" void psx_mod_set_savestate_blocked(int blocked) {
     savestate_set_title_blocked(blocked);
 }
+extern "C" void psx_mod_set_savestate_load_blocked(int blocked) {
+    savestate_set_title_load_blocked(blocked);
+}
+
+/* psx_mod_set_fast_forward_blocked: the manual fast-forward block in the
+ * frame loop treats Turbo / TurboToggle / the pad shortcuts as released. */
+static int g_mod_fast_forward_blocked = 0;
+extern "C" void psx_mod_set_fast_forward_blocked(int blocked) {
+    g_mod_fast_forward_blocked = blocked != 0;
+}
+extern "C" void psx_mod_set_debug_tools_restricted(int restricted) {
+    debug_server_set_restricted(restricted);
+}
+
+/* The disc the player picked, before a disc-patching mod's private image
+ * replaces it (session_disc_path). */
+static std::string g_stock_disc_path;
+extern "C" int psx_mod_stock_disc_path(char* out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (g_stock_disc_path.empty() || g_stock_disc_path.size() + 1 > cap) return 0;
+    std::memcpy(out, g_stock_disc_path.c_str(), g_stock_disc_path.size() + 1);
+    return 1;
+}
 static uint32_t      g_savestate_input_guard_min_until = 0;
 static uint32_t      g_savestate_input_guard_max_until = 0;
 static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
@@ -2118,6 +2142,7 @@ static void reset_mod_owned_presentation(void) {
  * the committed plan built one, else the stock disc, which stays untouched
  * (master behaviour). Every session start calls it after its commit. */
 static std::string session_disc_path(const std::filesystem::path& stock_disc) {
+    g_stock_disc_path = stock_disc.string();
     const std::filesystem::path& mod_disc =
         PSXRecompV4::mod_runtime_effective_disc_path();
     if (mod_disc.empty()) return stock_disc.string();
@@ -8506,6 +8531,11 @@ static int g_manual_turbo_latched = 0;
 
 static void fast_forward_toggle_flip(void) {
     char msg[40];
+    if (g_mod_fast_forward_blocked) {
+        g_manual_turbo_latched = 0;
+        host_osd_push("Fast forward is off in this game mode", 1500);
+        return;
+    }
     g_manual_turbo_latched = !g_manual_turbo_latched;
     if (!g_manual_turbo_latched) {
         host_osd_push("Fast forward: off", 900);
@@ -9541,8 +9571,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_keybinds_host_keys(keys, host_keys);
         const bool kb_turbo = host_hotkey_input_focused() &&
             host_keymap_down(HOST_KEYMAP_TURBO, host_keys, (int)SDL_GetModState());
-        if (kb_turbo || g_manual_turbo_latched ||
-            hotkey_shortcut_down(PSX_ASSIST_BIND_FAST_FORWARD, g_hotkey_pad_fast_forward)) {
+        static int ff_refused_down = 0;
+        bool ff_wanted = kb_turbo || g_manual_turbo_latched ||
+            hotkey_shortcut_down(PSX_ASSIST_BIND_FAST_FORWARD, g_hotkey_pad_fast_forward);
+        if (g_mod_fast_forward_blocked) {
+            /* A title mode (psx_mod_set_fast_forward_blocked) refuses it:
+             * say so once per press, drop a latched run. */
+            if (ff_wanted && !ff_refused_down)
+                host_osd_push("Fast forward is off in this game mode", 1500);
+            ff_refused_down = ff_wanted;
+            g_manual_turbo_latched = 0;
+            ff_wanted = false;
+        } else {
+            ff_refused_down = 0;
+        }
+        if (ff_wanted) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
@@ -20244,6 +20287,9 @@ int main(int argc, char** argv) {
         g_p1_claimed_buttons = 0;
         psx_rewind_set_title_blocked(0);
         savestate_set_title_blocked(0);
+        savestate_set_title_load_blocked(0);
+        g_mod_fast_forward_blocked = 0;
+        debug_server_set_restricted(0);
         psx_savestate_menu_set_renderer(nullptr);
         for (auto& policy : g_mod_controller_policy)
             policy = ModControllerPresentationPolicy{};
@@ -22191,6 +22237,7 @@ soft_return_lobby:
             if (rui_out_disc[0]) {
                 resolved_disc = normalize_disc_path_for_launch(rui_out_disc);
                 disc_path_str = resolved_disc.string();
+                g_stock_disc_path = disc_path_str;
             }
             if (ls.netplay_launch.enabled) {
                 {

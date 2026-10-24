@@ -57,6 +57,7 @@ static uint32_t s_bios_checksum;
 static uint32_t s_entry_pc;
 static int      s_configured   = 0;
 static int      s_title_blocked;
+static int      s_title_load_blocked;
 static int      s_save_pending = -1;   /* slot, or -1 */
 static int      s_load_pending = -1;
 static int      s_load_completed = 0;
@@ -207,8 +208,23 @@ void savestate_set_title_blocked(int blocked) {
     clear_load_blob();
 }
 
+int savestate_title_load_blocked(void) { return s_title_load_blocked; }
+void savestate_set_title_load_blocked(int blocked) {
+    s_title_load_blocked = blocked != 0;
+    if (!s_title_load_blocked) return;
+    if (s_load_pending >= 0) s_load_failed = 1;
+    s_load_pending = -1;
+    clear_load_blob();
+}
+
 static int title_save_request_blocked(int is_load, int slot) {
     const char* reason;
+    if (is_load && s_title_load_blocked && !s_title_blocked) {
+        reason = "Loading save states is off in this game mode";
+        fprintf(stderr, "savestate: %s\n", reason);
+        psx_frontend_on_savestate_refused(is_load, slot, reason);
+        return 1;
+    }
     if (!s_title_blocked && psx_mod_netplay_savestates_supported()) return 0;
     reason = s_title_blocked ? "Save states are unavailable in this game mode" :
                               "Save states are unavailable in this netplay mode";

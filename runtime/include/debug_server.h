@@ -92,6 +92,10 @@ void debug_server_get_status(int *listening, int *port, int *error);
  * Call once per vblank. */
 void debug_server_poll(void);
 
+/* Restricted mode (psx_mod_set_debug_tools_restricted): refuse every command
+ * that reads or changes guest state or drives input. */
+void debug_server_set_restricted(int restricted);
+
 /* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
  * active. The TCP command pump stays live; expensive per-dispatch/per-frame
  * recording backs off so debug builds can still play FMVs at speed. */

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -1133,6 +1134,26 @@ void psx_mod_set_savestate_menu_renderer(PSXModSaveStateMenuRenderer renderer);
  * by the guest serializer. Includes synchronized netplay state operations;
  * pending requests are cancelled. Cleared before each session's activation. */
 void psx_mod_set_savestate_blocked(int blocked);
+
+/* Play restrictions for a title mode such as an achievement hardcore mode
+ * (RetroAchievements forbids loading states and debug tools there). Each is
+ * refused with an OSD note while set; all are cleared before each session's
+ * activation, so set them from activation or a VBlank callback.
+ * - loads only: every save state load (menu, title code, quick load, TCP) is
+ *   refused and a pending one cancelled; saving stays available. Rewind is
+ *   separate (psx_mod_set_rewind_blocked).
+ * - fast forward: Turbo, TurboToggle and their pad shortcuts are ignored.
+ * - debug tools: the TCP debug server refuses every command that reads or
+ *   changes guest state or drives input (frame, screenshots, perf and save
+ *   state status stay). No effect in builds without debug tools. */
+void psx_mod_set_savestate_load_blocked(int blocked);
+void psx_mod_set_fast_forward_blocked(int blocked);
+void psx_mod_set_debug_tools_restricted(int restricted);
+
+/* Path of the disc the player picked, never a disc-patching mod's private
+ * image: identifies the stock title to outside services (e.g. an achievement
+ * hash). Returns 0 (empty string) when unknown or `cap` is too small. */
+int psx_mod_stock_disc_path(char* out, size_t cap);
 
 /* Title-supplied host rumble for one guest port (0-based): DualShock motor
  * values (small: 0 off / nonzero on, large: 0..255) for a title that
