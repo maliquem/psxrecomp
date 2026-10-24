@@ -13471,6 +13471,91 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
     if (vrew) flush_cpu_upload();   /* the chains' reads (sprite cut-outs) see VRAM as it is now */
 }
 
+/* Where the newer real frame shows what the picture shows along each view
+ * edge: the picture's position less the newer frame's, for the redrawn
+ * list's camera-placed vertices on that edge, native px, in FG_ESEG pieces
+ * along it (a turning camera moves one end of an edge more than the other;
+ * a piece with none takes its edge's mean, an edge with none no offset).
+ * The strips the picture moved away from are copied from the newer frame
+ * there: copied from the same place, they showed the scene where the newer
+ * frame has it, a step off the rest (a misaligned band that blinked along
+ * the edges; a thin line with the camera nearly still). */
+enum { FG_ESEG = 8 };
+static void fg_edge_offsets(const FgList *L, double tl, float off[FG_MAX_VIEWS][4][FG_ESEG][2]) {
+    float sum[FG_MAX_VIEWS][5][2] = {{{0}}}, ssum[FG_MAX_VIEWS][4][FG_ESEG][2] = {{{{0}}}};
+    int cnt[FG_MAX_VIEWS][5] = {{0}}, scnt[FG_MAX_VIEWS][4][FG_ESEG] = {{{0}}};
+    float At[FG_MAX_VIEWS][9], bt[FG_MAX_VIEWS][3], A0[FG_MAX_VIEWS][9], b0[FG_MAX_VIEWS][3];
+    int ok[FG_MAX_VIEWS] = {0};
+    for (uint32_t vi = 0; vi < s_fg_fit.nviews && vi < FG_MAX_VIEWS; vi++)
+        ok[vi] = s_fg_fit.v[vi].ok && fg_view_affine(&s_fg_fit, (int)vi, tl, At[vi], bt[vi]) &&
+                 (!s_fg_src_older || fg_view_affine(&s_fg_fit, (int)vi, 0.0, A0[vi], b0[vi]));
+    for (uint32_t j = 0; j < L->prims.n; j++) {
+        const FgPrim *p = &L->prims.v[j];
+        for (int k = 0; k < 3; k++) {
+            const FgVert *fv = &s_fg_verts[3 * j + k];
+            if (fv->mode != FG_PLACE_CAMERA || fv->view < 0 || fv->view >= FG_MAX_VIEWS || !ok[fv->view]) continue;
+            const int vi = fv->view;
+            const float *P = p->p[k];
+            float G[3], B[3];
+            for (int r = 0; r < 3; r++) {
+                G[r] = At[vi][3 * r] * P[0] + At[vi][3 * r + 1] * P[1] + At[vi][3 * r + 2] * P[2] + bt[vi][r];
+                B[r] = s_fg_src_older ? A0[vi][3 * r] * P[0] + A0[vi][3 * r + 1] * P[1] + A0[vi][3 * r + 2] * P[2] + b0[vi][r] : P[r];
+            }
+            if (G[2] < 16.0f || B[2] < 16.0f) continue;
+            const float dx = p->h[k] * (G[0] / G[2] - B[0] / B[2]), dy = p->h[k] * (G[1] / G[2] - B[1] / B[2]);
+            const float *ar = s_fg_fit.v[vi].area, bx = p->x[k], by = p->y[k];
+            /* on an edge: at it or a little past it (a clipped triangle's far
+             * corner moves unlike what shows at the edge) */
+            const int on[5] = {bx <= ar[0] + 1.0f && bx >= ar[0] - 32.0f, by <= ar[1] + 1.0f && by >= ar[1] - 32.0f,
+                               bx >= ar[2] - 1.0f && bx <= ar[2] + 32.0f, by >= ar[3] - 1.0f && by <= ar[3] + 32.0f, 0};
+            for (int e = 0; e < 5; e++) {
+                if (!on[e]) continue;
+                sum[vi][e][0] += dx; sum[vi][e][1] += dy; cnt[vi][e]++;
+                if (e == 4) continue;
+                /* its piece along the edge: by y on the sides, by x on top and bottom */
+                const float a0 = (e & 1) ? ar[0] : ar[1], a1 = (e & 1) ? ar[2] : ar[3], c = (e & 1) ? bx : by;
+                int sg = a1 > a0 ? (int)((c - a0) / (a1 - a0) * (float)FG_ESEG) : 0;
+                sg = sg < 0 ? 0 : sg >= FG_ESEG ? FG_ESEG - 1 : sg;
+                ssum[vi][e][sg][0] += dx; ssum[vi][e][sg][1] += dy; scnt[vi][e][sg]++;
+            }
+        }
+    }
+    for (int vi = 0; vi < FG_MAX_VIEWS; vi++)
+        for (int e = 0; e < 4; e++) {
+            const float mx = cnt[vi][e] ? sum[vi][e][0] / (float)cnt[vi][e] : 0.0f;
+            const float my = cnt[vi][e] ? sum[vi][e][1] / (float)cnt[vi][e] : 0.0f;
+            for (int sg = 0; sg < FG_ESEG; sg++) {
+                const int n = scnt[vi][e][sg];
+                off[vi][e][sg][0] = n ? ssum[vi][e][sg][0] / (float)n : mx;
+                off[vi][e][sg][1] = n ? ssum[vi][e][sg][1] / (float)n : my;
+            }
+        }
+}
+/* TCP frame_gen "strips": the last strip copies (edge, piece, margin, offset
+ * x/y native px, used: 1 shifted, 0 own place, the source rect's surface px) */
+enum { FG_SDBG = 64 };
+static float    s_fg_sdbg[FG_SDBG][9];
+static unsigned s_fg_sdbg_n = 0;
+/* A strip copy (colour) from the newer frame at an offset (surface px). A
+ * source outside the newer frame's view (v: x0, y0, x1, y1, surface px) is
+ * a part it never drew (the newer list is the one redrawn and the strip is
+ * on the side only the older one saw): the strip comes from its own place
+ * then (sx0, sy0). Its depth stays the redraw's hole, which the chains fill
+ * from the newer frame (postfx_note_fill): that frame's depth moved along
+ * with the colour read the turning camera's depth across the strip wrong
+ * (heavy shadow bands). */
+static void fg_strip_copy(GLuint src, GLuint dst, int sx, int sy, int sx0, int sy0, int dx, int dy,
+                          int w, int h, const int v[4]) {
+    if (w <= 0 || h <= 0) return;
+    if (sx < v[0] || sy < v[1] || sx + w > v[2] || sy + h > v[3]) { sx = sx0; sy = sy0; }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
+
 /* The chains of a generated frame build their inputs from the newer real
  * frame (its slot and camera) while its picture is the in-between camera's:
  * the shadows stayed where the real frame had them and slid against the
@@ -14196,7 +14281,9 @@ static int fg_generate(double t, int swap) {
         const int ox = iw >= 0 ? L->wide_off : 0, sw = iw >= 0 ? g_wide_w : L->disp[2];
         const GLuint src = iw >= 0 ? wf : f0, dst = iw >= 0 ? s_fg_w_fbo : s_fg_hr_fbo;
         const int bx0 = iw >= 0 ? 0 : L->disp[0], sdy = dy - ly;   /* source rows: the newer frame's */
-        for (uint32_t vi = 0; vi < s_fg_fit.nviews; vi++) {
+        float eo[FG_MAX_VIEWS][4][FG_ESEG][2];
+        fg_edge_offsets(L, tl, eo);
+        for (uint32_t vi = 0; vi < s_fg_fit.nviews && vi < FG_MAX_VIEWS; vi++) {
             const float *ar = s_fg_fit.v[vi].area, *m = s_fg_margin[vi];
             int x1 = (int)floorf(ar[0]) + ox, x2 = (int)ceilf(ar[2]) + 1 + ox;
             int y1 = L->disp[1] + (int)ar[1], y2 = L->disp[1] + (int)ar[3] + 1;
@@ -14212,10 +14299,29 @@ static int fg_generate(double t, int swap) {
             if (mr > w) mr = w;
             if (mt > h) mt = h;
             if (mb > h) mb = h;
-            if (ml) fg_blit2(src, dst, (bx0 + x1) * S, (y1 + sdy) * S, (bx0 + x1) * S, y1 * S, ml * S, h * S);
-            if (mr) fg_blit2(src, dst, (bx0 + x2 - mr) * S, (y1 + sdy) * S, (bx0 + x2 - mr) * S, y1 * S, mr * S, h * S);
-            if (mt) fg_blit2(src, dst, (bx0 + x1) * S, (y1 + sdy) * S, (bx0 + x1) * S, y1 * S, w * S, mt * S);
-            if (mb) fg_blit2(src, dst, (bx0 + x1) * S, (y2 - mb + sdy) * S, (bx0 + x1) * S, (y2 - mb) * S, w * S, mb * S);
+            /* each strip from where the newer frame has it (fg_edge_offsets) */
+            const int vb[4] = {(bx0 + x1) * S, (y1 + sdy) * S, (bx0 + x2) * S, (y2 + sdy) * S};
+            /* an offset far beyond the strip's own width is no step of this
+             * camera (a stray estimate): the strip's own place then */
+#define FG_STRIP(e, sg, X, Y, W, H) do { \
+                float ex = eo[vi][e][sg][0], ey = eo[vi][e][sg][1]; \
+                const float lim = 4.0f * m[e] + 4.0f; \
+                if (fabsf(ex) > lim || fabsf(ey) > lim) ex = ey = 0.0f; \
+                { float *D_ = s_fg_sdbg[s_fg_sdbg_n++ % FG_SDBG]; D_[0] = (float)(e); D_[1] = (float)(sg); D_[2] = m[e]; \
+                  D_[3] = eo[vi][e][sg][0]; D_[4] = eo[vi][e][sg][1]; D_[5] = ex; D_[6] = ey; D_[7] = (float)(X); D_[8] = (float)((Y) + sdy); } \
+                fg_strip_copy(src, dst, (X) * S - (int)lrintf(ex * (float)S), \
+                              ((Y) + sdy) * S - (int)lrintf(ey * (float)S), \
+                              (X) * S, ((Y) + sdy) * S, (X) * S, (Y) * S, (W) * S, (H) * S, vb); \
+            } while (0)
+            for (int sg = 0; sg < FG_ESEG; sg++) {
+                const int ya = y1 + h * sg / FG_ESEG, yb = y1 + h * (sg + 1) / FG_ESEG;
+                const int xa = x1 + w * sg / FG_ESEG, xb = x1 + w * (sg + 1) / FG_ESEG;
+                if (ml) FG_STRIP(0, sg, bx0 + x1, ya, ml, yb - ya);
+                if (mr) FG_STRIP(2, sg, bx0 + x2 - mr, ya, mr, yb - ya);
+                if (mt) FG_STRIP(1, sg, bx0 + xa, y1, xb - xa, mt);
+                if (mb) FG_STRIP(3, sg, bx0 + xa, y2 - mb, xb - xa, mb);
+            }
+#undef FG_STRIP
         }
     }
     s_fg_reprojected_now = reproj;
@@ -14924,6 +15030,16 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
     k += snprintf(out + k, (size_t)(cap - k), "],\"vlog\":{\"rewinds\":%llu,\"missed\":%llu,\"entries\":%llu,\"bytes\":%llu}",
                   (unsigned long long)s_vlog_rewinds, (unsigned long long)s_vlog_missed,
                   (unsigned long long)(s_vlog_seq - s_vlog_first), (unsigned long long)s_vlog_bytes);
+    k += snprintf(out + k, (size_t)(cap - k), ",\"src_older\":%d,\"strips\":[", s_fg_src_older);
+    {
+        const unsigned sn = s_fg_sdbg_n < FG_SDBG ? s_fg_sdbg_n : FG_SDBG;
+        for (unsigned i = 0; i < sn && k < cap - 96; i++) {
+            const float *D = s_fg_sdbg[(s_fg_sdbg_n - sn + i) % FG_SDBG];
+            k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f]", i ? "," : "",
+                          D[0], D[1], D[2], D[3], D[4], D[5], D[6], D[7], D[8]);
+        }
+    }
+    k += snprintf(out + k, (size_t)(cap - k), "]");
     return k;
 }
 
