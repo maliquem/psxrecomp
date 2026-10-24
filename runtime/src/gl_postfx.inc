@@ -1677,6 +1677,8 @@ static const float k_fire_face[6][3][3] = {
     {{ 0, 0, 1}, {1, 0,  0}, {0, 1,  0}}, {{ 0, 0,-1}, {-1, 0, 0}, {0, 1,  0}}};
 static float s_fl_view[FIRE_MAX][4];   /* each light: view space (y up), reach */
 static float s_fl_scr[FIRE_MAX][4];    /* its place on the picture (uv), 1 */
+static float s_fl_base[FIRE_MAX][3];   /* its glow's point (view space, y up), s_fl_scr's */
+static float s_fl_k[2];                /* the picture's projection: uv per unit of x / z, y / z */
 static float s_fl_col[FIRE_MAX][4];    /* its colour (its glow's, brightest channel 1), its strength (0..1) */
 #define LIT_FULL 384.0f                /* a glow's size (px, the cave's campfire) that lights at full strength */
 static int   s_fl_n = 0;
@@ -1720,6 +1722,8 @@ static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
         s_fl_scr[nl][0] = 0.5f + (h * V[0] / V[2]) / (240.0f * aspect);
         s_fl_scr[nl][1] = 0.5f - (h * V[1] / V[2]) / 240.0f;
         s_fl_scr[nl][2] = 1.0f; s_fl_scr[nl][3] = 0.0f;
+        s_fl_base[nl][0] = V[0]; s_fl_base[nl][1] = -V[1]; s_fl_base[nl][2] = V[2];
+        s_fl_k[0] = h / (240.0f * aspect); s_fl_k[1] = h / 240.0f;
         {   /* its glow's colour, as bright as can be (none known: u_firecol's);
              * its strength and reach by how big its glow is: a campfire's
              * (LIT_FULL px) full, a staff's small orb a quarter or so */
@@ -1824,6 +1828,22 @@ static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
  * w the reach), u_fls0, u_fls1 their place on the picture (uv; z 1 = lit),
  * u_flc0, u_flc1 their colours (w their strength), u_flmap (face px,
  * lights, row pairs). */
+/* A generated frame (s_pfx_vx_on): what the chains get in the real frame's
+ * view space, in the picture's. A direction turns; a point turns and moves;
+ * a mapping row (dot(xyz, P) - w) keeps its value at the same scene point. */
+static void pfx_vx_dir(const float *d, float *o) {
+    const float *A = s_pfx_vx_a;
+    const float x = d[0], y = d[1], z = d[2];
+    for (int r = 0; r < 3; r++) o[r] = A[r * 3] * x + A[r * 3 + 1] * y + A[r * 3 + 2] * z;
+}
+static void pfx_vx_point(const float *p, float *o) {
+    pfx_vx_dir(p, o);
+    for (int r = 0; r < 3; r++) o[r] += s_pfx_vx_b[r];
+}
+static void pfx_vx_row(const float *row, float *o) {
+    pfx_vx_dir(row, o);
+    o[3] = row[3] + o[0] * s_pfx_vx_b[0] + o[1] * s_pfx_vx_b[1] + o[2] * s_pfx_vx_b[2];
+}
 static void pfx_fire_uniforms(GLuint prog) {
     static const char *const pn[FIRE_MAX] = {"u_fl0", "u_fl1"}, *const sn[FIRE_MAX] = {"u_fls0", "u_fls1"};
     static const char *const cn[FIRE_MAX] = {"u_flc0", "u_flc1"};
@@ -1833,16 +1853,20 @@ static void pfx_fire_uniforms(GLuint prog) {
             if (l < s_fl_n) p_glUniform4f(lc, s_fl_col[l][0], s_fl_col[l][1], s_fl_col[l][2], s_fl_col[l][3]);
             else p_glUniform4f(lc, 0.0f, 0.0f, 0.0f, 0.0f);
         }
+        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f}, s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (l < s_fl_n) {
+            memcpy(v, s_fl_view[l], sizeof v); memcpy(s, s_fl_scr[l], sizeof s);
+            if (s_pfx_vx_on) {
+                float b[3];
+                pfx_vx_point(s_fl_view[l], v);
+                pfx_vx_point(s_fl_base[l], b);
+                if (b[2] > 1.0f) { s[0] = 0.5f + s_fl_k[0] * b[0] / b[2]; s[1] = 0.5f + s_fl_k[1] * b[1] / b[2]; }
+            }
+        }
         GLint loc = p_glGetUniformLocation(prog, pn[l]);
-        if (loc >= 0) {
-            if (l < s_fl_n) p_glUniform4f(loc, s_fl_view[l][0], s_fl_view[l][1], s_fl_view[l][2], s_fl_view[l][3]);
-            else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
-        }
+        if (loc >= 0) p_glUniform4f(loc, v[0], v[1], v[2], v[3]);
         loc = p_glGetUniformLocation(prog, sn[l]);
-        if (loc >= 0) {
-            if (l < s_fl_n) p_glUniform4f(loc, s_fl_scr[l][0], s_fl_scr[l][1], s_fl_scr[l][2], s_fl_scr[l][3]);
-            else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
-        }
+        if (loc >= 0) p_glUniform4f(loc, s[0], s[1], s[2], s[3]);
     }
     const GLint loc = p_glGetUniformLocation(prog, "u_flmap");
     if (loc >= 0) p_glUniform4f(loc, (float)FIRE_FACE, (float)s_fl_n, (float)(2 * FIRE_MAX), 0.0f);
@@ -1851,12 +1875,16 @@ static void pfx_shadow_uniforms(GLuint prog) {
     static const char *const names[4] = {"u_smx", "u_smy", "u_smz", "u_sms"};
     for (int k = 0; k < 4; k++) {
         const GLint loc = p_glGetUniformLocation(prog, names[k]);
-        if (loc >= 0) p_glUniform4f(loc, s_sm_u[k][0], s_sm_u[k][1], s_sm_u[k][2], s_sm_u[k][3]);
+        float u[4];
+        if (k < 3 && s_pfx_vx_on) pfx_vx_row(s_sm_u[k], u); else memcpy(u, s_sm_u[k], sizeof u);
+        if (loc >= 0) p_glUniform4f(loc, u[0], u[1], u[2], u[3]);
     }
     static const char *const sn[4] = {"u_ssx", "u_ssy", "u_ssz", "u_sss"};   /* the sprites' map (w 0: the scenery's) */
     for (int k = 0; k < 4; k++) {
         const GLint loc = p_glGetUniformLocation(prog, sn[k]);
-        if (loc >= 0) p_glUniform4f(loc, s_ss_u[k][0], s_ss_u[k][1], s_ss_u[k][2], s_ss_u[k][3]);
+        float u[4];
+        if (k < 3 && s_pfx_vx_on && s_ss_u[3][3] > 0.0f) pfx_vx_row(s_ss_u[k], u); else memcpy(u, s_ss_u[k], sizeof u);
+        if (loc >= 0) p_glUniform4f(loc, u[0], u[1], u[2], u[3]);
     }
     /* the camera's world axes and the light, when the framework knows them
      * (after the preset's own values, which they replace) */
@@ -1865,8 +1893,9 @@ static void pfx_shadow_uniforms(GLuint prog) {
          * backdrop's ground); w 0 = no camera */
         const GLint loc = p_glGetUniformLocation(prog, "u_horizon");
         if (loc >= 0) {
-            if (s_sm_world[1][3] > 0.5f && s_cam_h > 0.0f)
-                p_glUniform4f(loc, s_sm_world[1][0], s_sm_world[1][1], s_sm_world[1][2], s_cam_h);
+            float up[3];
+            if (s_pfx_vx_on) pfx_vx_dir(s_sm_world[1], up); else memcpy(up, s_sm_world[1], sizeof up);
+            if (s_sm_world[1][3] > 0.5f && s_cam_h > 0.0f) p_glUniform4f(loc, up[0], up[1], up[2], s_cam_h);
             else p_glUniform4f(loc, 0.0f, 0.0f, 0.0f, 0.0f);
         }
     }
@@ -1874,7 +1903,9 @@ static void pfx_shadow_uniforms(GLuint prog) {
     for (int k = 0; k < 3; k++) {
         if (s_sm_world[k][3] < 0.5f) continue;
         const GLint loc = p_glGetUniformLocation(prog, wn[k]);
-        if (loc >= 0) p_glUniform4f(loc, s_sm_world[k][0], s_sm_world[k][1], s_sm_world[k][2], 1.0f);
+        float d[3];
+        if (s_pfx_vx_on) pfx_vx_dir(s_sm_world[k], d); else memcpy(d, s_sm_world[k], sizeof d);
+        if (loc >= 0) p_glUniform4f(loc, d[0], d[1], d[2], 1.0f);
     }
 }
 

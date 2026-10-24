@@ -431,6 +431,11 @@ static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
  * real frame's marks under them): a chain that reads the marks or the depth
  * then sees the picture it is given, not the real frame's. */
 static int       s_fg_marks;
+/* A generated frame's chains: the view space their inputs are built in (the
+ * real frame's camera) to the picture's (the in-between camera), y up:
+ * P' = A P + b (fg_effects_view); s_pfx_vx_on 0 = the same. */
+static int       s_pfx_vx_on;
+static float     s_pfx_vx_a[9], s_pfx_vx_b[3];
 static void      fg_capture(const RtCmd *c, const void *payload);
 static int       fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stale);
 static void      fg_flush(void);
@@ -13275,6 +13280,37 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
     }
 }
 
+/* The chains of a generated frame build their inputs from the newer real
+ * frame (its slot and camera) while its picture is the in-between camera's:
+ * the shadows stayed where the real frame had them and slid against the
+ * scenery while the camera moved. The map from the newer frame's view space
+ * to the picture's: the redrawn list's motion at its phase tl (fg_view_affine,
+ * GTE camera space), after the older list's camera when that list is the one
+ * redrawn; then y up. 0: no fit for the main view. */
+static int fg_effects_view(double tl, float A[9], float b[3]) {
+    const int vi = (int)fg_main_view(&s_fg_fit);
+    float At[9], bt[3], G[9], g[3];
+    if (!s_fg_fit.ok || !s_fg_fit.v[vi].ok || !fg_view_affine(&s_fg_fit, vi, tl, At, bt)) return 0;
+    if (s_fg_src_older) {
+        /* the newer frame from the older one: P_b = A0 P_a + b0 (phase 0) */
+        float A0[9], b0[3];
+        if (!fg_view_affine(&s_fg_fit, vi, 0.0, A0, b0)) return 0;
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)   /* At A0^T: A0 turns, its inverse is its transpose */
+                G[3 * r + c] = At[3 * r] * A0[3 * c] + At[3 * r + 1] * A0[3 * c + 1] + At[3 * r + 2] * A0[3 * c + 2];
+        for (int r = 0; r < 3; r++)
+            g[r] = bt[r] - (G[3 * r] * b0[0] + G[3 * r + 1] * b0[1] + G[3 * r + 2] * b0[2]);
+    } else {
+        memcpy(G, At, sizeof G); memcpy(g, bt, sizeof g);
+    }
+    static const float s[3] = {1.0f, -1.0f, 1.0f};
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) A[3 * r + c] = G[3 * r + c] * s[r] * s[c];
+        b[r] = g[r] * s[r];
+    }
+    return 1;
+}
+
 /* The generated image composed like a real present (no hold-last, no
  * interpolation capture, no present bookkeeping), then swapped. */
 static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int linear,
@@ -13992,7 +14028,9 @@ static int fg_generate(double t, int swap) {
         }
     }
     s_fg_reprojected_now = reproj;
+    s_pfx_vx_on = s_fg_marks && !reproj && fg_effects_view(tl, s_pfx_vx_a, s_pfx_vx_b);
     fg_compose(L, iw >= 0 ? s_fg_w_fbo : 0, iw >= 0 ? s_fg_w_tex : 0, b->linear, b->force43);
+    s_pfx_vx_on = 0;
     s_fg_reprojected_now = 0;
     s_fg_drawing = 0;
     s_fg_marks = 0;
