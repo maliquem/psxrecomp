@@ -13869,7 +13869,17 @@ static int fg_generate(double t, int swap) {
     FgState real;
     fg_state_capture(&real);
     const GLuint real_wide_cur = g_wide_cur;
-    const int real_pc = s_pc_valid, real_pq = s_pq_valid, real_pz = s_pz_valid;
+    /* A generated frame can come between a real record that sets up the next
+     * triangle (its sub-pixel corners, perspective weights, projected uv,
+     * depth) and that triangle: the redraw sets and consumes its own, so all
+     * of it is kept, not only the flags (with the flags alone the real
+     * triangle took the redraw's last corners: stray dark triangles anywhere
+     * on the real frames). */
+    const int real_pc = s_pc_valid, real_pq = s_pq_valid, real_pz = s_pz_valid, real_puv = s_projected_uv_valid;
+    float real_pend[6][3];
+    memcpy(real_pend[0], s_pc_x, sizeof real_pend[0]); memcpy(real_pend[1], s_pc_y, sizeof real_pend[1]);
+    memcpy(real_pend[2], s_pq, sizeof real_pend[2]); memcpy(real_pend[3], s_pz, sizeof real_pend[3]);
+    memcpy(real_pend[4], s_projected_u, sizeof real_pend[4]); memcpy(real_pend[5], s_projected_v, sizeof real_pend[5]);
     /* PGXP depth (G1.14): the generated frame tests depth like the real one,
      * from its own clear (the surface's depth is not the real frame's), and
      * leaves the real stream's depth bookkeeping and counters untouched. */
@@ -13897,7 +13907,10 @@ static int fg_generate(double t, int swap) {
     const double tl = s_fg_src_older ? 1.0 - t : t;
     const int ly = L->disp[1] < 0 ? 0 : L->disp[1];
     const int lh = L->disp[1] + L->disp[3] > VRAM_H ? VRAM_H - ly : L->disp[1] + L->disp[3] - ly;
-    if (L->disp[0] != b->disp[0] || lh != dh || L->disp[2] != b->disp[2]) return 0;
+    if (L->disp[0] != b->disp[0] || lh != dh || L->disp[2] != b->disp[2]) {
+        s_pz_valid = real_pz; s_depth_need_clear = real_dneed;   /* nothing drawn: as it was */
+        return 0;
+    }
     /* Reprojected frames start from the list's snapshot instead (below). */
     const int will_rp = s_fg_reproject && L == b && s_fg_fit.ok && rp_snap_slot((int)(L - s_fg_l)) >= 0;
     if (!will_rp) {
@@ -13995,7 +14008,10 @@ static int fg_generate(double t, int swap) {
         s_wst_x0[iw] = wst[0]; s_wst_y0[iw] = wst[1]; s_wst_x1[iw] = wst[2]; s_wst_y1[iw] = wst[3];
     }
     fg_state_apply(&real, real_wide_cur);
-    s_pc_valid = real_pc; s_pq_valid = real_pq; s_pz_valid = real_pz;
+    s_pc_valid = real_pc; s_pq_valid = real_pq; s_pz_valid = real_pz; s_projected_uv_valid = real_puv;
+    memcpy(s_pc_x, real_pend[0], sizeof real_pend[0]); memcpy(s_pc_y, real_pend[1], sizeof real_pend[1]);
+    memcpy(s_pq, real_pend[2], sizeof real_pend[2]); memcpy(s_pz, real_pend[3], sizeof real_pend[3]);
+    memcpy(s_projected_u, real_pend[4], sizeof real_pend[4]); memcpy(s_projected_v, real_pend[5], sizeof real_pend[5]);
     s_depth_need_clear = real_dneed; s_depth_used = real_dused; s_depth_last_avg = real_davg;
     s_depth_tris = real_dtris; s_depth_clears = real_dclears;
     memcpy(s_depth_clear_reason, real_dreason, sizeof real_dreason);
