@@ -1119,6 +1119,16 @@ int psx_mod_allow_direct_shortcut(uint32_t shortcut);
  * when the mode starts and 0 when it ends (setting it every frame from the
  * title's state is fine). Cleared at every mod/session reset. */
 void psx_mod_set_rewind_blocked(int blocked);
+
+/* The title's own look for the save state menu: `renderer` draws the menu
+ * (selected slot, a 240-line ARGB canvas as wide as the window's aspect gives,
+ * alpha blended over the frozen game; psx_savestate_menu.h) and the framework
+ * keeps the slots, the keys and saving / loading. The renderer may read the
+ * slots through savestate.h (exists, mtime, thumbnail) and the guest's VRAM;
+ * returning 0 shows the framework's panel instead. Call at activation; NULL
+ * restores the framework's panel; cleared at every mod/session reset. */
+typedef int (*PSXModSaveStateMenuRenderer)(int selected_slot, uint32_t *argb, int w, int h);
+void psx_mod_set_savestate_menu_renderer(PSXModSaveStateMenuRenderer renderer);
 /* Refuse saves and loads while trusted host gameplay state cannot be restored
  * by the guest serializer. Includes synchronized netplay state operations;
  * pending requests are cancelled. Cleared before each session's activation. */

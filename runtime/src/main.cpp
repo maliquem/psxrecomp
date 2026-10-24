@@ -1579,6 +1579,10 @@ extern "C" void psx_mod_set_rewind_blocked(int blocked) {
     psx_rewind_set_title_blocked(blocked);
 }
 
+extern "C" void psx_mod_set_savestate_menu_renderer(PSXModSaveStateMenuRenderer renderer) {
+    psx_savestate_menu_set_renderer(renderer);
+}
+
 /* psx_mod_set_host_rumble: per-seat title rumble, stamped with the rumble
  * VBlank so a value the mod stops refreshing lapses (psx_host_rumble.h). */
 static PsxHostRumbleSlot g_mod_rumble[PSX_MAX_PLAYERS];
@@ -8292,6 +8296,9 @@ static int savestate_menu_nav_fresh = 0;
 static SDL_Keycode savestate_menu_open_key = 0;
 
 static void savestate_menu_sync_overlay(void) {
+    int w = 0, h = 0;
+    if (sdl_window) SDL_GetWindowSize(sdl_window, &w, &h);
+    psx_savestate_menu_set_window(w, h);   /* a title canvas follows the aspect */
     psx_savestate_menu_set_state(savestate_menu_open, savestate_menu_slot);
 }
 
@@ -8805,6 +8812,11 @@ static void savestate_menu_host_pause_loop(void) {
             }
         }
         savestate_menu_poll_nav((uint32_t)SDL_GetTicks());
+        {
+            int ww = 0, wh = 0;   /* a resized window redraws a title canvas */
+            if (sdl_window) SDL_GetWindowSize(sdl_window, &ww, &wh);
+            psx_savestate_menu_set_window(ww, wh);
+        }
         rewind_pause_present();
         starvation_watchdog_heartbeat();
         SDL_Delay(8);
@@ -20232,6 +20244,7 @@ int main(int argc, char** argv) {
         g_p1_claimed_buttons = 0;
         psx_rewind_set_title_blocked(0);
         savestate_set_title_blocked(0);
+        psx_savestate_menu_set_renderer(nullptr);
         for (auto& policy : g_mod_controller_policy)
             policy = ModControllerPresentationPolicy{};
         g_mod_load_wall_multiplier = -1;

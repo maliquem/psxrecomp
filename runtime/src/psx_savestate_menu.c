@@ -6,6 +6,7 @@
 #include "savestate.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -60,6 +61,14 @@ static int s_dirty = 1;
 static uint32_t s_panel[SSM_W * SSM_H];
 static uint32_t s_thumbs[SAVESTATE_SLOTS][SAVESTATE_THUMB_W * SAVESTATE_THUMB_H];
 static int s_have_thumb[SAVESTATE_SLOTS];
+
+/* A title's renderer and its canvas (psx_savestate_menu_set_renderer). */
+#define SSM_CANVAS_H 240
+#define SSM_CANVAS_MAX_W 1024
+static PsxSaveStateMenuRenderer s_renderer;
+static uint32_t *s_canvas;
+static int s_canvas_w, s_canvas_on;
+static int s_win_w = 4, s_win_h = 3;
 
 static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
 {
@@ -309,6 +318,41 @@ int psx_savestate_menu_needs_present(void)
     return s_open;
 }
 
+void psx_savestate_menu_set_renderer(PsxSaveStateMenuRenderer renderer)
+{
+    s_renderer = renderer;
+    s_dirty = 1;
+}
+
+void psx_savestate_menu_set_window(int w, int h)
+{
+    if (w <= 0 || h <= 0 || (w == s_win_w && h == s_win_h)) return;
+    s_win_w = w;
+    s_win_h = h;
+    s_dirty = 1;
+}
+
+int psx_savestate_menu_overlay_blend(void)
+{
+    return s_open && s_canvas_on;
+}
+
+/* The title's canvas, when it has a renderer and draws this time. */
+static int render_canvas(void)
+{
+    int cw = (int)((int64_t)SSM_CANVAS_H * s_win_w / s_win_h);
+    if (!s_renderer) return 0;
+    if (cw < 320) cw = 320;
+    if (cw > SSM_CANVAS_MAX_W) cw = SSM_CANVAS_MAX_W;
+    if (!s_canvas) {
+        s_canvas = (uint32_t *)malloc((size_t)SSM_CANVAS_MAX_W * SSM_CANVAS_H * sizeof(uint32_t));
+        if (!s_canvas) return 0;
+    }
+    memset(s_canvas, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    s_canvas_w = cw;
+    return s_renderer(s_selected, s_canvas, cw, SSM_CANVAS_H) != 0;
+}
+
 int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
 {
     if (!s_open) {
@@ -317,8 +361,17 @@ int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
         if (h) *h = 0;
         return 0;
     }
-    if (s_dirty)
-        rasterize_panel();
+    if (s_dirty) {
+        s_canvas_on = render_canvas();
+        if (s_canvas_on) s_dirty = 0;
+        else rasterize_panel();
+    }
+    if (s_canvas_on) {
+        if (pixels) *pixels = s_canvas;
+        if (w) *w = s_canvas_w;
+        if (h) *h = SSM_CANVAS_H;
+        return 1;
+    }
     if (pixels) *pixels = s_panel;
     if (w) *w = SSM_W;
     if (h) *h = SSM_H;

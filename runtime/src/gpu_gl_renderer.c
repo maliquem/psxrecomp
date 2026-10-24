@@ -10297,8 +10297,16 @@ static void pass_apply_promotion(void) {
 /* Draw one host OSD ARGB image into the default framebuffer at (vx,vy)
  * in top-left window coordinates (y down). Bitmap is ow×oh; viewport is
  * dw×dh (may upscale for HiDPI / large windows). */
+static void gl_draw_osd_image_blend(const uint32_t *px, int ow, int oh, int dw, int dh,
+                                    int vx, int vy, int ww, int wh, int blend);
 static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
                               int dw, int dh, int vx, int vy, int ww, int wh) {
+    gl_draw_osd_image_blend(px, ow, oh, dw, dh, vx, vy, ww, wh, 0);
+}
+/* blend: the image carries alpha (a title's save state menu canvas): source
+ * over the composed frame. */
+static void gl_draw_osd_image_blend(const uint32_t *px, int ow, int oh, int dw, int dh,
+                                    int vx, int vy, int ww, int wh, int blend) {
     if (!px || ow <= 0 || oh <= 0 || dw <= 0 || dh <= 0 ||
         !s_present_prog || ww <= 0 || wh <= 0)
         return;
@@ -10326,10 +10334,16 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_DEPTH_TEST);
     /* host_osd bakes opaque panels (A=0xFF). Do not blend — PSX mode-2
-     * REVERSE_SUBTRACT left armed across FMV present made toasts solid black. */
+     * REVERSE_SUBTRACT left armed across FMV present made toasts solid black.
+     * The equation is reset to ADD either way; a blended image sets its own
+     * function and leaves blending off again. */
     glDisable(GL_BLEND);
     if (p_glBlendEquationSeparate)
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+    if (blend) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
     /* GL viewport origin is bottom-left. */
     glViewport(vx, wh - vy - dh, dw, dh);
     p_glUseProgram(s_present_prog);
@@ -10347,6 +10361,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
         p_glBindVertexArray(0);
     }
     p_glUseProgram(0);
+    if (blend) glDisable(GL_BLEND);
 }
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
@@ -10458,6 +10473,7 @@ static struct {
     const uint32_t *px[4];
     int w[4], h[4];
     float slide;
+    int blend3;   /* the save state menu image carries alpha */
 } s_rth_ov;
 static int ov_image(int i, const uint32_t **px, int *w, int *h) {
     if (rth_replaying() && s_rth_ov.valid) {
@@ -10473,6 +10489,9 @@ static int ov_image(int i, const uint32_t **px, int *w, int *h) {
 }
 static float ov_rewind_slide(void) {
     return (rth_replaying() && s_rth_ov.valid) ? s_rth_ov.slide : psx_rewind_slide();
+}
+static int ov_savestate_blend(void) {
+    return (rth_replaying() && s_rth_ov.valid) ? s_rth_ov.blend3 : psx_savestate_menu_overlay_blend();
 }
 static int ov_needs_present(void) {
     return (rth_replaying() && s_rth_ov.valid) ? s_rth_ov.needs_present
@@ -10752,7 +10771,7 @@ static void gl_swap_with_osd(void) {
                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
             }
             if (ov_image(3, &px, &ow, &oh) && px)
-                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+                gl_draw_osd_image_blend(px, ow, oh, ww, wh, 0, 0, ww, wh, ov_savestate_blend());
             /* In-game overlay provider (host_overlay.h P2), over everything
              * the host composes; no-op unless one registered. */
             psx_host_overlay_draw(ww, wh);
@@ -12189,6 +12208,7 @@ typedef struct RthOvHdr {
     int32_t needs_present, has, w[4], h[4];
     float   slide;
     int32_t args[8], nargs;
+    int32_t blend3;
 } RthOvHdr;
 
 static int rth_record_present(uint16_t op, int n, const int32_t *v) {
@@ -12203,6 +12223,7 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
         }
     }
     hd.slide = psx_rewind_slide();
+    hd.blend3 = psx_savestate_menu_overlay_blend();
     hd.nargs = n;
     for (int i = 0; i < n && i < 8; i++) hd.args[i] = v[i];
     size_t bytes = sizeof hd;
@@ -12256,6 +12277,7 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
     s_rth_ov.valid = 1;
     s_rth_ov.needs_present = hd.needs_present;
     s_rth_ov.slide = hd.slide;
+    s_rth_ov.blend3 = hd.blend3;
     for (int i = 0; i < 4; i++)
         if (hd.has & (1 << i)) {
             s_rth_ov.px[i] = (const uint32_t *)q;
@@ -14712,6 +14734,7 @@ static void fg_generate_timed(double t) {
         s_rth_ov.valid = 1;
         s_rth_ov.needs_present = hd.needs_present;
         s_rth_ov.slide = hd.slide;
+        s_rth_ov.blend3 = hd.blend3;
         for (int i = 0; i < 4; i++)
             if (hd.has & (1 << i)) {
                 s_rth_ov.px[i] = (const uint32_t *)qq;
