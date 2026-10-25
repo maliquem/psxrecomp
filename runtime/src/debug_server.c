@@ -452,6 +452,10 @@ typedef struct {
     uint8_t  pad[3];
 } WriteTraceAllEntry;
 static WriteTraceAllEntry *s_wtrace_all = NULL;
+/* Passive recorders (debug_server.h): the policy, and whether they record
+ * now (the catch-all ring, the fingerprint, card traces, the sampler). */
+static int s_passive_policy = 1;
+static int s_passive = 1;
 static uint64_t s_wtrace_all_seq  = 0;
 static uint32_t s_wtrace_all_head = 0;
 
@@ -11707,8 +11711,10 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
         if (psx_fp_write_eligible(phys, psx_ram_live_bytes())) psx_fp_note_quiet(&s_fp);
         return;
     }
-    if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
-    fp_record_write(phys, new_val, g_debug_last_store_pc);
+    if (s_passive) {
+        if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
+        fp_record_write(phys, new_val, g_debug_last_store_pc);
+    }
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
         if (phys < psx_ram_live_bytes())
@@ -11738,7 +11744,7 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
 #endif
     if (s_fmv_quiet) { psx_fp_note_quiet(&s_fp); return; }
     /* First-divergence fingerprint + frame recorder also see device writes. */
-    fp_record_mmio(addr, val, g_debug_last_store_pc);
+    if (s_passive) fp_record_mmio(addr, val, g_debug_last_store_pc);
     rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
               debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
     if (!s_mmio_trace) return;
@@ -16881,7 +16887,12 @@ void debug_server_init(int port)
     /* Always-on catch-all wtrace ring (8 MB). Records EVERY RAM write
      * with lean fields (no register window). Sized for ~1 second of
      * coverage at typical Tomba write rates. */
-    if (!s_wtrace_all) {
+    {   /* the passive recorders' policy: env, else the title's */
+        const char *e = getenv("PSX_DEBUG_PASSIVE");
+        if (e && e[0]) s_passive_policy = !strcmp(e, "connect") ? 2 : (e[0] != '0');
+        s_passive = s_passive_policy == 1;
+    }
+    if (!s_wtrace_all && s_passive) {
         s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP,
                                                     sizeof(WriteTraceAllEntry));
     }
@@ -17257,6 +17268,21 @@ void debug_server_get_status(int *listening, int *port, int *error)
     if (error)     *error     = s_listen_err;
 }
 
+void debug_server_set_passive_policy(int policy) { s_passive_policy = policy; }
+int  debug_server_passive_active(void) { return s_passive; }
+
+/* Policy 2: the first request turns the passive recorders on (on the
+ * emulation thread, which the sampler must start from). */
+static void passive_on_first_request(void) {
+    if (s_passive || s_passive_policy != 2) return;
+    if (!s_wtrace_all)
+        s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP, sizeof(WriteTraceAllEntry));
+    s_wtrace_all_seq = 0;
+    s_wtrace_all_head = 0;
+    s_passive = 1;
+    host_sampler_start();
+}
+
 void debug_server_poll(void)
 {
     /* Phase 1.0e-e2 starvation watchdog heartbeat. Refreshes the
@@ -17274,6 +17300,7 @@ void debug_server_poll(void)
     req[sizeof(req) - 1] = '\0';
     SDL_UnlockMutex(s_io_mutex);
 
+    passive_on_first_request();
     /* Execute on the emu thread (safe point). send_line appends to s_resp_buf. */
     s_resp_len = 0;
     s_resp_overflow = 0;

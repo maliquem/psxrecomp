@@ -1649,6 +1649,9 @@ extern "C" int psx_mod_fast_forward_speed(void) {
 extern "C" void psx_mod_set_debug_tools_restricted(int restricted) {
     debug_server_set_restricted(restricted);
 }
+extern "C" void psx_mod_set_debug_passive_recorders(int policy) {
+    debug_server_set_passive_policy(policy);
+}
 
 /* The disc the player picked, before a disc-patching mod's private image
  * replaces it (session_disc_path). */
@@ -21132,7 +21135,9 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
-        host_sampler_start();   /* this is the emulation thread */
+        /* this is the emulation thread; with the passive recorders deferred,
+         * the first debug request starts it (debug_server_poll) */
+        if (debug_server_passive_active()) host_sampler_start();
 #else
         (void)debug_port;
 #endif

@@ -96,6 +96,16 @@ void debug_server_poll(void);
  * that reads or changes guest state or drives input. */
 void debug_server_set_restricted(int restricted);
 
+/* Passive recorders: what lets a probe that connects late look back (the
+ * catch-all RAM write ring, 128 MB; the frame fingerprint; the memory card
+ * traces; the host CPU sampler). They cost the emulation thread on every
+ * guest store. Policy: 1 = always (the default), 0 = never, 2 = from the
+ * first debug request on. PSX_DEBUG_PASSIVE (0, 1, connect) wins over the
+ * title's choice (psx_mod_set_debug_passive_recorders), read at
+ * debug_server_init. */
+void debug_server_set_passive_policy(int policy);
+int  debug_server_passive_active(void);
+
 /* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
  * active. The TCP command pump stays live; expensive per-dispatch/per-frame
  * recording backs off so debug builds can still play FMVs at speed. */

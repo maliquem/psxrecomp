@@ -1154,6 +1154,11 @@ void psx_mod_set_savestate_blocked(int blocked);
 void psx_mod_set_savestate_load_blocked(int blocked);
 void psx_mod_set_fast_forward_blocked(int blocked);
 void psx_mod_set_debug_tools_restricted(int restricted);
+/* The debug server's passive recorders (debug_server.h): 1 always, 0 never,
+ * 2 from the first debug request on (a title's players pay nothing for them
+ * while no tool is attached). Call from a constructor: read once at start;
+ * PSX_DEBUG_PASSIVE wins. No effect in builds without debug tools. */
+void psx_mod_set_debug_passive_recorders(int policy);
 /* The manual fast-forward's speed for the title (e.g. levels a player picks):
  * 2..16 times, -1 unbounded, 0 the default (PSX_FAST_FORWARD_SPEED, else 4).
  * Applies from the next frame, also to a run in progress; cleared before each
