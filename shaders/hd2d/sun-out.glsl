@@ -11,9 +11,14 @@
 // u_sunview.x = 1 shows the lit term alone; u_ss.y 0: the sprites' shadows
 // only (no sun on the scenery): the colour is kept, and darkened where a
 // sprite's shadow falls as a shadow darkens it under the sun (ambient over sun).
+// Night (u_night.x, the framework's: gl_renderer_set_night): the light and the
+// ambient move that far toward u_mooncol and u_moonamb, and the sprites take
+// u_moonspr's tint (they keep their daytime colours in the game).
 
 uniform vec4 u_suncol;
 uniform vec4 u_amb;
+uniform vec4 u_night;                  // the framework's: x = the night's share of the light
+uniform vec4 u_mooncol, u_moonamb, u_moonspr;
 uniform vec4 u_sunview;
 uniform vec4 u_ss;
 uniform vec4 u_worldup, u_shadowdir;   // the framework's (pfx_shadow_uniforms): world up, the light
@@ -41,13 +46,16 @@ void main()
 {
     ivec2 p = ivec2(gl_FragCoord.xy) - u_org;
     vec3 src = texture(u_src, v_uv).rgb;
+    float nf = clamp(u_night.x, 0.0, 1.0);
+    vec3 suncol = mix(u_suncol.rgb, u_mooncol.rgb, nf), amb = mix(u_amb.rgb, u_moonamb.rgb, nf);
+    vec3 sprk = mix(vec3(1.0), u_moonspr.rgb, nf);
     vec3 mk = texelFetch(u_m, p, 0).rgb;
     float m = mk.g * (1.0 - mk.b);
     float zs = texelFetch(u_spr, p, 0).r;
     if (mk.g < 0.5 && zs > 0.0 && zs < 50000.0) {   // a sprite standing in the scene
         float ls = lit_at(zs);
         if (u_sunview.x > 0.5) { o = vec4(vec3(0.25 + 0.5 * ls), 1.0); return; }
-        o = vec4(src * mix(u_amb.rgb / max(u_suncol.rgb, vec3(1e-3)), vec3(1.0), ls), 1.0);
+        o = vec4(src * sprk * mix(amb / max(suncol, vec3(1e-3)), vec3(1.0), ls), 1.0);
         return;
     }
     float d = texelFetch(u_d, p, 0).r;
@@ -64,13 +72,13 @@ void main()
         vec3 ray = normalize(vec3((v_uv - 0.5) * nat / u_horizon.w, 1.0));
         float gnd = smoothstep(0.03, 0.06, -dot(ray, up));   // past the far dunes painted at the horizon
         float lg = clamp(dot(up, normalize(u_shadowdir.xyz)), 0.0, 1.0);
-        o = vec4(src * mix(vec3(1.0), mix(u_amb.rgb, u_suncol.rgb, lg), gnd), 1.0); return;
+        o = vec4(src * mix(vec3(1.0), mix(amb, suncol, lg), gnd), 1.0); return;
     }
     if (d >= 0.99999 || (m < 0.5 && u_sunview.x < 0.5)) { o = vec4(src, 1.0); return; }
     float z = 256.0 / max(1.0 - d, 1e-7) - 256.0;
     float lit = lit_at(z);
     if (u_sunview.x > 0.5) { o = vec4(vec3(m > 0.5 ? lit : 0.5), 1.0); return; }
-    vec3 shade = u_ss.y > 0.5 ? mix(u_amb.rgb, u_suncol.rgb, lit)
-                              : mix(u_amb.rgb / max(u_suncol.rgb, vec3(1e-3)), vec3(1.0), lit);
+    vec3 shade = u_ss.y > 0.5 ? mix(amb, suncol, lit)
+                              : mix(amb / max(suncol, vec3(1e-3)), vec3(1.0), lit);
     o = vec4(src * mix(vec3(1.0), shade, m), 1.0);
 }

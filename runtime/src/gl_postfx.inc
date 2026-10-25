@@ -1454,6 +1454,15 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     const float *sun = pfx_pass_uniform(ps, "u_sun");
     float area_sun[2];   /* [video.shadow] sun_areas: this area's own sun */
     if (sun && gpu_shadow_sun_area(&area_sun[0], &area_sun[1])) sun = area_sun;
+    float night_sun[2];  /* gl_renderer_set_night: that far toward the pass's moon (u_moon) */
+    {
+        const float *moon = pfx_pass_uniform(ps, "u_moon");
+        if (sun && moon && moon[1] > 0.0f && s_night_f > 0.0f) {
+            night_sun[0] = sun[0] + moon[0] * s_night_f;
+            night_sun[1] = sun[1] + (moon[1] - sun[1]) * s_night_f;
+            sun = night_sun;
+        }
+    }
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
     float Ls[3] = {L[0], L[1], L[2]};   /* the sprites' light (u_sprsun) */
@@ -2208,6 +2217,30 @@ static void pfx_shadow_uniforms(GLuint prog) {
         if (s_pfx_vx_on) pfx_vx_dir(s_sm_world[k], d); else memcpy(d, s_sm_world[k], sizeof d);
         if (loc >= 0) p_glUniform4f(loc, d[0], d[1], d[2], 1.0f);
     }
+    {   /* gl_renderer_set_night: x = the night's share of the light */
+        const GLint loc = p_glGetUniformLocation(prog, "u_night");
+        if (loc >= 0) p_glUniform4f(loc, s_night_f, 0.0f, 0.0f, 0.0f);
+    }
+}
+/* gl_renderer_scene_tone: the picture on screen's 3D scenery (its slot's
+ * tone), at each real present; none = nothing (cover 0). A slot stays on
+ * screen while nothing new is drawn (a black screen, a 2D menu): after
+ * TONE_STALE presents with no 3D triangle summed anywhere it is none, and
+ * stays none until a slot summed after that stretch is shown (the first
+ * new frame goes to the other buffer of a double-buffered game). */
+enum { TONE_STALE = 6 };
+static void pfx_tone_publish(void) {
+    static unsigned seen = 0, idle = 0;
+    if (s_tone_adds != seen) { seen = s_tone_adds; idle = 0; }
+    else if (idle <= TONE_STALE && ++idle > TONE_STALE) s_tone_epoch++;
+    float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const ScSlot *sc = sc_presented();
+    if (sc && sc->tone[3] > 0.0f && sc->tone_epoch == s_tone_epoch) {
+        const float da = (float)(sc->area[2] - sc->area[0] + 1) * (float)(sc->area[3] - sc->area[1] + 1);
+        for (int c = 0; c < 3; c++) t[c] = sc->tone[c] / sc->tone[3];
+        t[3] = da > 0.0f ? sc->tone[3] / da : 0.0f;
+    }
+    tone_publish(t);
 }
 
 
@@ -2445,7 +2478,8 @@ static int s_pfx_src_gen = 0;
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh) {
     const int src_fresh = fresh || s_pfx_src_gen;
     s_pfx_presents++;
-    if (fresh) pfx_lights_update();
+    s_night_f = atomic_load_explicit(&s_night_req, memory_order_relaxed);
+    if (fresh) { pfx_lights_update(); pfx_tone_publish(); }
     if (!s_ctx) { s_mask_src_valid = 0; return; }
     if (!post_clip_rect(&lx, &ly, &lw, &lh, 8)) { s_mask_src_valid = 0; return; }
     const int mark_shown = fresh && s_sc_on;   /* after this present's shadow map */

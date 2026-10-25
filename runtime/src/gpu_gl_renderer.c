@@ -834,6 +834,8 @@ typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; S
                                                corners (x, y VRAM px x 3), the share of the colour it adds
                                                (1, mode 3: 0.25), its look (emit_tex_rgb, 0 = none) */
                  float pts[SC_PTS_MAX][3]; int npts;   /* the points projected with the camera (view space) */
+                 float tone[4];   /* its 3D scenery's colour as drawn: sum rgb x area, sum area (VRAM px) */
+                 unsigned tone_epoch;   /* s_tone_epoch when it was last summed into */
                } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
 static unsigned s_sc_use = 0;
@@ -876,6 +878,7 @@ static ScSlot *sc_slot(const int area[4], int make) {
     memcpy(lru->area, area, sizeof lru->area);
     lru->n = 0; lru->conv = 0; lru->shown = 0; lru->sn = 0; lru->nanc = 0; lru->en = 0; lru->npts = 0;
     lru->atl_x = lru->atl_y = lru->atl_h = 0; lru->atl_key[0] = -1;
+    memset(lru->tone, 0, sizeof lru->tone);
     if (!lru->cap) { lru->v = (float *)malloc(4096 * 3 * SC_V * sizeof(float)); lru->cap = lru->v ? 4096 : 0; }
     return lru->cap ? lru : NULL;
 }
@@ -908,6 +911,7 @@ static void sc_restart(ScSlot *sl) {
     sc_hold(sl);
     sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0; sl->en = 0;
     sl->atl_x = sl->atl_y = sl->atl_h = 0; sl->atl_key[0] = -1;
+    memset(sl->tone, 0, sizeof sl->tone);
     memcpy(sl->anc, s_anc_pend, (size_t)s_anc_pend_n * sizeof s_anc_pend[0]);
     sl->nanc = s_anc_pend_n;
     s_anc_pend_n = 0;
@@ -980,6 +984,53 @@ static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth
         }
     }
     for (int c = 0; c < 3; c++) rgb[c] = (w > 0.0f ? s[c] / w : 1.0f) * m[c];
+}
+static unsigned s_tone_adds = 0;   /* triangles summed into a slot's tone (pfx_tone_publish: none new = none) */
+static unsigned s_tone_epoch = 1;  /* one more after each stretch with none (pfx_tone_publish) */
+/* The scenery's tone (gl_renderer_scene_tone): a 3D triangle's colour as the
+ * game draws it, for the mean over the picture. Textured: its texels (3x3
+ * over its uv box, through the CLUT; transparent ones left out) times its
+ * vertex colour (col: mod / 255, 128 = as is; raw: not modulated), each
+ * clamped as the GPU does; 0 when every sample is transparent (or a mod's
+ * texture bank). Flat: its vertices' colour (15-bit). */
+static int tone_tex_rgb(const int *us, const int *vs, int bx, int by, int depth, int cx, int cy,
+                        const float *col, int raw, float *rgb) {
+    if (!s_vram || s_selected_bank_tex) return 0;
+    float m[3] = {1.0f, 1.0f, 1.0f};
+    if (!raw)
+        for (int c = 0; c < 3; c++) m[c] = (col[c] + col[3 + c] + col[6 + c]) * (255.0f / 128.0f) / 3.0f;
+    int u0 = us[0], u1 = us[0], v0 = vs[0], v1 = vs[0];
+    for (int i = 1; i < 3; i++) {
+        u0 = us[i] < u0 ? us[i] : u0; u1 = us[i] > u1 ? us[i] : u1;
+        v0 = vs[i] < v0 ? vs[i] : v0; v1 = vs[i] > v1 ? vs[i] : v1;
+    }
+    float s[3] = {0.0f, 0.0f, 0.0f};
+    int n = 0;
+    for (int j = 0; j < 3; j++)
+        for (int i = 0; i < 3; i++) {
+            const int u = (u0 + (u1 - u0) * (2 * i + 1) / 6) & 255, v = (v0 + (v1 - v0) * (2 * j + 1) / 6) & 255;
+            const int row = ((by + v) & 511) * 1024;
+            uint16_t t;
+            if (depth == 0) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+            else if (depth == 1) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+            else t = s_vram[row + ((bx + u) & 1023)];
+            if (!t) continue;
+            s[0] += fminf((float)(t & 31) / 31.0f * m[0], 1.0f);
+            s[1] += fminf((float)((t >> 5) & 31) / 31.0f * m[1], 1.0f);
+            s[2] += fminf((float)((t >> 10) & 31) / 31.0f * m[2], 1.0f);
+            n++;
+        }
+    if (!n) return 0;
+    for (int c = 0; c < 3; c++) rgb[c] = s[c] / (float)n;
+    return 1;
+}
+static void tone_flat_rgb(const uint16_t *cs, float *rgb) {
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        rgb[0] += (float)(cs[i] & 31) / 93.0f;
+        rgb[1] += (float)((cs[i] >> 5) & 31) / 93.0f;
+        rgb[2] += (float)((cs[i] >> 10) & 31) / 93.0f;
+    }
 }
 /* A Smooth motion generated frame redraws a recorded list: the slots belong to
  * the real frames (their pieces, foot points, lights), so its draws leave them
@@ -1112,14 +1163,23 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
 /* The atlas of this slot's sprite pieces, rows in use (0 = none). */
 static int sc_atlas_rows(const ScSlot *sl) { return sl && sl->atl ? sl->atl_y + sl->atl_h : 0; }
 /* tex: NULL = untextured, else {u0,v0,u1,v1,u2,v2, page x, page y, clut x,
- * clut y, depth, window}. */
-static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex) {
+ * clut y, depth, window}. tone: its colour as drawn (tone_tex_rgb,
+ * tone_flat_rgb), NULL = none: the slot's tone sums it by its area. */
+static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex, const float *tone) {
     if (!s_sc_on || !s_pz_valid || !s_pc_valid || s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
     if (sl->shown) sc_restart(sl);   /* a new frame into a shown picture */
     if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
+    if (tone) {
+        const float a = 0.5f * fabsf((s_pc_x[1] - s_pc_x[0]) * (s_pc_y[2] - s_pc_y[0]) -
+                                     (s_pc_x[2] - s_pc_x[0]) * (s_pc_y[1] - s_pc_y[0]));
+        for (int c = 0; c < 3; c++) sl->tone[c] += tone[c] * a;
+        sl->tone[3] += a;
+        sl->tone_epoch = s_tone_epoch;
+        s_tone_adds++;
+    }
     if (sl->n >= SC_MAX_TRIS) return;
     if (sl->n == sl->cap) {
         float *p = (float *)realloc(sl->v, (size_t)sl->cap * 2 * 3 * SC_V * sizeof(float));
@@ -1567,13 +1627,50 @@ void gl_renderer_shadow_world(const float *w9, int n) {
 static uint32_t s_wg_area = 0;   /* gl_renderer_shadow_area */
 void gl_renderer_shadow_area(uint32_t id) { s_wg_area = id; }
 uint32_t gl_renderer_shadow_area_id(void) { return s_wg_area; }
+/* gl_renderer_scene_tone: published by each real present (pfx_tone_publish)
+ * from the slot on screen, read by any thread (a sequence count: odd while
+ * written). gl_renderer_set_night: asked by any thread, taken by each present
+ * (s_night_f) so all its passes see one value. */
+static _Atomic unsigned s_tone_seq = 0;
+static float            s_tone_pub[4];
+static _Atomic float    s_night_req = 0.0f;
+static float            s_night_f = 0.0f;
+int gl_renderer_scene_tone(float out[4]) {
+    for (int tries = 0; tries < 8; tries++) {
+        const unsigned a = atomic_load_explicit(&s_tone_seq, memory_order_acquire);
+        if (a & 1u) continue;
+        float t[4];
+        memcpy(t, s_tone_pub, sizeof t);
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&s_tone_seq, memory_order_relaxed) != a) continue;
+        memcpy(out, t, sizeof t);
+        return t[3] > 0.0f;
+    }
+    return 0;
+}
+static void tone_publish(const float t[4]) {
+    atomic_fetch_add_explicit(&s_tone_seq, 1u, memory_order_acq_rel);
+    memcpy(s_tone_pub, t, sizeof s_tone_pub);
+    atomic_fetch_add_explicit(&s_tone_seq, 1u, memory_order_release);
+}
+void gl_renderer_set_night(float f) {
+    if (!(f > 0.0f)) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    atomic_store_explicit(&s_night_req, f, memory_order_relaxed);
+}
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();
 }
 int gl_renderer_shadow_cache_stats(char *out, int cap) {
     GL_RT_SYNC("shadow_cache_stats");
-    return snprintf(out, (size_t)cap,
+    float tone[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    (void)gl_renderer_scene_tone(tone);
+    const int k = snprintf(out, (size_t)cap, "\"tone\":[%.4f,%.4f,%.4f,%.3f],\"night\":%.3f,",
+                           tone[0], tone[1], tone[2], tone[3], s_night_f);
+    if (k < 0 || k >= cap) return 0;
+    out += k; cap -= k;
+    return k + snprintf(out, (size_t)cap,
         "\"camera\":%d,\"stored\":%d,\"alive\":%d,\"matched\":%llu,\"added\":%llu,\"dropped\":%llu,"
         "\"resets\":%llu,\"pick\":%d,\"world\":%d,\"frame_cam\":%u,\"sprite_frames\":%u,\"sprite_pieces\":%u,\"sprite_runs\":[%u,%u,%u],\"sprite_bent\":%u,\"centre\":[%.1f,%.1f],\"picture_centre\":[%.1f,%.1f]",
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
@@ -5689,7 +5786,12 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
 
     int gate = bd_prim_gate(xs, n, 0);
     const int dmode = n == 3 ? pgxp_tri_depth_mode(semi) : 0;
-    if (dmode) { depth_before_tri(); sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, NULL); }
+    if (dmode) {
+        depth_before_tri();
+        float tone[3];
+        tone_flat_rgb(cs, tone);
+        sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, NULL, tone);
+    }
     if (n == 3 && (semi == 1 || semi == 3) && s_sc_on) {
         float rgb[3], wsc, wce;
         emit_flat_rgb(cs, rgb);
@@ -5867,7 +5969,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                 t[6] = (float)base_x; t[7] = (float)base_y; t[8] = (float)clut_x; t[9] = (float)clut_y;
                 t[10] = s_selected_bank_tex ? -1.0f : (float)depth;   /* a mod bank: opaque */
                 t[11] = (float)(twx | (twy << 5) | (tox << 10) | (toy << 15));
-                sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, t);
+                float tone[3];
+                const int toned = tone_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, tone);
+                sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, t, toned ? tone : NULL);
             }
         } else if (s_spr_on) {
             const float t6[6] = {(float)base_x, (float)base_y, (float)clut_x, (float)clut_y,

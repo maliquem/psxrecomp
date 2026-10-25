@@ -245,6 +245,18 @@ void  gl_renderer_shadow_world(const float *w9, int n);
  * in place of the scene_keys' number. 0: none (the scene_keys'). */
 void     gl_renderer_shadow_area(uint32_t id);
 uint32_t gl_renderer_shadow_area_id(void);
+/* The picture on screen's 3D scenery as the game drew it (while a chain reads
+ * the shadow map): rgb = the mean colour of its depth-tested triangles
+ * (texels through the CLUT times the vertex colour, 0..1), weighted by their
+ * area; [3] = that area over the drawing area's (overlaps count twice). 0
+ * while there is none. Each real present updates it; any thread may read
+ * it (no sync point). */
+int   gl_renderer_scene_tone(float out[4]);
+/* The light's night share, 0..1 (0 = day, as before): the passes that read
+ * the shadow map, and their chain, get u_night (x = it), and the light moves
+ * toward the reading pass's u_moon (x = azimuth added, y = elevation). Any
+ * thread, no sync point: takes effect from the next present. */
+void  gl_renderer_set_night(float f);
 /* Faces the game culled (NCLIP back-facing), shadow-only casters: n x 9
  * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
 void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);
