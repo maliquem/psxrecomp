@@ -1222,6 +1222,18 @@ void psx_mod_title_toast_redraw(void);
  * each session's activation. */
 typedef int (*PSXModOsdHandler)(const char *msg, int duration_ms);
 void psx_mod_set_osd_handler(PSXModOsdHandler handler);
+/* The kind of P1's host controller, for a title's button prompts: the
+ * assigned gamepad's family (PSX_MOD_PAD_KIND_NONE without one). The debug
+ * host layer counts as OTHER; PSX_PAD_KIND=xbox|playstation|nintendo|other
+ * overrides it (tests). */
+enum {
+    PSX_MOD_PAD_KIND_NONE = 0,
+    PSX_MOD_PAD_KIND_OTHER = 1,
+    PSX_MOD_PAD_KIND_XBOX = 2,
+    PSX_MOD_PAD_KIND_PLAYSTATION = 3,
+    PSX_MOD_PAD_KIND_NINTENDO = 4
+};
+int psx_mod_host_pad_kind(void);
 /* Save the next presented picture (with the OSD, a page or HUD, as shown) as
  * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
  * One request at a time: a newer one replaces a pending one. */

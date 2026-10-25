@@ -8929,6 +8929,43 @@ extern "C" void psx_mod_title_hud_redraw(void) { psx_savestate_menu_hud_redraw()
 extern "C" void psx_mod_set_title_toast(PSXModCanvasRenderer render) { psx_savestate_menu_set_toast(render); }
 extern "C" void psx_mod_title_toast_redraw(void) { psx_savestate_menu_toast_redraw(); }
 extern "C" void psx_mod_set_osd_handler(PSXModOsdHandler handler) { host_osd_set_handler(handler); }
+extern "C" int psx_mod_host_pad_kind(void) {
+    if (const char* e = std::getenv("PSX_PAD_KIND")) {
+        if (!std::strcmp(e, "xbox")) return PSX_MOD_PAD_KIND_XBOX;
+        if (!std::strcmp(e, "playstation")) return PSX_MOD_PAD_KIND_PLAYSTATION;
+        if (!std::strcmp(e, "nintendo")) return PSX_MOD_PAD_KIND_NINTENDO;
+        if (!std::strcmp(e, "other")) return PSX_MOD_PAD_KIND_OTHER;
+    }
+    uint16_t word;
+    uint8_t st[4], lt, rt;
+    if (host_pad_layer(&word, st, &lt, &rt)) return PSX_MOD_PAD_KIND_OTHER;
+    SDL_GameController* h = g_players[0].handle;
+    if (!h) return PSX_MOD_PAD_KIND_NONE;
+#if defined(PSX_SDL3)
+    switch (SDL_GetGamepadType(h)) {
+    case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE:
+        return PSX_MOD_PAD_KIND_XBOX;
+    case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5:
+        return PSX_MOD_PAD_KIND_PLAYSTATION;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+        return PSX_MOD_PAD_KIND_NINTENDO;
+    default:
+        return PSX_MOD_PAD_KIND_OTHER;
+    }
+#else
+    switch (SDL_GameControllerGetType(h)) {
+    case SDL_CONTROLLER_TYPE_XBOX360: case SDL_CONTROLLER_TYPE_XBOXONE:
+        return PSX_MOD_PAD_KIND_XBOX;
+    case SDL_CONTROLLER_TYPE_PS3: case SDL_CONTROLLER_TYPE_PS4: case SDL_CONTROLLER_TYPE_PS5:
+        return PSX_MOD_PAD_KIND_PLAYSTATION;
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+        return PSX_MOD_PAD_KIND_NINTENDO;
+    default:
+        return PSX_MOD_PAD_KIND_OTHER;
+    }
+#endif
+}
 extern "C" int psx_mod_request_screenshot(const char* path) { return present_shot_request(path); }
 
 /* P1's controller as PSX_MOD_PAGE_* bits (the debug host layer too). */
