@@ -1224,8 +1224,8 @@ typedef int (*PSXModOsdHandler)(const char *msg, int duration_ms);
 void psx_mod_set_osd_handler(PSXModOsdHandler handler);
 /* The kind of P1's host controller, for a title's button prompts: the
  * assigned gamepad's family (PSX_MOD_PAD_KIND_NONE without one). The debug
- * host layer counts as OTHER; PSX_PAD_KIND=xbox|playstation|nintendo|other
- * overrides it (tests). */
+ * host layer counts as OTHER; PSX_PAD_KIND=xbox|playstation|nintendo|other|
+ * none overrides it (tests). */
 enum {
     PSX_MOD_PAD_KIND_NONE = 0,
     PSX_MOD_PAD_KIND_OTHER = 1,
@@ -1234,6 +1234,12 @@ enum {
     PSX_MOD_PAD_KIND_NINTENDO = 4
 };
 int psx_mod_host_pad_kind(void);
+/* Write a title's own pixels into VRAM (w x h halfwords, row by row, at x, y;
+ * wraps at the VRAM's edges): an unmasked CPU->VRAM copy done at once, in the
+ * guest's VRAM and the renderer's (render thread too). For small host-side
+ * art (e.g. button icons in a font page) from a VBlank or hook callback; the
+ * pixels are guest state from then on (save states keep them). */
+void psx_mod_vram_write(int x, int y, int w, int h, const uint16_t *px);
 /* Save the next presented picture (with the OSD, a page or HUD, as shown) as
  * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
  * One request at a time: a newer one replaces a pending one. */
