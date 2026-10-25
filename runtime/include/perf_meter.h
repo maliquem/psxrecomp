@@ -21,10 +21,10 @@
  *   DEBUG   — the debug server's per-VBlank work (debug-tools builds)
  *   VBLANK  — the rest of the VBlank epilogue (input, OSD, bookkeeping)
  * Each record also carries the render thread's busy time over the interval
- * and the GPU time of the frames read back in it (frame_perf's timer
- * queries, debug-tools builds, a few frames late: the post effects and the
- * present exactly; the scene's draws as the span between two presents, an
- * upper bound that includes the GPU's idle gaps).
+ * and the GPU time read back in it, a few frames late: the post effects
+ * exactly (timer queries around each stage's passes), and frame_perf's
+ * spans (debug-tools builds; upper bounds: the scene's draws between two
+ * presents with the GPU's idle gaps, the present with the swap's vsync).
  */
 #ifndef PSX_PERF_METER_H
 #define PSX_PERF_METER_H
@@ -52,11 +52,13 @@ typedef struct PsxPerfFrame {
     float    game_ms;        /* the recompiled code (wall less every section) */
     float    sec_ms[PM_COUNT];
     float    render_cpu_ms;  /* the render thread's busy time over the interval */
-    float    gpu_ms;         /* GPU time of the frames read back this interval:
-                              * scene span (an upper bound) + present */
-    float    gpu_post_ms;    /* of it, the present: post effects, blit (exact) */
+    float    gpu_ms;         /* frame_perf (debug builds) over the frames read back
+                              * this interval: the scene's span + the present's,
+                              * both upper bounds (idle gaps, the swap's vsync) */
+    float    gpu_post_ms;    /* the post effects' GPU time of the presents read
+                              * back this interval (exact: one burst per stage) */
     uint8_t  render_frames;  /* render-thread frames finished this interval */
-    uint8_t  gpu_frames;     /* frames whose GPU time was read back (debug builds) */
+    uint8_t  gpu_frames;     /* presents whose post-effect time was read back */
     uint8_t  presents;       /* frames handed to the display this VBlank */
     uint8_t  fast_forward;   /* the manual turbo was on */
 } PsxPerfFrame;

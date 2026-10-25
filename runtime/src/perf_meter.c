@@ -33,6 +33,7 @@ static uint64_t s_keep_until = 0;       /* a TCP reader: on until this tick */
 /* the render thread's busy time, frame_perf's GPU totals (last VBlank) */
 static uint64_t s_rt_busy_last = 0, s_rt_frames_last = 0;
 static uint64_t s_gf_last = 0, s_gs_last = 0, s_gp_last = 0;
+static uint64_t s_xf_last = 0, s_xn_last = 0;   /* the post effects' GPU totals */
 
 static PsxPerfFrame s_ring[PM_RING];
 static uint64_t s_seq = 0;
@@ -172,12 +173,14 @@ void perf_meter_vblank(int want, int fast_forward) {
         f->render_cpu_ms = rs.running ? (float)((double)(rs.render_busy_ns - s_rt_busy_last) * 1e-6) : 0.0f;
         s_rt_busy_last = rs.render_busy_ns;
         s_rt_frames_last = rs.frames_consumed;
-        uint64_t gf, gs, gp;
+        uint64_t gf, gs, gp, xf, xn;
         gl_renderer_frame_gpu_totals(&gf, &gs, &gp);
-        f->gpu_frames = (uint8_t)(gf - s_gf_last > 255 ? 255 : gf - s_gf_last);
+        gl_renderer_postfx_gpu_totals(&xf, &xn);
+        f->gpu_frames = (uint8_t)(xf - s_xf_last > 255 ? 255 : xf - s_xf_last);
         f->gpu_ms = (float)((double)(gs - s_gs_last + gp - s_gp_last) * 1e-6);
-        f->gpu_post_ms = (float)((double)(gp - s_gp_last) * 1e-6);
+        f->gpu_post_ms = (float)((double)(xn - s_xn_last) * 1e-6);
         s_gf_last = gf; s_gs_last = gs; s_gp_last = gp;
+        s_xf_last = xf; s_xn_last = xn;
         s_seq++;
         if (now - s_win_t0 >= s_freq) window_close(now);
     }
@@ -195,12 +198,14 @@ void perf_meter_vblank(int want, int fast_forward) {
         s_rt_busy_last = rs.render_busy_ns;
         s_rt_frames_last = rs.frames_consumed;
         gl_renderer_frame_gpu_totals(&s_gf_last, &s_gs_last, &s_gp_last);
+        gl_renderer_postfx_gpu_totals(&s_xf_last, &s_xn_last);
         s_win_t0 = now;
         s_win_seq0 = s_seq;
         s_win_cpu0 = psx_host_thread_cpu_ns();
         s_win_rcpu0 = gl_renderer_gl_thread_cpu_ns();
         s_win.valid = 0;
     }
+    if (on != g_perf_meter_on) gl_renderer_postfx_timing_auto(on);
     g_perf_meter_on = on;
 }
 

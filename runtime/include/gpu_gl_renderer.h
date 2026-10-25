@@ -604,6 +604,12 @@ void gl_renderer_render_thread_costs(GlRthCosts *out);
  * upper bound, idle gaps included) and the present (post effects, the
  * blit; one burst: its true cost). Any thread, never syncs. */
 void gl_renderer_frame_gpu_totals(uint64_t *frames, uint64_t *scene_ns, uint64_t *present_ns);
+/* The post effects' GPU time (every pass of every stage, timer queries read
+ * back three presents late; exact: each stage is one burst), running totals
+ * over the presents read back. On while gl_renderer_postfx_timing_auto(1)
+ * (the perf meter) or TCP postfx_timing; any thread, never syncs. */
+void gl_renderer_postfx_timing_auto(int on);
+void gl_renderer_postfx_gpu_totals(uint64_t *presents, uint64_t *ns);
 
 /* Narrow a native-wide display aspect num:den to the widest whose surface
  * this context can allocate at its internal scale (psx_gl_fit_wide_aspect;

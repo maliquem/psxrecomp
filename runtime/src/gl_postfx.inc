@@ -2355,35 +2355,88 @@ static void pfx_tone_publish(void) {
  * Mean microseconds per pass and per stage since the last reset. */
 enum { PT_RING = 3, PT_TS = PFX_MAX_PASSES + 1 };
 static int      s_pxt_on = 0, s_pxt_stage = -1, s_pxt_slot = 0;
+/* The perf meter's own use (perf_meter.h): the same stamps without a sync
+ * point (an atomic the render thread reads at each present), each read-back
+ * present's post-effect GPU time added to running totals. s_pxt_live: on
+ * for this present (TCP or the meter). */
+static _Atomic int      s_pxt_meter = 0;
+static _Atomic uint64_t s_pxt_tot_presents = 0, s_pxt_tot_ns = 0;
+static int      s_pxt_live = 0;
+/* the inputs built outside the stages (the 3D mask, the depth): their own
+ * stamp pairs, per ring slot; "inputs" in the TCP report */
+enum { PXI_MASK = 0, PXI_DEPTH, PXI_N };
+static GLuint   s_pxi_q[PT_RING][PXI_N][2];
+static uint8_t  s_pxi_used[PT_RING][PXI_N];
+static double   s_pxi_sum[PXI_N];
+static uint32_t s_pxi_n[PXI_N];
+static void pxi_stamp(int which, int end) {
+    if (!s_pxt_live || !p_glQueryCounter) return;
+    p_glQueryCounter(s_pxi_q[s_pxt_slot][which][end], 0x8E28 /*GL_TIMESTAMP*/);
+    if (end) s_pxi_used[s_pxt_slot][which] = 1;
+}
+void gl_renderer_postfx_timing_auto(int on) { atomic_store(&s_pxt_meter, on ? 1 : 0); }
+void gl_renderer_postfx_gpu_totals(uint64_t *presents, uint64_t *ns) {
+    *ns = atomic_load(&s_pxt_tot_ns);
+    *presents = atomic_load(&s_pxt_tot_presents);
+}
 static GLuint   s_pxt_q[PT_RING][PFX_NSTAGES][PT_TS];
 static uint8_t  s_pxt_used[PT_RING][PFX_NSTAGES];   /* timestamps issued: npasses + 1, 0 = none */
 static double   s_pxt_sum[PFX_NSTAGES][PFX_MAX_PASSES];
 static uint32_t s_pxt_n[PFX_NSTAGES][PFX_MAX_PASSES];
 static void pxt_stamp(int k) {
-    if (s_pxt_on && s_pxt_stage >= 0 && p_glQueryCounter)
+    if (s_pxt_live && s_pxt_stage >= 0 && p_glQueryCounter)
         p_glQueryCounter(s_pxt_q[s_pxt_slot][s_pxt_stage][k], 0x8E28 /*GL_TIMESTAMP*/);
 }
 /* At the start of a present: collect the slot about to be reused. */
 static void pxt_frame_begin(void) {
-    if (!s_pxt_on || !p_glQueryCounter) return;
+    s_pxt_live = s_pxt_on || atomic_load_explicit(&s_pxt_meter, memory_order_relaxed);
+    if (!s_pxt_live || !p_glQueryCounter) return;
     static int made = 0;
-    if (!made) { p_glGenQueries(PT_RING * PFX_NSTAGES * PT_TS, &s_pxt_q[0][0][0]); made = 1; }
+    if (!made) {
+        p_glGenQueries(PT_RING * PFX_NSTAGES * PT_TS, &s_pxt_q[0][0][0]);
+        p_glGenQueries(PT_RING * PXI_N * 2, &s_pxi_q[0][0][0]);
+        made = 1;
+    }
     s_pxt_slot = (s_pxt_slot + 1) % PT_RING;
+    uint64_t slot_ns = 0;
+    int any = 0;
     for (int st = 0; st < PFX_NSTAGES; st++) {
         const int n = s_pxt_used[s_pxt_slot][st];
         if (n < 2) continue;
         GLuint64 t[PT_TS];
         for (int k = 0; k < n; k++) p_glGetQueryObjectui64v(s_pxt_q[s_pxt_slot][st][k], GL_QUERY_RESULT, &t[k]);
-        for (int k = 0; k + 1 < n; k++) {
-            s_pxt_sum[st][k] += (double)(t[k + 1] - t[k]) * 1e-3;
-            s_pxt_n[st][k]++;
-        }
+        if (s_pxt_on)
+            for (int k = 0; k + 1 < n; k++) {
+                s_pxt_sum[st][k] += (double)(t[k + 1] - t[k]) * 1e-3;
+                s_pxt_n[st][k]++;
+            }
+        if (t[n - 1] > t[0]) slot_ns += t[n - 1] - t[0];
+        any = 1;
         s_pxt_used[s_pxt_slot][st] = 0;
+    }
+    for (int w = 0; w < PXI_N; w++) {
+        if (!s_pxi_used[s_pxt_slot][w]) continue;
+        GLuint64 a = 0, b = 0;
+        p_glGetQueryObjectui64v(s_pxi_q[s_pxt_slot][w][0], GL_QUERY_RESULT, &a);
+        p_glGetQueryObjectui64v(s_pxi_q[s_pxt_slot][w][1], GL_QUERY_RESULT, &b);
+        if (b > a) {
+            slot_ns += b - a;
+            if (s_pxt_on) { s_pxi_sum[w] += (double)(b - a) * 1e-3; s_pxi_n[w]++; }
+        }
+        s_pxi_used[s_pxt_slot][w] = 0;
+        any = 1;
+    }
+    if (any) {
+        atomic_fetch_add(&s_pxt_tot_ns, slot_ns);
+        atomic_fetch_add(&s_pxt_tot_presents, 1);   /* last: the time above is in */
     }
 }
 void gl_renderer_postfx_timing(int on, int reset) {
     GL_RT_SYNC("postfx_timing");
-    if (reset || (on && !s_pxt_on)) { memset(s_pxt_sum, 0, sizeof s_pxt_sum); memset(s_pxt_n, 0, sizeof s_pxt_n); memset(s_pxt_used, 0, sizeof s_pxt_used); }
+    if (reset || (on && !s_pxt_on)) {
+        memset(s_pxt_sum, 0, sizeof s_pxt_sum); memset(s_pxt_n, 0, sizeof s_pxt_n); memset(s_pxt_used, 0, sizeof s_pxt_used);
+        memset(s_pxi_sum, 0, sizeof s_pxi_sum); memset(s_pxi_n, 0, sizeof s_pxi_n); memset(s_pxi_used, 0, sizeof s_pxi_used);
+    }
     if (on >= 0) s_pxt_on = on ? 1 : 0;
 }
 int gl_renderer_postfx_timing_json(char *out, int cap) {
@@ -2409,6 +2462,13 @@ int gl_renderer_postfx_timing_json(char *out, int cap) {
             pf = 0;
         }
         k += snprintf(out + k, (size_t)(cap - k), "]}");
+    }
+    if (s_pxi_n[PXI_MASK] || s_pxi_n[PXI_DEPTH]) {
+        const double m = s_pxi_n[PXI_MASK] ? s_pxi_sum[PXI_MASK] / s_pxi_n[PXI_MASK] : 0.0;
+        const double d = s_pxi_n[PXI_DEPTH] ? s_pxi_sum[PXI_DEPTH] / s_pxi_n[PXI_DEPTH] : 0.0;
+        k += snprintf(out + k, (size_t)(cap - k),
+                      "%s{\"stage\":\"inputs\",\"file\":\"\",\"us\":%.1f,\"passes\":[{\"pass\":\"mask\",\"us\":%.1f},"
+                      "{\"pass\":\"depth\",\"us\":%.1f}]}", first ? "" : ",", m + d, m, d);
     }
     k += snprintf(out + k, (size_t)(cap - k), "]");
     return k;
@@ -2537,7 +2597,7 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         if (ps->blend != PFX_BLEND_REPLACE) glDisable(GL_BLEND);
     }
     pxt_stamp(c->npasses);
-    if (s_pxt_on && s_pxt_stage >= 0) s_pxt_used[s_pxt_slot][s_pxt_stage] = (uint8_t)(c->npasses + 1);
+    if (s_pxt_live && s_pxt_stage >= 0) s_pxt_used[s_pxt_slot][s_pxt_stage] = (uint8_t)(c->npasses + 1);
     for (int k = PFX_MAX_INPUTS - 1; k >= 0; k--) {
         p_glActiveTexture(PSXGL_TEXTURE0 + (GLenum)k);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -2599,11 +2659,19 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         PfxStage *st = &s_pfx[i];
         if (st->chain.uses_shadow && gpu_shadow_off_active()) continue;   /* no place under the sun (a world map) */
         if (st->chain.uses_mask || st->chain.uses_mask3d) {
-            if (!mask_done) { mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1; }
+            if (!mask_done) {
+                if (with_aa) pxi_stamp(PXI_MASK, 0);
+                mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1;
+                if (with_aa) pxi_stamp(PXI_MASK, 1);
+            }
             if (!mask_ok) continue;                  /* no marks yet */
         }
         if (st->chain.uses_depth) {
-            if (!dep_done) { dep_ok = pfx_depth_build(src_fresh, lw, lh); dep_done = 1; }
+            if (!dep_done) {
+                if (with_aa) pxi_stamp(PXI_DEPTH, 0);
+                dep_ok = pfx_depth_build(src_fresh, lw, lh); dep_done = 1;
+                if (with_aa) pxi_stamp(PXI_DEPTH, 1);
+            }
             if (!dep_ok) continue;                   /* no depth yet */
         }
         if (i == PFX_STAGE_BLOOM) {
