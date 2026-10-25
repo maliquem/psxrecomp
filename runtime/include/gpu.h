@@ -633,6 +633,9 @@ void gpu_ws_set_nw_phase_backdrop(int on);
 enum { GPU_WS_WIDE_PRIM_DEFAULT = 0, GPU_WS_WIDE_PRIM_STRETCH = 1, GPU_WS_WIDE_PRIM_EDGES = 2,
        GPU_WS_WIDE_PRIM_KEEP = 3, GPU_WS_WIDE_PRIM_IMAGE = 4 };
 void gpu_ws_set_wide_prim_predicate(int (*predicate)(uint32_t op, uint32_t ot_rank, uint32_t flags));
+/* The primitive being drawn is in its ordering table's last entries, where a
+ * game draws its UI over everything (never a sprite standing in the world). */
+int gpu_ot_front_now(void);
 /* The backdrop-image rule (native-wide): what a frame draws before its 3D
  * world, as images (a picture's tiles together, a band each for pieces
  * stacked in it), each decided on its own: past the wide edge (a panorama),

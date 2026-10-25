@@ -4473,6 +4473,18 @@ void gpu_ws_end_linked_list(void) {
     gp0_ot_rank = 0xFFFFu;
 }
 
+/* The ordering table's front: its last GPU_OT_FRONT entries, where a game puts
+ * what it draws over everything (BoF4: menus, a target's HP bar, the markers
+ * by each character, at entries 1031 and 1033 of 1036); its world's sprites
+ * are sorted by depth into the entries before them. s_ot_top: the linked list
+ * being drawn's last entry (its empty nodes, counted by the prepass). */
+enum { GPU_OT_FRONT = 6 };
+static uint16_t s_ot_top = 0xFFFFu;
+int gpu_ot_front_now(void) {
+    return gp0_ot_rank != 0xFFFFu && s_ot_top != 0xFFFFu && s_ot_top >= 64u &&
+           (uint32_t)gp0_ot_rank + GPU_OT_FRONT > s_ot_top;
+}
+
 void gpu_ws_restore_linked_list_rank(uint32_t rank) {
     gp0_ot_rank = rank == UINT32_MAX ? 0xFFFFu : (uint16_t)rank;
 }
@@ -7280,6 +7292,16 @@ static int ws_ui_attached(const WsUiPrepassItem *a, const WsUiPrepassItem *b) {
 static void bdi_prepass(uint32_t start_addr);   /* backdrop images, below */
 
 void gpu_ws_prepass_linked_list(uint32_t start_addr) {
+    {   /* the list's entries: its empty nodes (gpu_ot_front_now) */
+        uint32_t a = psx_mod_gpu_dma_resolve_address(start_addr), n = 0;
+        for (uint32_t safety = 0; safety < 0x40000u; safety++) {
+            const uint32_t h = psx_read_word(a);
+            if (((h >> 24) & 0xFFu) == 0) n++;
+            if ((h & 0x00FFFFFFu) == 0x00FFFFFFu) break;
+            a = psx_mod_gpu_dma_resolve_address(h & 0x00FFFFFFu);
+        }
+        s_ot_top = n > 0 && n <= 0xFFFFu ? (uint16_t)(n - 1u) : 0xFFFFu;
+    }
     bdi_prepass(start_addr);
     ws_ui_prepass_count = 0;
     ws_ui_prepass_nodes_reset();

@@ -421,7 +421,7 @@ static uint16_t *s_rth_vram_pub = NULL;   /* gpu.c's VRAM (guest-visible)      *
 static uint16_t *s_rth_vram_priv = NULL;  /* render thread's upload source     */
 /* Replay-side capture of guest state (valid only on the render thread). */
 static int       s_rthx_prim = 0;         /* current record carries prim tags  */
-static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
+static int       s_rthx_tagged = 0, s_rthx_backdrop = 0, s_rthx_front = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
 /* Frame generation (defined with the render-thread code near the end). */
@@ -450,6 +450,10 @@ static int ctx_prim_tagged(void) {
 }
 static int ctx_prim_in_backdrop(void) {
     return rth_replaying() ? (s_rthx_prim ? s_rthx_backdrop : 0) : psx_ws_prim_in_backdrop();
+}
+/* in its ordering table's front (gpu_ot_front_now): the game's UI */
+static int ctx_prim_front(void) {
+    return rth_replaying() ? (s_rthx_prim ? s_rthx_front : 0) : gpu_ot_front_now();
 }
 static int ctx_flat_backdrop(void) {
     return rth_replaying() ? s_rths_flat_bd : gpu_ws_nw_flat_backdrop_enabled();
@@ -818,7 +822,8 @@ typedef struct { float r[9], t[3], of[2], h; } ScCam;
 /* conv: taken into the world store; cam (cam_ok): the frame camera when its
  * triangles were drawn (gl_renderer_shadow_frame_camera), cam_ver its version */
 /* sv/sn: the frame's 2D textured triangles (sprites, HUD; SC_V floats per
- * vertex, z = 1 when translucent); anc/nanc: the sprite foot points projected
+ * vertex, z = 1 when translucent, 2 opaque in the ordering table's front:
+ * the game's UI, never a sprite); anc/nanc: the sprite foot points projected
  * for that frame (gl_renderer_shadow_anchor, view space of their camera). */
 enum { SC_ANC_MAX = 64 };
 /* atl: the cut-outs of the frame's sprite pieces (1 = drawn texel), copied from
@@ -828,7 +833,9 @@ enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 16 };
 typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
                  float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
                  float *sb;   /* per 2D triangle: VRAM y below its lowest drawn texel row, -1e30 = none known */
+                 float *sf;   /* per 2D triangle: the share of its texel box drawn (0..1, -1 = not known) */
                  uint8_t *atl; int atl_x, atl_y, atl_h, atl_key[10], atl_kx, atl_ky, atl_klo, atl_khi;
+                 float atl_kfill;
                  float *ev; int en, ecap;   /* glowing pieces (light sources): x, y (VRAM px), SZ (0 = none), area,
                                                3D triangles drawn before it, colour (rgb, 1 = full), its
                                                corners (x, y VRAM px x 3), the share of the colour it adds
@@ -853,7 +860,7 @@ static unsigned s_spr_runs[3] = {0, 0, 0};          /* sprite runs: at their foo
 static int      s_spr_stood[SC_ANC_MAX], s_spr_stood_n = 0;   /* the last build: pieces stood at each foot point */
 static float    s_spr_dbg_anc[SC_ANC_MAX][2];                  /* its foot points (picture px) */
 enum { SPR_DBG_RUNS = 512 };
-static float    s_spr_dbg_run[SPR_DBG_RUNS][7];                /* its runs: box, foot point, at it (+2 over it), CLUT (9: too big) */
+static float    s_spr_dbg_run[SPR_DBG_RUNS][8];                /* its runs: box, foot point, at it (+2 over it), CLUT (9: too big), share drawn */
 static int      s_spr_dbg_nrun = 0;
 static unsigned s_spr_bent = 0;                      /* raised feet bent down to the floor */
 static float    s_anc_pend[SC_ANC_MAX][3];
@@ -901,7 +908,7 @@ static void sc_hold(ScSlot *sl) {
     const ScSlot spare = s_sc_held;
     s_sc_held = *sl;
     sl->v = spare.v; sl->cap = spare.cap;
-    sl->sv = spare.sv; sl->sb = spare.sb; sl->scap = spare.scap;
+    sl->sv = spare.sv; sl->sb = spare.sb; sl->sf = spare.sf; sl->scap = spare.scap;
     sl->atl = spare.atl;
     sl->ev = spare.ev; sl->ecap = spare.ecap;
     s_sc_held_ok = 1;
@@ -1091,12 +1098,16 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         sl->sv = p;
         float *b = (float *)realloc(sl->sb, (size_t)nc * sizeof(float));
         if (!b) return;
-        sl->sb = b; sl->scap = nc;
+        sl->sb = b;
+        float *f = (float *)realloc(sl->sf, (size_t)nc * sizeof(float));
+        if (!f) return;
+        sl->sf = f; sl->scap = nc;
     }
     /* the piece's cut-out as drawn now: its texel box, through its page, CLUT
      * and texture window, into the slot's atlas (depth 3 = atlas texel); lo/hi:
      * its first and last texel rows with something drawn (-1: none) */
     int ax = -1, ay = 0, u0 = 255, v0 = 255, u1 = 0, w1 = 0, lo = -1, hi = -1;
+    float fill = -1.0f;   /* the share of its texel box drawn */
     const int depth = (int)tex6[4];
     if (s_vram && depth >= 0 && depth <= 2) {
         for (int i = 0; i < 3; i++) {
@@ -1107,13 +1118,14 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         const int key[10] = {px, py, cx, cy, depth, win, u0, v0, u1, w1};
         const int w = u1 - u0 + 1, hgt = w1 - v0 + 1;
         if (!memcmp(key, sl->atl_key, sizeof key)) {   /* the quad's other half */
-            ax = sl->atl_kx; ay = sl->atl_ky; lo = sl->atl_klo; hi = sl->atl_khi;
+            ax = sl->atl_kx; ay = sl->atl_ky; lo = sl->atl_klo; hi = sl->atl_khi; fill = sl->atl_kfill;
         }
         else if (w > 0 && hgt > 0 && w <= 256 && hgt <= 256) {
             if (!sl->atl) sl->atl = (uint8_t *)malloc((size_t)SC_ATL * SC_ATL);
             if (sl->atl_x + w > SC_ATL) { sl->atl_x = 0; sl->atl_y += sl->atl_h; sl->atl_h = 0; }
             if (sl->atl && sl->atl_y + hgt <= SC_ATL) {
                 ax = sl->atl_x; ay = sl->atl_y;
+                int drawn = 0;
                 const int twx = win & 31, twy = (win >> 5) & 31, tox = (win >> 10) & 31, toy = (win >> 15) & 31;
                 for (int t = 0; t < hgt; t++)
                     for (int s = 0; s < w; s++) {
@@ -1125,19 +1137,22 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
                         else if (depth == 1) raw = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((px + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
                         else raw = s_vram[row + ((px + u) & 1023)];
                         sl->atl[(size_t)(ay + t) * SC_ATL + ax + s] = raw ? 255 : 0;
+                        drawn += raw != 0;
                         /* the row and column past the far edges (v1, u1 themselves)
                          * are not drawn: the sheet's next picture may be there */
                         if (raw && (t < hgt - 1 || hgt == 1) && (s < w - 1 || w == 1)) { if (lo < 0) lo = t; hi = t; }
                     }
                 sl->atl_x += w; if (hgt > sl->atl_h) sl->atl_h = hgt;
+                fill = (float)drawn / (float)(w * hgt);
                 memcpy(sl->atl_key, key, sizeof key); sl->atl_kx = ax; sl->atl_ky = ay;
-                sl->atl_klo = lo; sl->atl_khi = hi;
+                sl->atl_klo = lo; sl->atl_khi = hi; sl->atl_kfill = fill;
             }
         }
     }
     float *v = sl->sv + (size_t)sl->sn * 3 * SC_V;
+    const float kind = semi >= 0 ? 1.0f : ctx_prim_front() ? 2.0f : 0.0f;
     for (int i = 0; i < 3; i++, v += SC_V) {
-        v[0] = (float)xs[i]; v[1] = (float)ys[i]; v[2] = semi >= 0 ? 1.0f : 0.0f;
+        v[0] = (float)xs[i]; v[1] = (float)ys[i]; v[2] = kind;
         v[3] = (float)us[i]; v[4] = (float)vs[i];
         for (int k = 0; k < 6; k++) v[5 + k] = tex6[k];
         if (ax >= 0) {   /* atlas texel coordinates; page/CLUT kept to tell sprites apart */
@@ -1157,6 +1172,7 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         bottom = yv0 <= ylo ? (float)ylo + (float)(hi + 1) * s : (float)yhi - (float)lo * s;
     }
     sl->sb[sl->sn] = bottom;
+    sl->sf[sl->sn] = fill;
     sl->sn++;
     sl->use = ++s_sc_use;
 }
@@ -1697,7 +1713,7 @@ int gl_renderer_sprite_dump_json(char *out, int cap) {
     k += snprintf(out + k, (size_t)(cap - k), "],\"runs\":[");
     for (int r = 0; r < s_spr_dbg_nrun && k < cap - 96; r++) {
         const float *b = s_spr_dbg_run[r];
-        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]", r ? "," : "", b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.2f]", r ? "," : "", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
     }
     k += snprintf(out + k, (size_t)(cap - k), "],\"pieces\":[");
     for (int t = 0; t < sl->sn && k < cap - 128; t++) {
@@ -12292,6 +12308,7 @@ static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 #define RTHF_BD_SHIFT  2          /* bits 2-4: psx_ws_prim_in_backdrop() 0..4 */
 #define RTHF_BD_MASK   7u
 #define RTHF_BDQ_SHIFT 5          /* bits 5-12: its stretch share (backdrop images), 0 = the full one */
+#define RTHF_FRONT     0x2000u    /* in the ordering table's front (gpu_ot_front_now): UI */
 static uint16_t rth_bd_flags(int bd) {
     return (uint16_t)(((unsigned)bd & RTHF_BD_MASK) << RTHF_BD_SHIFT |
                       (((unsigned)bd >> 8) & 0xFFu) << RTHF_BDQ_SHIFT);
@@ -12357,11 +12374,12 @@ static void rth_send_state(void) {
  * only when the backend would read them (native-wide on, stretch gate on;
  * or the 3D mark kept: a painted backdrop takes it, b3dm_passes). */
 static uint16_t rth_prim_flags(void) {
+    const uint16_t fr = gpu_ot_front_now() ? (uint16_t)(RTHF_PRIM | RTHF_FRONT) : 0;
     if (s_rthm_wide_w <= 0 || !g_ws_bd_stretch_on) {
-        if (!s_b3d_on) return 0;
-        return (uint16_t)(RTHF_PRIM | rth_bd_flags(psx_ws_prim_in_backdrop()));
+        if (!s_b3d_on) return fr;
+        return (uint16_t)(RTHF_PRIM | rth_bd_flags(psx_ws_prim_in_backdrop()) | fr);
     }
-    uint16_t f = RTHF_PRIM;
+    uint16_t f = (uint16_t)(RTHF_PRIM | fr);
     if (g_ws_bd_phase_mode != 0)
         f |= rth_bd_flags(psx_ws_prim_in_backdrop());
     else if (psx_ws_prim_is_tagged())
@@ -13600,6 +13618,7 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         s_rthx_prim = (h.flags & RTHF_PRIM) != 0;
         s_rthx_tagged = (h.flags & RTHF_TAGGED) != 0;
         s_rthx_backdrop = rth_bd_value(h.flags);
+        s_rthx_front = (h.flags & RTHF_FRONT) != 0;
         const int area[4] = { s_area_x1, s_area_y1, s_area_x2, s_area_y2 };
         const int in = !s_fg_replay_objects_only && fg_area_meets(area, disp);
         switch (h.op) {
@@ -15798,6 +15817,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
     s_rthx_backdrop = rth_bd_value(c->flags);
+    s_rthx_front = (c->flags & RTHF_FRONT) != 0;
     if (c->op == RTH_FRAME) { rthf_end(); return; }
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();

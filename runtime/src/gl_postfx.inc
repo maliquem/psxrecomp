@@ -811,6 +811,13 @@ static GLint  s_spr_uvram = -1, s_sm_uatl = -1, s_spr_uatl = -1;
 static GLuint s_spr_atl_tex = 0;   /* the presented slot's sprite cut-outs (R8, SC_ATL square) */
 static int    s_spr_w = 0, s_spr_h = 0, s_spr_n = 0;
 static float *s_spr_cast = NULL, *s_spr_scr = NULL; static int s_spr_cap = 0;
+/* The `sprite` input's triangles in the order the game drew them: the
+ * standing pieces at their depth, every other opaque 2D piece at SPR_NONE,
+ * so what is drawn over a sprite (a target's HP bar, a window) is no sprite
+ * on the picture (s_spr_ord, s_spr_nord vertices; s_spr_at: per 2D piece of
+ * the slot, its first vertex in s_spr_scr, -1 when it does not stand). */
+static float *s_spr_ord = NULL; static int s_spr_nord = 0, s_spr_ocap = 0;
+static int   *s_spr_at = NULL;  static int s_spr_atcap = 0;
 static float *s_spr_cau = NULL;   /* per caster vertex: its sprite's floor height (dot with world up) */
 static const float *pfx_pass_uniform(const PfxPass *ps, const char *name) {
     for (int k = 0; k < ps->nuniforms; k++) if (!strcmp(ps->u[k].name, name)) return ps->u[k].v;
@@ -833,6 +840,39 @@ static int spr_ground(float x, float y, float au, const float *u, float *G) {
     return 1;
 }
 enum { SPR_COLS = 136, SPR_ZONE = 64, SPR_FOOT_MIN = 3, SPR_MIN_H = 12, SPR_AIR = 64 };
+#define SPR_SOLID 0.85f   /* a run with this share of its texels drawn or more is solid: a window, a portrait */
+/* Too big for a figure: past 256 x 224 px, or past 128 x 192 when solid (a
+ * panel; a big monster has see-through parts). */
+static int spr_big(const float *b, float fill) {
+    const float w = b[1] - b[0], h = b[3] - b[2];
+    return w > 256.0f || h > 224.0f || ((w > 128.0f || h > 192.0f) && fill >= SPR_SOLID);
+}
+/* Each run (pieces i with root r): rb, its box and lowest drawn row (bx0,
+ * bx1, by0, by1, ob); rf, the share of its pieces' texel boxes drawn (by
+ * area; 0.5 when none is known). */
+static void spr_run_boxes(const ScSlot *sc, const int *ids, int *par, int m, float (*box)[4],
+                          float (*rb)[5], float *rf) {
+    for (int r = 0; r < m; r++) {
+        if (spr_root(par, r) != r) continue;
+        float *b = rb[r], fa = 0.0f, fw = 0.0f;
+        b[0] = b[2] = 1e30f; b[1] = b[3] = b[4] = -1e30f;
+        for (int i = r; i < m; i++)
+            if (spr_root(par, i) == r) {
+                b[0] = fminf(b[0], box[i][0]); b[1] = fmaxf(b[1], box[i][1]);
+                b[2] = fminf(b[2], box[i][2]); b[3] = fmaxf(b[3], box[i][3]);
+                if (sc->sb && sc->sb[ids[i]] > -1e29f) b[4] = fmaxf(b[4], sc->sb[ids[i]] - s_sc_cy);
+                const float a = (box[i][1] - box[i][0]) * (box[i][3] - box[i][2]);
+                if (sc->sf && sc->sf[ids[i]] >= 0.0f) { fa += sc->sf[ids[i]] * a; fw += a; }
+            }
+        if (b[4] < -1e29f) b[4] = b[3];   /* its lowest drawn pixel row (else its box) */
+        rf[r] = fw > 0.0f ? fa / fw : 0.5f;
+    }
+}
+/* The foot point (x, y) in a run's reach: within its columns, from its top
+ * down to a little under its bottom. */
+static int spr_holds(const float *b, const float *a) {
+    return a[0] >= b[0] - 8.0f && a[0] <= b[1] + 8.0f && a[1] >= b[2] - 8.0f && a[1] <= b[3] + 20.0f;
+}
 /* A sprite's bottom, from its cut-outs: col, the lowest drawn pixel of each
  * picture column (native px from the centre, below the pixel; X0 the first
  * column, W of them); mask, its drawn pixels in the SPR_ZONE rows above Yb
@@ -1002,8 +1042,14 @@ static int sprc_known(float code) {
     return 0;
 }
 static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
-    s_spr_n = 0; s_spr_nx = 0; s_spr_stood_n = 0;
+    s_spr_n = 0; s_spr_nx = 0; s_spr_stood_n = 0; s_spr_nord = 0;
     if (!s_spr_on || !sc || !s_cam_ok || sc->nanc <= 0 || sc->sn <= 0 || s_sm_world[1][3] < 0.5f) return;
+    if (sc->sn > s_spr_atcap) {
+        int *a = (int *)realloc(s_spr_at, (size_t)sc->sn * sizeof(int));
+        if (!a) return;
+        s_spr_at = a; s_spr_atcap = sc->sn;
+    }
+    for (int t = 0; t < sc->sn; t++) s_spr_at[t] = -1;
     float AP[SC_ANC_MAX][3], AS[SC_ANC_MAX][2];
     int na = 0;
     for (int q = 0; q < sc->nanc; q++) {
@@ -1057,10 +1103,12 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
     }
     const float h = s_cam_h, kx = 1.0f / (120.0f * aspect), ky = 1.0f / 120.0f;
     s_spr_kx = kx; s_spr_ky = ky;
-    /* One sprite = its opaque pieces from one texture page and CLUT that touch
-     * one another, in whatever order they were drawn (the game sorts by depth,
-     * so two sprites' pieces interleave). Translucent pieces (dust, glows, the
-     * game's own blob) neither cast nor take shadows. */
+    /* One sprite = its opaque pieces of one CLUT that touch one another, on
+     * whatever texture page (a big monster spreads over several: the
+     * scorpion's head, tail and legs), in whatever order they were drawn (the
+     * game sorts by depth, so two sprites' pieces interleave). Translucent
+     * pieces (dust, glows, the game's own blob) neither cast nor take
+     * shadows. */
     enum { SPR_MAXP = 1024 };
     static int   par[SPR_MAXP], ids[SPR_MAXP];
     static float box[SPR_MAXP][4];
@@ -1080,7 +1128,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         const float *vi = sc->sv + (size_t)ids[i] * 3 * SC_V;
         for (int j = i + 1; j < m; j++) {
             const float *vj = sc->sv + (size_t)ids[j] * 3 * SC_V;
-            if (vi[5] != vj[5] || vi[6] != vj[6] || vi[7] != vj[7] || vi[8] != vj[8]) continue;
+            if (vi[7] != vj[7] || vi[8] != vj[8]) continue;
             if (box[j][0] > box[i][1] + 2.0f || box[j][1] < box[i][0] - 2.0f ||
                 box[j][2] > box[i][3] + 2.0f || box[j][3] < box[i][2] - 2.0f) continue;
             /* the root stays the lowest index of its run: the runs are walked from it */
@@ -1090,39 +1138,66 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
     }
     /* Each run: its box, lowest drawn row and foot point. A run whose bottom
      * is at a foot point within its columns is that sprite's (direct; a sword
-     * held out puts the point near one end). A run that is not (a part cut
-     * off from its sprite: another texture page) joins a sprite only when it
+     * held out puts the point near one end); so is a run with see-through
+     * parts that holds the foot point (a monster whose point is at its middle,
+     * its legs drawn below it: the scorpion), never a solid one (a window or a
+     * portrait beside a character) nor a line of text. A run that holds two
+     * foot points or more (two monsters of one palette side by side) is
+     * split, each piece to the nearest point across. A run that is not at a
+     * foot point (a part cut off from its sprite) joins a sprite only when it
      * has that sprite's CLUT, touches one of its runs (or is up to SPR_AIR px
      * over it), its middle is within that sprite's columns and it is at most
-     * twice as wide, so
-     * the HUD's panels, bars, texts and labels on or beside a character (UI
-     * palettes) never stand there. A foot point no run is at takes the run
-     * over it, up to SPR_AIR px up, in a palette seen standing on the floor
-     * (a jump: off the floor, its shadow on the floor below). */
+     * twice as wide, so the HUD's panels, bars, texts and labels on or beside
+     * a character (UI palettes) never stand there. A foot point no run is at
+     * takes the run over it, up to SPR_AIR px up, in a palette seen standing
+     * on the floor (a jump: off the floor, its shadow on the floor below). */
     static float rb[SPR_MAXP][5];   /* bx0, bx1, by0, by1, ob */
+    static float rf[SPR_MAXP];      /* the share of its texels drawn */
     static int   rq[SPR_MAXP];      /* foot point, -1 none */
     static uint8_t rdir[SPR_MAXP];  /* 1 = at its foot point */
     static uint8_t rair[SPR_MAXP];  /* 1 = over it, off the floor */
     float ax[SC_ANC_MAX][2];        /* each foot point's direct runs: columns */
     for (int q = 0; q < na; q++) { ax[q][0] = 1e30f; ax[q][1] = -1e30f; }
+    spr_run_boxes(sc, ids, par, m, box, rb, rf);
+    {
+        static int mem[SPR_MAXP];
+        int split = 0;
+        for (int r = 0; r < m; r++) {
+            if (spr_root(par, r) != r || spr_big(rb[r], rf[r])) continue;
+            int qs[SC_ANC_MAX], nq = 0;
+            for (int q = 0; q < na; q++) if (spr_holds(rb[r], AS[q])) qs[nq++] = q;
+            if (nq < 2) continue;
+            int nm = 0, rep[SC_ANC_MAX];
+            for (int i = r; i < m; i++) if (spr_root(par, i) == r) mem[nm++] = i;
+            for (int k = 0; k < nq; k++) rep[k] = -1;
+            for (int t = 0; t < nm; t++) {   /* ascending: each part's root its lowest index */
+                const int i = mem[t];
+                const float cx = 0.5f * (box[i][0] + box[i][1]);
+                int kb = 0;
+                for (int k = 1; k < nq; k++)
+                    if (fabsf(cx - AS[qs[k]][0]) < fabsf(cx - AS[qs[kb]][0])) kb = k;
+                if (rep[kb] < 0) rep[kb] = i;
+                par[i] = rep[kb];
+            }
+            split = 1;
+        }
+        if (split) spr_run_boxes(sc, ids, par, m, box, rb, rf);
+    }
     for (int r = 0; r < m; r++) {
         rq[r] = -1; rdir[r] = 0; rair[r] = 0;
         if (spr_root(par, r) != r) continue;
-        float *b = rb[r];
-        b[0] = b[2] = 1e30f; b[1] = b[3] = b[4] = -1e30f;
-        for (int i = r; i < m; i++)
-            if (spr_root(par, i) == r) {
-                b[0] = fminf(b[0], box[i][0]); b[1] = fmaxf(b[1], box[i][1]);
-                b[2] = fminf(b[2], box[i][2]); b[3] = fmaxf(b[3], box[i][3]);
-                if (sc->sb && sc->sb[ids[i]] > -1e29f) b[4] = fmaxf(b[4], sc->sb[ids[i]] - s_sc_cy);
-            }
-        if (b[4] < -1e29f) b[4] = b[3];   /* its lowest drawn pixel row (else its box) */
-        if (b[1] - b[0] > 128.0f || b[3] - b[2] > 192.0f) continue;   /* panels, not a sprite */
+        const float *b = rb[r];
+        if (spr_big(b, rf[r])) continue;   /* panels, not a sprite */
         const float cx = 0.5f * (b[0] + b[1]);
         float bs = 1e30f;
         for (int q = 0; q < na; q++) {
-            if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f || b[3] < AS[q][1] - 8.0f || b[3] > AS[q][1] + 20.0f) continue;
-            const float s = fabsf(b[3] - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
+            if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f) continue;
+            float s;
+            if (b[3] >= AS[q][1] - 8.0f && b[3] <= AS[q][1] + 20.0f)
+                s = fabsf(b[3] - AS[q][1]) + 0.25f * fabsf(cx - AS[q][0]);
+            else if (AS[q][1] >= b[2] && AS[q][1] <= b[3] && rf[r] < SPR_SOLID && b[3] - b[2] >= 2.0f * SPR_MIN_H)
+                s = 64.0f + 0.25f * fabsf(cx - AS[q][0]);   /* it holds the point */
+            else continue;
             if (s < bs) { bs = s; rq[r] = q; }
         }
         if (rq[r] >= 0) {
@@ -1139,7 +1214,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         for (int r = 0; r < m; r++) {
             if (spr_root(par, r) != r || rq[r] >= 0) continue;
             const float *b = rb[r];
-            if (b[1] - b[0] > 128.0f || b[3] - b[2] > 192.0f || b[3] - b[2] < SPR_MIN_H) continue;
+            if (spr_big(b, rf[r]) || b[3] - b[2] < SPR_MIN_H) continue;
             if (AS[q][0] < b[0] - 8.0f || AS[q][0] > b[1] + 8.0f || b[3] > AS[q][1] || b[3] < AS[q][1] - SPR_AIR) continue;
             const float cx = 0.5f * (b[0] + b[1]);
             if (fabsf(cx - AS[q][0]) > 0.5f * (b[1] - b[0]) + 16.0f) continue;
@@ -1156,7 +1231,7 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         for (int r = 0; r < m; r++) {
             if (spr_root(par, r) != r || rq[r] >= 0) continue;
             const float *b = rb[r];
-            if (b[1] - b[0] > 128.0f || b[3] - b[2] > 192.0f) continue;
+            if (spr_big(b, rf[r])) continue;
             const float cx = 0.5f * (b[0] + b[1]);
             for (int o = 0; o < m && rq[r] < 0; o++) {
                 const int q = rq[o];
@@ -1188,15 +1263,16 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
         const int best = rq[r];
         if (s_spr_dbg_nrun < SPR_DBG_RUNS) {   /* sprite_dump: every run (9 = too big, then the rest) */
             float *g = s_spr_dbg_run[s_spr_dbg_nrun++];
-            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r]; g[6] = 9.0f;
+            g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r]; g[6] = 9.0f; g[7] = rf[r];
         }
-        if (bx1 - bx0 > 128.0f || by1 - by0 > 192.0f) continue;
+        if (spr_big(rb[r], rf[r])) continue;
         if (s_spr_dbg_nrun > 0 && s_spr_dbg_run[s_spr_dbg_nrun - 1][6] == 9.0f) s_spr_dbg_nrun--;
         s_spr_runs[best < 0 ? 2 : rdir[r] ? 0 : 1]++;
         if (s_spr_dbg_nrun < SPR_DBG_RUNS) {
             float *g = s_spr_dbg_run[s_spr_dbg_nrun++];
             g[0] = bx0; g[1] = by0; g[2] = bx1; g[3] = by1; g[4] = (float)best; g[5] = rdir[r] + 2 * rair[r];
             g[6] = sc->sv[(size_t)ids[r] * 3 * SC_V + 8] * 64.0f + sc->sv[(size_t)ids[r] * 3 * SC_V + 7] / 16.0f;   /* its CLUT */
+            g[7] = rf[r];   /* the share of its texels drawn */
         }
         if (best < 0) continue;
         if (rdir[r] && by1 - by0 < SPR_MIN_H) continue;   /* a marker or icon (a map's), not a figure; a part joined to one may be small (eyes) */
@@ -1242,11 +1318,32 @@ static void pfx_sprites_stand(const ScSlot *sc, float aspect, const float *L) {
                 memcpy(s + 3, v + j * SC_V + 3, (SC_V - 3) * sizeof(float));
             }
             if (ok) { for (int j = 0; j < 3; j++) s_spr_cau[s_spr_n + j] = au;
+                      s_spr_at[ids[i]] = s_spr_n;
                       s_spr_n += 3; s_spr_stood[best]++; }
         }
     }
     if (s_spr_n) s_spr_frames++;
     s_spr_last = (unsigned)s_spr_n / 3u;
+    /* in draw order: the standing pieces, and the other opaque ones over them */
+    if (s_spr_n && sc->sn * 3 > s_spr_ocap) {
+        float *o = (float *)realloc(s_spr_ord, (size_t)sc->sn * 3 * SC_V * sizeof(float));
+        if (o) { s_spr_ord = o; s_spr_ocap = sc->sn * 3; }
+    }
+    if (s_spr_n && sc->sn * 3 <= s_spr_ocap)
+        for (int t = 0; t < sc->sn; t++) {
+            const float *v = sc->sv + (size_t)t * 3 * SC_V;
+            float *o = s_spr_ord + (size_t)s_spr_nord * SC_V;
+            if (s_spr_at[t] >= 0) memcpy(o, s_spr_scr + (size_t)s_spr_at[t] * SC_V, 3 * SC_V * sizeof(float));
+            else if (v[2] != 1.0f)   /* opaque, no sprite (the UI too) */
+                for (int j = 0; j < 3; j++) {
+                    float *q = o + j * SC_V;
+                    memcpy(q, v + j * SC_V, SC_V * sizeof(float));
+                    q[0] = (v[j * SC_V] - s_sc_cx) * kx; q[1] = -(v[j * SC_V + 1] - s_sc_cy) * ky;
+                    q[2] = (float)SPR_NONE;
+                }
+            else continue;
+            s_spr_nord += 3;
+        }
     /* the pieces' cut-outs as they were drawn (sc_add_sprite_tri) */
     const int rows = sc_atlas_rows(sc);
     if (s_spr_n && rows > 0) {
@@ -1308,10 +1405,17 @@ static void pfx_sprites_depth(int lw, int lh) {
         glBindTexture(GL_TEXTURE_2D, s_spr_atl_tex);
         p_glUniform1i(s_spr_uatl, 1);
         p_glActiveTexture(PSXGL_TEXTURE0);
+        if (s_spr_nord > 0) {
+            /* in the game's draw order, each piece over the last: what it draws
+             * over a sprite (a HUD bar, a window) leaves no sprite there */
+            p_glBufferData(PSXGL_ARRAY_BUFFER, (GLsizeiptr)((size_t)s_spr_nord * SC_V * sizeof(float)), s_spr_ord, PSXGL_STREAM_DRAW);
+            glDisable(GL_BLEND);
+            glDrawArrays(GL_TRIANGLES, 0, s_spr_nord);
+        }
         glEnable(GL_BLEND);
         p_glBlendEquationSeparate(0x8007 /*MIN*/, 0x8007);
         glBlendFunc(GL_ONE, GL_ONE);
-        glDrawArrays(GL_TRIANGLES, 0, s_spr_n);
+        if (s_spr_nord <= 0) glDrawArrays(GL_TRIANGLES, 0, s_spr_n);
         /* the bent feet too, the nearest still winning: written over, a
          * sprite's bent feet behind another (Ryu's behind Nina) gave her
          * pixels their place, in a shadow she is not in */
