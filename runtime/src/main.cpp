@@ -8935,6 +8935,7 @@ extern "C" int psx_mod_host_pad_kind(void) {
         if (!std::strcmp(e, "playstation")) return PSX_MOD_PAD_KIND_PLAYSTATION;
         if (!std::strcmp(e, "nintendo")) return PSX_MOD_PAD_KIND_NINTENDO;
         if (!std::strcmp(e, "other")) return PSX_MOD_PAD_KIND_OTHER;
+        if (!std::strcmp(e, "none")) return PSX_MOD_PAD_KIND_NONE;
     }
     uint16_t word;
     uint8_t st[4], lt, rt;
