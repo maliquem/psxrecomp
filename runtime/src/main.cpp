@@ -18907,6 +18907,7 @@ int main(int argc, char** argv) {
         if (us.has_render_thread)     g_render_thread     = us.render_thread ? 1 : 0;
         if (us.has_present_thread)    g_present_thread    = us.present_thread ? 1 : 0;
         if (us.has_frame_generation)  g_frame_generation  = us.frame_generation ? 1 : 0;
+        if (us.has_hdr)               gl_renderer_hdr_set_config(us.hdr ? 1 : 0);
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;

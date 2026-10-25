@@ -1642,6 +1642,9 @@ struct UserSettings {
     bool has_render_thread    = false; bool render_thread    = false;
     bool has_present_thread   = false; bool present_thread   = false;
     bool has_frame_generation = false; bool frame_generation = false;
+    // [video] hdr (docs/HDR_OUTPUT.md): HDR output from the next launch (a
+    // launcher writes it; PSX_HDR overrides one run).
+    bool has_hdr               = false; bool hdr               = false;
     bool has_vsync             = false; int  vsync             = 1;
     bool has_frame_interpolation = false; bool frame_interpolation = false;
     bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;

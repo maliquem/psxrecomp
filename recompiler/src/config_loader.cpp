@@ -3187,6 +3187,10 @@ UserSettings load_user_settings(const fs::path& path) {
             s.frame_generation = toml::find<bool>(v, "frame_generation");
             s.has_frame_generation = true;
         });
+        if (v.contains("hdr")) try_get([&]{
+            s.hdr = toml::find<bool>(v, "hdr");
+            s.has_hdr = true;
+        });
         if (v.contains("vsync")) try_get([&]{
             const auto m = toml::find<std::string>(v, "vsync");
             if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
@@ -3572,6 +3576,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "present_thread = " << (s.present_thread ? "true" : "false") << "\n";
     if (s.has_frame_generation)
         f << "frame_generation = " << (s.frame_generation ? "true" : "false") << "\n";
+    if (s.has_hdr)
+        f << "hdr = " << (s.hdr ? "true" : "false") << "\n";
     if (s.has_vsync)
         f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive"
                                          : s.vsync == 2 ? "vrr" : "on") << "\"\n";

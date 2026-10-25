@@ -77,13 +77,15 @@ static GLint  s_hdr_ad_uSt = -1, s_hdr_ad_uPrev = -1, s_hdr_ad_uK = -1;
 static GLint  s_hdr_uState = -1, s_hdr_uDyn = -1, s_hdr_uDynp = -1;
 
 /* PSX_HDR and its settings, read once (before the window is created). */
+static int s_hdr_env = -1;   /* PSX_HDR: -1 unset, else 0/1 (wins over the settings) */
+static int s_hdr_cfg = 0;    /* [video] hdr in settings.toml (gl_renderer_hdr_set_config) */
 static void hdr_env_once(void) {
     if (s_hdr_want >= 0) return;
     s_hdr_want = 0;
     const char *e;
 #if defined(_WIN32) && defined(PSX_SDL3)
     e = getenv("PSX_HDR");
-    s_hdr_want = (e && *e && *e != '0') ? 1 : 0;
+    if (e && *e) s_hdr_env = *e != '0';
 #endif
     if ((e = getenv("PSX_HDR_PAPER")) && *e) s_hdr_paper_nits = (float)atof(e);
     if ((e = getenv("PSX_HDR_PEAK")) && *e) s_hdr_peak_nits = (float)atof(e);
@@ -120,7 +122,31 @@ static void hdr_env_once(void) {
 
 int gl_renderer_hdr_wanted(void) {
     hdr_env_once();
+#if defined(_WIN32) && defined(PSX_SDL3)
+    s_hdr_want = s_hdr_env >= 0 ? s_hdr_env : s_hdr_cfg;
+#else
+    s_hdr_want = 0;
+#endif
     return s_hdr_want;
+}
+
+/* [video] hdr (settings.toml): before the window exists; PSX_HDR wins. */
+void gl_renderer_hdr_set_config(int on) { s_hdr_cfg = on ? 1 : 0; }
+
+/* 0: this run has no HDR output (started without it, or no float buffer);
+ * 1: it has, but the display is not in HDR mode now; 2: HDR on screen. */
+int gl_renderer_hdr_state(void) { return !s_hdr_on ? 0 : s_hdr_display ? 2 : 1; }
+
+/* The settings a menu shows: boost 0..1, paper / peak nits (0 = the
+ * display's), contrast 0..1.5 (the larger of shadows and scenery), dynamic. */
+void gl_renderer_hdr_params(float *boost, float *paper_nits, float *peak_nits, float *contrast,
+                            int *dynamic) {
+    hdr_env_once();
+    if (boost) *boost = s_hdr_boost;
+    if (paper_nits) *paper_nits = s_hdr_paper_nits;
+    if (peak_nits) *peak_nits = s_hdr_peak_nits;
+    if (contrast) *contrast = fmaxf(s_hdr_shadows_v, s_hdr_scene_v);
+    if (dynamic) *dynamic = s_hdr_dyn;
 }
 
 /* The next window's pixel format. SDL's attributes are global: what HDR

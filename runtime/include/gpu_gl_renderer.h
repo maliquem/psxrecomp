@@ -337,10 +337,19 @@ void gl_renderer_fmv_enhance_debug(int mask, const char *dump_prefix);
  * dynamic tone mapping: PSX_HDR_DYNAMIC=1, PSX_HDR_ADAPT, PSX_HDR_AREA,
  * PSX_HDR_SPEED, PSX_HDR_EXPOSURE_MIN/_MAX; contrast: PSX_HDR_CONTRAST or
  * PSX_HDR_SHADOWS / PSX_HDR_SCENE, PSX_HDR_SCENE_AREA).
- * wanted: PSX_HDR asks for it (read before the window exists);
- * window_attributes: the SDL GL attributes for the next window (0 restores). */
+ * wanted: [video] hdr (settings.toml, gl_renderer_hdr_set_config) or PSX_HDR
+ * (wins) asks for it, read before the window exists; window_attributes: the
+ * SDL GL attributes for the next window (0 restores). */
 int  gl_renderer_hdr_wanted(void);
+void gl_renderer_hdr_set_config(int on);
 void gl_renderer_hdr_window_attributes(int on);
+/* 0: no HDR output this run; 1: HDR output, the display not in HDR mode now;
+ * 2: HDR on screen. */
+int  gl_renderer_hdr_state(void);
+/* What a menu shows: boost 0..1, paper / peak nits (0 = the display's),
+ * contrast 0..1.5, dynamic 0/1 (NULL skips). */
+void gl_renderer_hdr_params(float *boost, float *paper_nits, float *peak_nits, float *contrast,
+                            int *dynamic);
 /* Live (TCP hdr): a negative value keeps the current one; probe_path non-NULL
  * reads the next finished frame back ("" = statistics only). */
 void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float knee,
