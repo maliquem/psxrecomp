@@ -8811,8 +8811,10 @@ extern "C" int psx_debug_push_host_key(const char *name, int down) {
     return SDL_PushEvent(&ev) ? 1 : 0;
 }
 
-/* Debug: inject a mouse click (x, y in window points) or wheel step. */
-extern "C" int psx_debug_push_host_mouse(float x, float y, int wheel) {
+/* Debug: inject mouse input at (x, y) in window points: a move there, then a
+ * wheel step (wheel != 0) or, by action, a click (0), press (1), release (2)
+ * or nothing more (3) of `button` (SDL_BUTTON_LEFT/MIDDLE/RIGHT). */
+extern "C" int psx_debug_push_host_mouse_ex(float x, float y, float wheel, int button, int action) {
     SDL_Event ev;
     const Uint32 win = sdl_window ? SDL_GetWindowID(sdl_window) : 0;
 #if defined(PSX_SDL3)
@@ -8820,24 +8822,28 @@ extern "C" int psx_debug_push_host_mouse(float x, float y, int wheel) {
     ev.type = SDL_EVENT_MOUSE_MOTION;
     ev.motion.windowID = win; ev.motion.x = x; ev.motion.y = y;
     if (!SDL_PushEvent(&ev)) return 0;
-    if (wheel) {
+    if (wheel != 0.0f) {
         SDL_zero(ev);
         ev.type = SDL_EVENT_MOUSE_WHEEL;
-        ev.wheel.windowID = win; ev.wheel.y = (float)wheel; ev.wheel.mouse_x = x; ev.wheel.mouse_y = y;
+        ev.wheel.windowID = win; ev.wheel.y = wheel; ev.wheel.mouse_x = x; ev.wheel.mouse_y = y;
         return SDL_PushEvent(&ev) ? 1 : 0;
     }
     for (int down = 1; down >= 0; --down) {
+        if (action == 3 || (action == 1 && !down) || (action == 2 && down)) continue;
         SDL_zero(ev);
         ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
-        ev.button.windowID = win; ev.button.button = SDL_BUTTON_LEFT;
+        ev.button.windowID = win; ev.button.button = (Uint8)button;
         ev.button.down = down != 0; ev.button.clicks = 1; ev.button.x = x; ev.button.y = y;
         if (!SDL_PushEvent(&ev)) return 0;
     }
     return 1;
 #else
-    (void)ev; (void)win; (void)x; (void)y; (void)wheel;
+    (void)ev; (void)win; (void)x; (void)y; (void)wheel; (void)button; (void)action;
     return 0;
 #endif
+}
+extern "C" int psx_debug_push_host_mouse(float x, float y, int wheel) {
+    return psx_debug_push_host_mouse_ex(x, y, (float)wheel, SDL_BUTTON_LEFT, 0);
 }
 
 static int host_pause_refuse_netplay(void) { return psx_netplay_active() ? 1 : 0; }
@@ -8969,6 +8975,32 @@ extern "C" int psx_mod_host_pad_kind(void) {
 #endif
 }
 extern "C" int psx_mod_request_screenshot(const char* path) { return present_shot_request(path); }
+extern "C" void psx_mod_set_pointer_image(const uint32_t *argb, int w, int h, int hot_x, int hot_y) {
+    gl_renderer_set_pointer_image(argb, w, h, hot_x, hot_y);
+}
+extern "C" void psx_mod_set_pointer(int visible, float x, float y) {
+    gl_renderer_set_pointer(visible, x, y);
+}
+extern "C" int psx_mod_window_to_display(float x, float y, float *dx, float *dy) {
+    return g_gl_active ? gl_renderer_window_to_display(x, y, dx, dy) : -1;
+}
+extern "C" int psx_mod_savestate_menu_command(int op, int slot) {
+    if (!savestate_menu_open) return 0;
+    if (op == PSX_MOD_SSM_CLOSE) {
+        savestate_menu_close();
+        return 1;
+    }
+    if (slot < 0 || slot >= 12) return 0;
+    if (slot != savestate_menu_slot) {
+        savestate_menu_slot = slot;
+        savestate_menu_sync_overlay();
+    }
+    if (op == PSX_MOD_SSM_LOAD || op == PSX_MOD_SSM_SAVE) savestate_menu_submit(op == PSX_MOD_SSM_SAVE);
+    return 1;
+}
+extern "C" int psx_mod_savestate_menu_selected(void) {
+    return savestate_menu_open ? savestate_menu_slot : -1;
+}
 
 /* P1's controller as PSX_MOD_PAGE_* bits (the debug host layer too). */
 static uint32_t title_page_buttons(void) {
@@ -20573,6 +20605,8 @@ int main(int argc, char** argv) {
         title_page_close();
         psx_savestate_menu_set_hud(nullptr);
         psx_savestate_menu_set_toast(nullptr);
+        gl_renderer_set_pointer(0, 0.0f, 0.0f);
+        gl_renderer_set_pointer_image(nullptr, 0, 0, 0, 0);
         host_osd_set_handler(nullptr);
         debug_server_set_restricted(0);
         psx_savestate_menu_set_renderer(nullptr);

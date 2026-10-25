@@ -2391,10 +2391,50 @@ static int hdr_mask_wanted(void) { return s_hdr_on && (s_hdr_boost > 0.0f || s_h
 static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb);
 static void hdr_mask_present(int fresh, int lx, int ly, int lw, int lh);
 static void hdr_mask_noted(int ok, int lx, int ly, int lw, int lh);
+
+/* The last game picture's place in the window, for a title's mouse
+ * (gl_renderer_window_to_display): its rect (drawable pixels, top origin),
+ * the display pixels it shows and where the display's own column 0 is in them
+ * (a native-wide picture's left margin). Written by the presenting thread,
+ * read by the main thread: a sequence count around the copy. */
+static _Atomic unsigned s_map_seq = 0;
+static int s_map[8];   /* lx, ly, lw, lh, src w, src h, column 0, drawable w */
+static void pres_note_map(int path, int w, int h, int lx, int ly, int lw, int lh,
+                          int drawable_w, int drawable_h) {
+    if (path != GL_PRES_VRAM && path != GL_PRES_WIDE && path != GL_PRES_CPU &&
+        path != GL_PRES_INTERP)
+        return;
+    if (w < 1 || h < 1 || lw < 1 || lh < 1) return;
+    const int wide = path == GL_PRES_WIDE || (path == GL_PRES_INTERP && g_wide_w > 0 && w == g_wide_w);
+    const int m[8] = {lx, drawable_h - ly - lh, lw, lh, w, h, wide ? g_wide_off + view_shift : 0,
+                      drawable_w};
+    atomic_fetch_add_explicit(&s_map_seq, 1, memory_order_acq_rel);   /* odd: writing */
+    memcpy(s_map, m, sizeof m);
+    atomic_fetch_add_explicit(&s_map_seq, 1, memory_order_acq_rel);
+}
+
+int gl_renderer_window_to_display(float x, float y, float *dx, float *dy) {
+    int m[8], win_w = 0, win_h = 0;
+    unsigned s0, tries = 0;
+    do {
+        s0 = atomic_load_explicit(&s_map_seq, memory_order_acquire);
+        memcpy(m, s_map, sizeof m);
+    } while (((s0 & 1u) || s0 != atomic_load_explicit(&s_map_seq, memory_order_acquire)) && ++tries < 64);
+    if (!s0 || tries >= 64 || !s_win || m[2] < 1 || m[3] < 1) return -1;
+    /* window coordinates (SDL's mouse) to drawable pixels */
+    SDL_GetWindowSize(s_win, &win_w, &win_h);
+    const float k = win_w > 0 ? (float)m[7] / (float)win_w : 1.0f;
+    const float px = x * k, py = y * k;
+    if (dx) *dx = (px - (float)m[0]) * (float)m[4] / (float)m[2] - (float)m[6];
+    if (dy) *dy = (py - (float)m[1]) * (float)m[5] / (float)m[3];
+    return px >= (float)m[0] && px < (float)(m[0] + m[2]) && py >= (float)m[1] && py < (float)(m[1] + m[3]);
+}
+
 static void pres_record(int path, int dx, int dy, int w, int h,
                         int lx, int ly, int lw, int lh) {
     int drawable_w = 0, drawable_h = 0;
     SDL_GL_GetDrawableSize(s_win, &drawable_w, &drawable_h);
+    pres_note_map(path, w, h, lx, ly, lw, lh, drawable_w, drawable_h);
     psx_video_telemetry_compose(PSX_VIDEO_OPENGL, s_out_scale, w, h,
                                drawable_w, drawable_h, lw, lh);
     /* The composed game image, before hold-last capture and the OSD: the
@@ -10590,6 +10630,90 @@ static void gl_draw_osd_image_blend(const uint32_t *px, int ow, int oh, int dw, 
     if (blend) glDisable(GL_BLEND);
 }
 
+/* ---- a title's mouse pointer (psx_mod_set_pointer*) --------------------------
+ * A small straight-alpha image drawn last at every swap (over the effects, the
+ * OSD, menus, pages and notices), its hotspot at the mouse, each image pixel as
+ * big as one of the game's (drawable height / 240). The main thread sets it,
+ * whichever thread presents draws it: the image is copied under a lock, the
+ * position is atomic. */
+enum { PTR_MAX = 64 };
+static atomic_flag s_ptr_lock = ATOMIC_FLAG_INIT;
+static uint32_t s_ptr_px[PTR_MAX * PTR_MAX];
+static int s_ptr_w = 0, s_ptr_h = 0, s_ptr_hx = 0, s_ptr_hy = 0;
+static unsigned s_ptr_gen = 0;
+static _Atomic int s_ptr_on = 0;
+static _Atomic float s_ptr_x = 0.0f, s_ptr_y = 0.0f;   /* window coordinates */
+static GLuint s_ptr_tex = 0;
+static unsigned s_ptr_tex_gen = 0;
+static void ptr_lock(void) { while (atomic_flag_test_and_set_explicit(&s_ptr_lock, memory_order_acquire)) {} }
+static void ptr_unlock(void) { atomic_flag_clear_explicit(&s_ptr_lock, memory_order_release); }
+
+void gl_renderer_set_pointer_image(const uint32_t *argb, int w, int h, int hot_x, int hot_y) {
+    ptr_lock();
+    if (!argb || w < 1 || h < 1 || w > PTR_MAX || h > PTR_MAX) {
+        s_ptr_w = s_ptr_h = 0;
+    } else {
+        memcpy(s_ptr_px, argb, (size_t)w * h * sizeof(uint32_t));
+        s_ptr_w = w; s_ptr_h = h; s_ptr_hx = hot_x; s_ptr_hy = hot_y;
+    }
+    s_ptr_gen++;
+    ptr_unlock();
+}
+
+void gl_renderer_set_pointer(int visible, float x, float y) {
+    atomic_store(&s_ptr_x, x);
+    atomic_store(&s_ptr_y, y);
+    atomic_store(&s_ptr_on, visible ? 1 : 0);
+}
+
+static void ptr_draw(int ww, int wh) {
+    int w, h, hx, hy, win_w = 0, win_h = 0;
+    if (!atomic_load(&s_ptr_on) || !s_present_prog || ww < 1 || wh < 1) return;
+    if (!s_ptr_tex) glGenTextures(1, &s_ptr_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_ptr_tex);
+    ptr_lock();
+    w = s_ptr_w; h = s_ptr_h; hx = s_ptr_hx; hy = s_ptr_hy;
+    if (w > 0 && s_ptr_tex_gen != s_ptr_gen) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, s_ptr_px);
+        s_ptr_tex_gen = s_ptr_gen;
+    }
+    ptr_unlock();
+    if (w < 1) return;
+    SDL_GetWindowSize(s_win, &win_w, &win_h);
+    const float k = win_w > 0 ? (float)ww / (float)win_w : 1.0f;   /* window coordinates -> pixels */
+    const float s = (float)wh / 240.0f;
+    const int x0 = (int)floorf(atomic_load(&s_ptr_x) * k - (float)hx * s + 0.5f);
+    const int y0 = (int)floorf(atomic_load(&s_ptr_y) * k - (float)hy * s + 0.5f);
+    const int dw = (int)((float)w * s + 0.5f), dh = (int)((float)h * s + 0.5f);
+    if (dw < 1 || dh < 1 || x0 >= ww || y0 >= wh || x0 + dw <= 0 || y0 + dh <= 0) return;
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+    if (p_glBlendEquationSeparate)
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glViewport(x0, wh - y0 - dh, dw, dh);   /* GL origin is bottom-left; GL clips the rest */
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    present_set_gamma(s_present_uGamma, 0);
+    present_set_sharp(0, 0, 0, 0, 0);
+    PRESENT_SCANLINE(0, 0, 0);
+    p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    glDisable(GL_BLEND);
+    glViewport(0, 0, ww, wh);
+}
+
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 /* ---- presented-image ring feed (debug tools) ------------------------------
  * Every present, before the host OSD is drawn: blit the composed default
@@ -11006,6 +11130,7 @@ static void gl_swap_with_osd(void) {
             /* In-game overlay provider (host_overlay.h P2), over everything
              * the host composes; no-op unless one registered. */
             psx_host_overlay_draw(ww, wh);
+            ptr_draw(ww, wh);   /* a title's mouse pointer, last */
         }
     }
     if (!rth_replaying()) host_osd_present_done();   /* replay: done at record */
