@@ -25,5 +25,14 @@ function(psxrecomp_apply_runtime_ipo target)
         set_property(TARGET ${target}
             PROPERTY INTERPROCEDURAL_OPTIMIZATION_${_psx_ipo_config} TRUE)
     endforeach()
+    # With LTO the code is generated at the link, under the link's options:
+    # the compile's -ffp-contract=off (runtime.cmake: bit-identical IEEE
+    # results everywhere) has to be there too, or the link fuses a*b+c into
+    # FMAs again (measured, BoF4 with ThinLTO: a rotated HUD sprite and a few
+    # polygon edges a pixel off against the same build without LTO; with this
+    # option the pictures are identical).
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_link_options(${target} PRIVATE -ffp-contract=off)
+    endif()
     message(STATUS "psxrecomp: experimental runtime IPO enabled for ${target} (optimized configurations)")
 endfunction()
