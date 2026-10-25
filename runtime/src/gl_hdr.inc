@@ -44,7 +44,7 @@
  *   - a soft shoulder from 80% of the display's peak to the peak, so nothing
  *     clips (also when PSX_HDR_PEAK asks for more than the display has).
  *
- * Contrast (opt-in, PSX_HDR_CONTRAST 0..1, or PSX_HDR_SHADOWS / PSX_HDR_SCENE
+ * Contrast (opt-in, PSX_HDR_CONTRAST 0..1.5, or PSX_HDR_SHADOWS / PSX_HDR_SCENE
  * apart): the stops under mid grey (0.18) stretch, more the darker (deeper
  * shadows, the whole picture: whites stay where they are), and the scenery's
  * stops over mid grey stretch up to white (bright 3D scenery above the paper
@@ -101,9 +101,9 @@ static void hdr_env_once(void) {
     if ((e = getenv("PSX_HDR_EXPOSURE_MIN")) && *e) s_hdr_exp_min = (float)atof(e);
     if ((e = getenv("PSX_HDR_EXPOSURE_MAX")) && *e) s_hdr_exp_max = (float)atof(e);
     if (!(s_hdr_shadows_v >= 0.0f)) s_hdr_shadows_v = 0.0f;
-    if (s_hdr_shadows_v > 1.0f) s_hdr_shadows_v = 1.0f;
+    if (s_hdr_shadows_v > 1.5f) s_hdr_shadows_v = 1.5f;
     if (!(s_hdr_scene_v >= 0.0f)) s_hdr_scene_v = 0.0f;
-    if (s_hdr_scene_v > 1.0f) s_hdr_scene_v = 1.0f;
+    if (s_hdr_scene_v > 1.5f) s_hdr_scene_v = 1.5f;
     if (!(s_hdr_scene_area > 0.01f)) s_hdr_scene_area = 0.3f;
     if (!(s_hdr_exp_min > 0.25f) || s_hdr_exp_min > 1.0f) s_hdr_exp_min = 0.85f;
     if (!(s_hdr_exp_max >= 1.0f) || s_hdr_exp_max > 2.0f) s_hdr_exp_max = 1.0f;
@@ -804,8 +804,8 @@ void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float k
 void gl_renderer_hdr_set_contrast(float shadows, float scene, float exp_min, float exp_max) {
     GL_RT_SYNC("hdr_contrast");
     hdr_env_once();
-    if (shadows >= 0.0f) s_hdr_shadows_v = shadows > 1.0f ? 1.0f : shadows;
-    if (scene >= 0.0f) s_hdr_scene_v = scene > 1.0f ? 1.0f : scene;
+    if (shadows >= 0.0f) s_hdr_shadows_v = shadows > 1.5f ? 1.5f : shadows;
+    if (scene >= 0.0f) s_hdr_scene_v = scene > 1.5f ? 1.5f : scene;
     if (exp_min > 0.25f && exp_min <= 1.0f) s_hdr_exp_min = exp_min;
     if (exp_max >= 1.0f && exp_max <= 2.0f) s_hdr_exp_max = exp_max;
     pfx_mask_wanted_update();

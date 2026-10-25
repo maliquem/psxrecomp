@@ -41,9 +41,9 @@ Opt-in and off by default. `PSX_HDR=1` asks for it; with it unset nothing in
 | `PSX_HDR_AREA` | lifted share of the picture that keeps the full boost | 0.015 |
 | `PSX_HDR_SPEED` | following time constant, seconds | 0.5 |
 | `PSX_HDR_EXPOSURE_MIN` / `_MAX` | range of the dynamic exposure | 0.85 / 1.0 |
-| `PSX_HDR_CONTRAST` | 0..1, sets both of the next two | 0 |
-| `PSX_HDR_SHADOWS` | 0..1, deeper shadows (whole picture) | 0 |
-| `PSX_HDR_SCENE` | 0..1, bright 3D scenery over the paper white | 0 |
+| `PSX_HDR_CONTRAST` | 0..1.5, sets both of the next two | 0 |
+| `PSX_HDR_SHADOWS` | 0..1.5, deeper shadows (whole picture) | 0 |
+| `PSX_HDR_SCENE` | 0..1.5, bright 3D scenery over the paper white | 0 |
 | `PSX_HDR_SCENE_AREA` | lifted scenery share that keeps the full lift (dynamic) | 0.3 |
 
 Boost 0 with Windows' paper white is, pixel for pixel, what an SDR window
@@ -93,7 +93,8 @@ stay:
 
 Measured (2986x1680, boost 0.6): stops between the 5th and 95th light
 percentile, field 4.95 → 5.85 (0.5) → 6.70 (1); battle 4.50 → 5.10 → 5.75;
-bright sunlit scenery up to ~410 / ~600 nits; HUD unchanged. Cost with
+bright sunlit scenery up to ~410 / ~600 nits; at 1.4: field 7.40, battle 6.25,
+scenery ~810 nits; HUD unchanged. Cost with
 everything on: 0.46 ms.
 
 ## Debug server
