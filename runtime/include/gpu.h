@@ -46,6 +46,9 @@ typedef struct {
 } GpuDisplayInfo;
 
 void gpu_get_display_info(GpuDisplayInfo* out);
+/* Display starts that moved (GP1(05h) to another place): the game's own
+ * frames of a double-buffered picture, for the FPS readout. */
+uint64_t gpu_display_flips(void);
 /* Render-pass GPU register checkpoint (render_pass.c). One at a time. */
 int gpu_pass_checkpoint_save(void);
 void gpu_pass_checkpoint_restore(void);

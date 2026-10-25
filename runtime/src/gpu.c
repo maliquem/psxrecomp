@@ -9299,10 +9299,16 @@ static void gp1_dma_direction(uint32_t val) {
     dma_direction = val & 3;
 }
 
+/* The game's own frames: a display start that moves (a double-buffered flip),
+ * for the FPS readout (the VBlank count is the console's rate, not the game's). */
+static uint64_t s_display_flips = 0;
+uint64_t gpu_display_flips(void) { return s_display_flips; }
+
 static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
+    if ((val & 0x3FFu) != display_area_x || ((val >> 10) & 0x1FFu) != display_area_y) s_display_flips++;
     display_area_x = val & 0x3FF;
     display_area_y = (val >> 10) & 0x1FF;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */

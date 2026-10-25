@@ -583,6 +583,7 @@ static int post_load_probe_env_on(void) {
 }
 static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
+static uint64_t s_fps_last_flips = 0;   /* gpu_display_flips() at the window's start */
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
@@ -9393,14 +9394,20 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         if (!s_fps_last_time) {
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_flips = gpu_display_flips();
             if (sdl_window && s_fps_base_title.empty()) {
                 const char *title = SDL_GetWindowTitle(sdl_window);
                 if (title) s_fps_base_title = title;
             }
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
-            const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
-            const double speed = fps / guest_video_standard_hz();
+            /* "Game": the game's own frames (its display flips; a 30 fps game
+             * shows 30, not the 60 VBlanks), the VBlank rate when it shows a
+             * single buffer; the speed stays the VBlanks' (1.00x = the console). */
+            const double vbl = (double)(s_frame_count - s_fps_last_frame) / seconds;
+            const uint64_t flips = gpu_display_flips() - s_fps_last_flips;
+            const double fps = flips ? (double)flips / seconds : vbl;
+            const double speed = vbl / guest_video_standard_hz();
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -9517,6 +9524,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             std::fflush(stderr);
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_flips = gpu_display_flips();
         }
     }
 
