@@ -9295,6 +9295,14 @@ static bool drain_host_events() {
             }
         }
     }
+    {
+        /* A title's HUD canvas follows the window's aspect during play too
+         * (the save state menu and title pages tell it while they are up):
+         * else a widescreen window gets a 4:3 canvas stretched over it. */
+        int ww = 0, wh = 0;
+        if (sdl_window) SDL_GetWindowSize(sdl_window, &ww, &wh);
+        psx_savestate_menu_set_window(ww, wh);
+    }
     return true;
 }
 
