@@ -222,6 +222,23 @@ uint32_t psx_mod_call_guest_uncharged_counted(struct CPUState* cpu,
         uint32_t function, uint32_t return_address, uint32_t a0, uint32_t a1,
         uint32_t a2, uint32_t a3, uint32_t budget_cycles, int* charged,
         uint64_t* counted_cycles);
+/* The same zero guest time for a stretch of the game's own code between two
+ * instruction hooks, for work a title's enhancement adds to the original
+ * (e.g. polygons a screen funnel keeps only for a band past the picture's
+ * edges, drawn for the shadows): from begin to end guest time stands still,
+ * every RAM, register and device effect of the code is kept, and the mult/
+ * div, GTE and load-pipeline timing at end is the one at begin. Begin and end
+ * belong to the same guest function, and an end must be reached on every
+ * path out of the stretch (a missed one leaves time frozen until the budget
+ * runs out: over budget_cycles the rest is charged). Snapshots wait meanwhile.
+ * Spans do not nest: begin returns 0 when a span, an uncharged call or a
+ * render pass is already running. end returns 1 when the span stayed
+ * uncharged; *counted_cycles (optional) = the guest cycles it executed. A
+ * span that ran over budget can be closed from anywhere (cpu NULL: a VBlank
+ * or savestate hook). */
+int psx_mod_uncharged_span_begin(struct CPUState* cpu, uint32_t budget_cycles);
+int psx_mod_uncharged_span_end(struct CPUState* cpu, uint64_t* counted_cycles);
+int psx_mod_uncharged_span_active(void);
 /* Deliver disc sectors into RAM exactly as a completed CD-ROM DMA would
  * (overlay capture, executable-page invalidation, CD DMA log when lba >= 0).
  * Word-aligned address and length. Returns 0 when the span leaves RAM. */

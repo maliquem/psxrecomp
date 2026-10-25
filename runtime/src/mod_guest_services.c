@@ -100,6 +100,37 @@ uint32_t psx_mod_call_guest_uncharged(struct CPUState* cpu, uint32_t function,
         a0, a1, a2, a3, budget_cycles, charged, NULL);
 }
 
+/* An uncharged span between two instruction hooks: the uncharged call's freeze
+ * and caller timing, kept here from begin to end. */
+static PsxCycleFreeze s_span_save;
+static CallerTiming s_span_timing;
+static int s_span_on = 0;
+
+int psx_mod_uncharged_span_begin(struct CPUState* cpu, uint32_t budget_cycles) {
+    if (psx_mod_host_output_scope() || s_span_on) return 0;
+    timing_save(&s_span_timing, cpu);
+    if (!psx_cycle_uncharged_begin(&s_span_save, budget_cycles)) return 0;
+    psx_snapshot_host_call_begin();
+    s_span_on = 1;
+    return 1;
+}
+
+int psx_mod_uncharged_span_end(struct CPUState* cpu, uint64_t* counted_cycles) {
+    if (!s_span_on) {
+        if (counted_cycles) *counted_cycles = 0;
+        return 0;
+    }
+    const uint64_t counted = psx_cycle_uncharged_counted();
+    const int uncharged = psx_cycle_uncharged_end(&s_span_save);
+    if (uncharged && cpu) timing_restore(cpu, &s_span_timing);
+    psx_snapshot_host_call_end();
+    s_span_on = 0;
+    if (counted_cycles) *counted_cycles = uncharged ? counted : 0;
+    return uncharged;
+}
+
+int psx_mod_uncharged_span_active(void) { return s_span_on; }
+
 int psx_mod_dma_write_ram(uint32_t address, const void* data, uint32_t bytes,
                           int lba) {
     if (psx_mod_host_output_scope()) return 0;
