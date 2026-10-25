@@ -2218,6 +2218,41 @@ static int   s_bloom_add_only = 0;     /* [video] bloom_source: 1 "additive" (op
 static int  postfx_active(void);
 static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int lh);
 static void postfx_pillar_fill(int lx, int ly, int lw, int lh);
+/* HDR output (gl_hdr.inc): opt-in, PSX_HDR. */
+typedef struct {
+    int   done, w, h, written;
+    float max_nits, mean_nits, over_paper, paper_nits, peak_nits;
+} GlHdrProbe;
+static int    s_hdr_want = -1;          /* PSX_HDR, read once before the window */
+static int    s_hdr_float = 0;          /* the window got a float back buffer */
+static int    s_hdr_on = 0;             /* scRGB out: hdr_finish runs before every swap */
+static int    s_hdr_display = 0;        /* the window's display is in HDR mode (last present) */
+static float  s_hdr_paper_nits = 0.0f, s_hdr_peak_nits = 0.0f;   /* 0 = the display's */
+static float  s_hdr_boost = 0.0f, s_hdr_knee = 0.6f;
+static int    s_hdr_gamma = 0;          /* 0: sRGB curve, 1: gamma 2.2 */
+static int    s_hdr_debug = 0;
+static float  s_hdr_sdr_white = 1.0f, s_hdr_headroom = 1.0f;     /* scRGB, as SDL reports */
+static float  s_hdr_last_paper = 1.0f, s_hdr_last_peak = 1.0f;
+static GLuint s_hdr_prog = 0, s_hdr_tex = 0, s_hdr_fbo = 0;
+static int    s_hdr_prog_failed = 0, s_hdr_w = 0, s_hdr_h = 0;
+static GLint  s_hdr_uSrc = -1, s_hdr_uMask = -1, s_hdr_uMrect = -1, s_hdr_uP = -1;
+static GLint  s_hdr_uGamma = -1, s_hdr_uMr = -1, s_hdr_uDbg = -1, s_hdr_uLmask = -1;
+static int    s_hdr_mrect[4], s_hdr_mask_ok = 0;   /* the boost's mask for this present */
+enum { HDR_LG_MAX = 64 };   /* lights in the HDR boost's mask */
+static GLuint s_hdr_lm_tex = 0, s_hdr_lm_fbo = 0, s_hdr_lm_prog = 0, s_hdr_lm_vao = 0, s_hdr_lm_vbo = 0;
+static int    s_hdr_lm_failed = 0, s_hdr_lm_w = 0, s_hdr_lm_h = 0;
+static int    s_hdr_lights = 0;         /* lights in this present's mask */
+static float  s_hdr_lm_buf[HDR_LG_MAX * 6 * 4];
+static int    s_hdr_overlay = 0;        /* a big overlay is over the picture: no boost */
+static int    s_hdr_pic_rect[4];        /* the last present's picture rect (dynamic tone mapping) */
+static uint64_t s_hdr_frames = 0, s_hdr_boosted = 0;
+static char   s_hdr_probe_path[512];
+static int    s_hdr_probe_req = 0;
+static GlHdrProbe s_hdr_probe;
+static int hdr_boost_wanted(void) { return s_hdr_on && s_hdr_boost > 0.0f; }
+static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb);
+static void hdr_mask_present(int fresh, int lx, int ly, int lw, int lh);
+static void hdr_mask_noted(int ok, int lx, int ly, int lw, int lh);
 static void pres_record(int path, int dx, int dy, int w, int h,
                         int lx, int ly, int lw, int lh) {
     int drawable_w = 0, drawable_h = 0;
@@ -2226,8 +2261,12 @@ static void pres_record(int path, int dx, int dy, int w, int h,
                                drawable_w, drawable_h, lw, lh);
     /* The composed game image, before hold-last capture and the OSD: the
      * post-effect chains (bloom, [video] post_shader, AA; gl_postfx.inc). */
+    s_hdr_mask_ok = 0;   /* the HDR boost reads this present's mask or none */
+    s_hdr_pic_rect[0] = lx; s_hdr_pic_rect[1] = ly; s_hdr_pic_rect[2] = lw; s_hdr_pic_rect[3] = lh;
     if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && postfx_active())
         postfx_present(path != GL_PRES_INTERP, 1, lx, ly, lw, lh);
+    else if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && hdr_boost_wanted())
+        hdr_mask_present(path != GL_PRES_INTERP, lx, ly, lw, lh);
     if (path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP)
         postfx_pillar_fill(lx, ly, lw, lh);     /* blurred side bars (opt-in) */
     s_native_surface_pending=s_native_surface_enabled &&
@@ -4589,6 +4628,7 @@ static int b3dm_passes(int semi, int b3d) {
     } while (0)
 
 #include "gl_postfx.inc"
+#include "gl_hdr.inc"
 
 /* tb_mask / check are the batch's set-mask and the mask-check state it was
  * drawn under; track_stencil lets the canonical pass record deferred stencil
@@ -7462,6 +7502,7 @@ int gl_renderer_init_context(SDL_Window *win) {
         s_raster_ok = 0;
         return 0;
     }
+    hdr_init_context();   /* PSX_HDR: did the window get its float buffer? */
     return 1;
 }
 
@@ -7502,6 +7543,7 @@ void gl_renderer_shutdown(void) {
     s_native_surface_enabled=s_native_surface_pending=0;
     gl_renderer_clear_hd_texture_cache();
     pass_resources_release();
+    hdr_release();
     if (s_ctx) {
         for (unsigned i = 1; i < 65536u; ++i)
             if (s_bank_tex[i]) glDeleteTextures(1, &s_bank_tex[i]);
@@ -10660,6 +10702,7 @@ static int pt_begin(void) {
         if (gfap) gfap(PSXGL_FRAMEBUFFER, GL_BACK_LEFT, 0x8215 /* ALPHA_SIZE */, &a);
         if (glGetError() != GL_NO_ERROR) a = 8;
         s_pt_format = a > 0 ? GL_RGBA8 : GL_RGB8;
+        if (s_hdr_on) s_pt_format = 0x881A;   /* RGBA16F: the scRGB frame the window takes */
     }
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     s_pt_ctx = SDL_GL_CreateContext(s_win);
@@ -10748,6 +10791,7 @@ static void gl_swap_with_osd(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
     if (s_ctx) present_image_ring_capture_gl();
 #endif
+    s_hdr_overlay = 0;
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -10777,9 +10821,12 @@ static void gl_swap_with_osd(void) {
                 if (dh < 8) dh = oh;
                 vy = wh - (int)((float)dh * slide + 0.5f);
                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
+                s_hdr_overlay = 1;
             }
-            if (ov_image(3, &px, &ow, &oh) && px)
+            if (ov_image(3, &px, &ow, &oh) && px) {
                 gl_draw_osd_image_blend(px, ow, oh, ww, wh, 0, 0, ww, wh, ov_savestate_blend());
+                s_hdr_overlay = 1;
+            }
             /* In-game overlay provider (host_overlay.h P2), over everything
              * the host composes; no-op unless one registered. */
             psx_host_overlay_draw(ww, wh);
@@ -10960,6 +11007,7 @@ static void gl_swap_now(int generated) {
 #ifdef GL_PRESENT_TEST_HOOK
     GL_PRESENT_TEST_HOOK(generated);
 #endif
+    hdr_finish();   /* PSX_HDR: the composed SDR picture -> scRGB, last step */
     s_swaps_total++;
     uint64_t t0 = s_dyn_on ? SDL_GetPerformanceCounter() : 0;
     const uint64_t rthf_t0 = rth_replaying() ? host_now_ns_rthf() : 0;
@@ -13768,7 +13816,9 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
         s_pfx_src_gen = 1;
     }
     s_sc_gen_read = 1;   /* the real frame's casters (sc_presented) */
+    s_hdr_mask_ok = 0;
     if (postfx_active()) postfx_present(0, 0, lx, ly, lw, lh);
+    else if (hdr_boost_wanted()) hdr_mask_present(s_pfx_src_gen, lx, ly, lw, lh);
     s_sc_gen_read = 0;
     s_pfx_src_gen = 0;
     postfx_pillar_fill(lx, ly, lw, lh);

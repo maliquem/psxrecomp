@@ -2594,6 +2594,8 @@ static void configure_core_gl_context_attributes() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    /* PSX_HDR (opt-in): a float16 back buffer, shown as scRGB (gl_hdr.inc). */
+    gl_renderer_hdr_window_attributes(gl_renderer_hdr_wanted());
 }
 
 /* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
@@ -21271,6 +21273,12 @@ session_reboot:
         game_w, game_h,
         win_flags
     );
+    if (!sdl_window && g_video_renderer == 1 && gl_renderer_hdr_wanted()) {
+        /* PSX_HDR: no float pixel format here; the usual window instead. */
+        gl_renderer_hdr_window_attributes(0);
+        sdl_window = SDL_CreateWindow(window_title.c_str(),
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, game_w, game_h, win_flags);
+    }
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;

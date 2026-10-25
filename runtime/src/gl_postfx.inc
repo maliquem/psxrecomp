@@ -168,6 +168,7 @@ static void pfx_mask_wanted_update(void) {
     int want3d = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_mask3d) want3d = 1;
+    if (hdr_boost_wanted()) want3d = 1;   /* the HDR boost: lights with no opaque 2D over them (gl_hdr.inc) */
     int wantd = 0, wants = 0, wantw = 0;
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_depth) wantd = 1;
@@ -179,6 +180,7 @@ static void pfx_mask_wanted_update(void) {
     for (int i = 0; i < PFX_NSTAGES; i++)
         if (pfx_stage_on(i) && s_pfx[i].loaded && s_pfx[i].chain.uses_sprite) wspr = 1;
     s_spr_on = wspr;
+    if (hdr_boost_wanted()) wantw = 1;    /* the HDR boost: the frame's light pieces (sc_add_emit) */
     if (wantw && !s_sc_on) gl_renderer_shadow_cache_clear();   /* switched on: a fresh memory */
     s_sc_on = wantw;
     s_sun_on = wants;
@@ -2465,6 +2467,10 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
         if (!ran) continue;
         if (i == PFX_STAGE_BLOOM) s_bloom_passes++;
         if (i == PFX_STAGE_AA || i == PFX_STAGE_HQ) s_paa_passes++;
+    }
+    if (hdr_boost_wanted()) {   /* the HDR boost reads the mask at the swap (gl_hdr.inc) */
+        if (!mask_done) { mask_ok = pfx_mask_build(src_fresh, lw, lh); mask_done = 1; }
+        hdr_mask_noted(mask_ok, lx, ly, lw, lh);
     }
     s_mask_src_valid = 0; s_mask_ctr_valid = 0;
     s_dfill_valid = s_dfill_ctr_valid = 0;

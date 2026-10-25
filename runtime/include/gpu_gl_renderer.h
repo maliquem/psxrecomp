@@ -329,6 +329,23 @@ void gl_renderer_fmv_enhance_phase(int *px, int *py);
  * it), and a path prefix: the next movie frame is saved through several stage
  * sets as <prefix>_mNN.bmp. */
 void gl_renderer_fmv_enhance_debug(int mask, const char *dump_prefix);
+/* HDR output (gl_hdr.inc; opt-in, PSX_HDR=1, Windows + SDL3): a float16 window
+ * that the compositor shows as scRGB; the composed SDR picture is decoded and
+ * scaled by the paper white as the last step before the swap, the scene's
+ * lights optionally lifted toward the display's peak (PSX_HDR_BOOST,
+ * PSX_HDR_PAPER / PSX_HDR_PEAK nits, PSX_HDR_KNEE, PSX_HDR_GAMMA=2.2;
+ * dynamic tone mapping: PSX_HDR_DYNAMIC=1, PSX_HDR_ADAPT, PSX_HDR_AREA,
+ * PSX_HDR_SPEED).
+ * wanted: PSX_HDR asks for it (read before the window exists);
+ * window_attributes: the SDL GL attributes for the next window (0 restores). */
+int  gl_renderer_hdr_wanted(void);
+void gl_renderer_hdr_window_attributes(int on);
+/* Live (TCP hdr): a negative value keeps the current one; probe_path non-NULL
+ * reads the next finished frame back ("" = statistics only). */
+void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float knee,
+                         int gamma, int debug, int dynamic, float adapt, float area,
+                         const char *probe_path);
+int  gl_renderer_hdr_json(char *out, size_t cap);
 void gl_renderer_note_present_depth24(int d24);
 int  gl_renderer_cpu_auth_dual(void);
 

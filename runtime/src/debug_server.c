@@ -8767,6 +8767,46 @@ static void handle_fmv_chroma(int id, const char *json)
              (unsigned long long)gl_renderer_fmv_chroma_frames());
 }
 
+/* hdr: {"cmd":"hdr"} reads the HDR output state (PSX_HDR, gl_hdr.inc): float
+ * buffer, the display's SDR white and headroom as SDL reports them, the paper
+ * white and peak in use, the boost and the last probe. Sets live: "boost"
+ * (0..1), "paper" / "peak" (nits, 0 = the display's), "knee" (0..0.95),
+ * "gamma" (0 sRGB curve, 1 gamma 2.2), "debug" (1 tints lifted pixels),
+ * "dynamic" (0/1: dynamic tone mapping), "adapt" (0..1), "area" (0..1),
+ * "probe" ("" or a PNG path: the next finished frame is read back; ask again
+ * for the result). */
+static float hdr_json_float(const char *json, const char *key, float def)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p == '"') p++;
+    char *end;
+    const float v = strtof(p, &end);
+    return end == p ? def : v;
+}
+static void handle_hdr(int id, const char *json)
+{
+    char probe[512];
+    const char *pp = NULL;
+    if (strstr(json, "\"probe\"")) {
+        probe[0] = '\0';
+        (void)json_get_str(json, "probe", probe, sizeof probe);
+        pp = probe;
+    }
+    gl_renderer_hdr_set(hdr_json_float(json, "boost", -1.0f), hdr_json_float(json, "paper", -1.0f),
+                        hdr_json_float(json, "peak", -1.0f), hdr_json_float(json, "knee", -1.0f),
+                        json_get_int(json, "gamma", -1), json_get_int(json, "debug", -1),
+                        json_get_int(json, "dynamic", -1), hdr_json_float(json, "adapt", -1.0f),
+                        hdr_json_float(json, "area", -1.0f), pp);
+    static char body[1024];
+    gl_renderer_hdr_json(body, sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 /* fmv_enhance: {"cmd":"fmv_enhance"} reads, {"cmd":"fmv_enhance","on":0|1}
  * sets [video] fmv_enhance live. Replies the enhanced-present count and the
  * 8x8 grid phase found in the movie. */
@@ -16157,6 +16197,7 @@ static const CmdEntry s_commands[] = {
     { "extra_shader",      handle_extra_shader },
     { "fmv_chroma",        handle_fmv_chroma },
     { "fmv_enhance",       handle_fmv_enhance },
+    { "hdr",               handle_hdr },
     { "texture_lod",       handle_texture_lod },
     { "accurate_blending", handle_accurate_blending },
 
