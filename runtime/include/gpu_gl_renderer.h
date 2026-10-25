@@ -778,6 +778,7 @@ int  gl_renderer_fbo_peek_deferred(int x, int y, int w, int h, uint16_t *out);
  * psx_mod_set_pointer): set from the main thread, drawn last at every swap. */
 void gl_renderer_set_pointer_image(const uint32_t *argb, int w, int h, int hot_x, int hot_y);
 void gl_renderer_set_pointer(int visible, float x, float y);
+void gl_renderer_set_pointer_scale(float scale);
 /* Window coordinates (SDL's mouse) to display pixels of the last game picture
  * presented (psx_mod_window_to_display). Main thread. */
 int  gl_renderer_window_to_display(float x, float y, float *dx, float *dy);

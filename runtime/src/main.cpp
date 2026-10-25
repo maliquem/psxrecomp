@@ -8981,6 +8981,9 @@ extern "C" void psx_mod_set_pointer_image(const uint32_t *argb, int w, int h, in
 extern "C" void psx_mod_set_pointer(int visible, float x, float y) {
     gl_renderer_set_pointer(visible, x, y);
 }
+extern "C" void psx_mod_set_pointer_scale(float scale) {
+    gl_renderer_set_pointer_scale(scale);
+}
 extern "C" int psx_mod_window_to_display(float x, float y, float *dx, float *dy) {
     return g_gl_active ? gl_renderer_window_to_display(x, y, dx, dy) : -1;
 }
@@ -20607,6 +20610,7 @@ int main(int argc, char** argv) {
         psx_savestate_menu_set_toast(nullptr);
         gl_renderer_set_pointer(0, 0.0f, 0.0f);
         gl_renderer_set_pointer_image(nullptr, 0, 0, 0, 0);
+        gl_renderer_set_pointer_scale(1.0f);
         host_osd_set_handler(nullptr);
         debug_server_set_restricted(0);
         psx_savestate_menu_set_renderer(nullptr);

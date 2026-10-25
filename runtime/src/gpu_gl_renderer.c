@@ -10643,6 +10643,7 @@ static int s_ptr_w = 0, s_ptr_h = 0, s_ptr_hx = 0, s_ptr_hy = 0;
 static unsigned s_ptr_gen = 0;
 static _Atomic int s_ptr_on = 0;
 static _Atomic float s_ptr_x = 0.0f, s_ptr_y = 0.0f;   /* window coordinates */
+static _Atomic float s_ptr_scale = 1.0f;                /* image pixels per game pixel (1 = one) */
 static GLuint s_ptr_tex = 0;
 static unsigned s_ptr_tex_gen = 0;
 static void ptr_lock(void) { while (atomic_flag_test_and_set_explicit(&s_ptr_lock, memory_order_acquire)) {} }
@@ -10658,6 +10659,10 @@ void gl_renderer_set_pointer_image(const uint32_t *argb, int w, int h, int hot_x
     }
     s_ptr_gen++;
     ptr_unlock();
+}
+
+void gl_renderer_set_pointer_scale(float scale) {
+    atomic_store(&s_ptr_scale, scale > 0.05f && scale <= 4.0f ? scale : 1.0f);
 }
 
 void gl_renderer_set_pointer(int visible, float x, float y) {
@@ -10686,7 +10691,8 @@ static void ptr_draw(int ww, int wh) {
     if (w < 1) return;
     SDL_GetWindowSize(s_win, &win_w, &win_h);
     const float k = win_w > 0 ? (float)ww / (float)win_w : 1.0f;   /* window coordinates -> pixels */
-    const float s = (float)wh / 240.0f;
+    float s = (float)wh / 240.0f * atomic_load(&s_ptr_scale);
+    if (s >= 1.0f) s = floorf(s + 0.5f);   /* whole pixels per image pixel: no uneven columns */
     const int x0 = (int)floorf(atomic_load(&s_ptr_x) * k - (float)hx * s + 0.5f);
     const int y0 = (int)floorf(atomic_load(&s_ptr_y) * k - (float)hy * s + 0.5f);
     const int dw = (int)((float)w * s + 0.5f), dh = (int)((float)h * s + 0.5f);

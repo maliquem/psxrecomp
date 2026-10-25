@@ -1270,6 +1270,10 @@ int  psx_mod_request_screenshot(const char* path);
  * at each session's activation. The host's own cursor is the title's to hide. */
 void psx_mod_set_pointer_image(const uint32_t *argb, int w, int h, int hot_x, int hot_y);
 void psx_mod_set_pointer(int visible, float x, float y);
+/* The pointer's size: each image pixel is `scale` game pixels (1, the default,
+ * one; 0.5 half as big; whole screen pixels per image pixel once that is 1 or
+ * more). Cleared with the image at each activation. */
+void psx_mod_set_pointer_scale(float scale);
 /* Window coordinates (as SDL's mouse events give them) to the display pixels
  * of the last game picture presented (0..display width x 0..height; a
  * native-wide picture's margins fall below 0 and past the width): the same
