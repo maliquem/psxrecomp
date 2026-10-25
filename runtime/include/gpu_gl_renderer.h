@@ -200,9 +200,11 @@ void  gl_renderer_set_post_shader(const char *path);
 /* Further .pfx chains run in slot order (0..4) right before post_shader
  * ("" = none); live uniforms (gl_renderer_set_post_uniform) reach them all. */
 void  gl_renderer_set_extra_shader(int slot, const char *path);
-/* Blurred pillarbox: a picture narrower than the window gets its side bars
- * filled with itself, scaled to cover, blurred and darkened (0 = black bars,
- * the default). Output pixels only; PSX_PILLARBOX_FILL=blur|black overrides. */
+/* Pillarbox fill: a picture narrower than the window gets its side bars in
+ * its own edge colour when that is flat (a plain logo or title background);
+ * otherwise 1 fills them with the picture scaled to cover, blurred and
+ * darkened, and 2 leaves them black (0 = black bars, the default). Output
+ * pixels only; PSX_PILLARBOX_FILL=auto|flat|black overrides. */
 void  gl_renderer_set_pillarbox_blur(int on);
 int   gl_renderer_get_pillarbox_blur(void);
 /* Live override of a user-chain (.pfx) uniform, 1..4 floats; kept across

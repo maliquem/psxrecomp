@@ -2479,7 +2479,8 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
  *   - edges of one flat colour (a plain logo or title background): the bars
  *     take exactly that colour, so the background simply continues;
  *   - anything else (menu art): the bars show the picture scaled to cover the
- *     window, heavily blurred and darkened, as video players and remasters do.
+ *     window, heavily blurred and darkened, as video players and remasters do
+ *     (mode 1); in mode 2 (flat colour only) they stay black instead.
  * FMV keeps black bars (CPU-readout presents and recent MDEC decodes are
  * skipped). It reads only the finished output pixels (after the post-effect
  * chains, before hold-last capture and the OSD) and draws only outside the
@@ -2487,7 +2488,7 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
  * default; a bezel image, when set, takes precedence. */
 extern int mdec_recently_active(uint32_t within_frames);
 static GLuint s_bezel_tex;                  /* defined with the bezel code below */
-static int    s_pillar_blur = 0;
+static int    s_pillar_blur = 0;            /* 0 off, 1 flat colour or blur, 2 flat colour or black */
 /* 0..2: 8x, 4x, 2x staging; 3 and 4: blur ping-pong at 1x; 5: 1x1 edge colour. */
 #define PB_LEVELS 6
 static GLuint s_pb_tex[PB_LEVELS], s_pb_fbo[PB_LEVELS];
@@ -2662,7 +2663,7 @@ static void postfx_pillar_fill(int lx, int ly, int lw, int lh) {
     p_glUseProgram(s_pb_draw_prog);
     p_glUniform1i(s_pb_draw_src, 0);
     p_glUniform1i(s_pb_draw_edge, 1);
-    p_glUniform1f(s_pb_draw_dim, 0.7f);
+    p_glUniform1f(s_pb_draw_dim, s_pillar_blur == 2 ? 0.0f : 0.7f);   /* 2: no blur, black */
     p_glUniform1f(s_pb_draw_flat, s_pb_flat);
     const float fw = (float)ww;
     if (lx > 0) {
@@ -2697,12 +2698,13 @@ static void postfx_pillar_fill(int lx, int ly, int lw, int lh) {
     s_pb_fills++;
 }
 
-/* PSX_PILLARBOX_FILL=auto|black overrides [video] pillarbox_fill. */
+/* on: 0 off, 1 flat colour or blur, 2 flat colour or black.
+ * PSX_PILLARBOX_FILL=auto|flat|black overrides [video] pillarbox_fill. */
 void gl_renderer_set_pillarbox_blur(int on) {
     GL_RT_SYNC("pillarbox_fill");
     const char *e = getenv("PSX_PILLARBOX_FILL");
-    if (e && *e) on = strcmp(e, "black") != 0;
-    s_pillar_blur = on ? 1 : 0;
+    if (e && *e) on = !strcmp(e, "black") ? 0 : !strcmp(e, "flat") ? 2 : 1;
+    s_pillar_blur = on == 2 ? 2 : on ? 1 : 0;
 }
 int gl_renderer_get_pillarbox_blur(void) { return s_pillar_blur; }
 
