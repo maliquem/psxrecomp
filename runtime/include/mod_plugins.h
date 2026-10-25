@@ -1154,6 +1154,13 @@ void psx_mod_set_savestate_blocked(int blocked);
 void psx_mod_set_savestate_load_blocked(int blocked);
 void psx_mod_set_fast_forward_blocked(int blocked);
 void psx_mod_set_debug_tools_restricted(int restricted);
+/* The manual fast-forward's speed for the title (e.g. levels a player picks):
+ * 2..16 times, -1 unbounded, 0 the default (PSX_FAST_FORWARD_SPEED, else 4).
+ * Applies from the next frame, also to a run in progress; cleared before each
+ * session's activation. Returns 0 for any other value. The getter gives the
+ * speed in force (-1 unbounded). */
+int  psx_mod_set_fast_forward_speed(int multiplier);
+int  psx_mod_fast_forward_speed(void);
 
 /* A title's own page over the frozen game (e.g. an achievements list), run
  * like the save state menu: while it is open the guest is held at the vblank

@@ -775,8 +775,13 @@ static bool host_hotkey_input_focused(void) {
     return (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
 
+/* psx_mod_set_fast_forward_speed: a title's own speed for the manual
+ * fast-forward (0 = none: PSX_FAST_FORWARD_SPEED or 4x). */
+static int g_mod_fast_forward_speed = 0;
+
 static int manual_fast_forward_multiplier(void) {
     static int value = -2; /* -2 = unread, -1 = max/unbounded */
+    if (g_mod_fast_forward_speed) return g_mod_fast_forward_speed;
     if (value == -2) {
         const char *e = std::getenv("PSX_FAST_FORWARD_SPEED");
         value = 4;
@@ -1615,6 +1620,14 @@ extern "C" void psx_mod_set_savestate_load_blocked(int blocked) {
 static int g_mod_fast_forward_blocked = 0;
 extern "C" void psx_mod_set_fast_forward_blocked(int blocked) {
     g_mod_fast_forward_blocked = blocked != 0;
+}
+extern "C" int psx_mod_set_fast_forward_speed(int multiplier) {
+    if (multiplier != 0 && multiplier != -1 && (multiplier < 2 || multiplier > 16)) return 0;
+    g_mod_fast_forward_speed = multiplier;
+    return 1;
+}
+extern "C" int psx_mod_fast_forward_speed(void) {
+    return manual_fast_forward_multiplier();
 }
 extern "C" void psx_mod_set_debug_tools_restricted(int restricted) {
     debug_server_set_restricted(restricted);
@@ -20436,6 +20449,7 @@ int main(int argc, char** argv) {
         savestate_set_title_blocked(0);
         savestate_set_title_load_blocked(0);
         g_mod_fast_forward_blocked = 0;
+        g_mod_fast_forward_speed = 0;
         title_page_close();
         psx_savestate_menu_set_hud(nullptr);
         debug_server_set_restricted(0);
