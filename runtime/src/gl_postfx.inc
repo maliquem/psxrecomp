@@ -1787,17 +1787,43 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
  * (2D; none near: the HUD, not a light), taken to the world (the picture's
  * camera), and followed from present to present
  * there (within LIT_MATCH units): one seen in LIT_STEADY presents or more,
- * and lately, is a light that stays (a fire, a lamp); a spell's flash is not.
+ * and lately, or in LIT_START with hardly a miss (LIT_ALL), is a light that
+ * stays (a fire, a lamp); a spell's flash is not (in a battle, up to 14
+ * presents in a row, or 25 now and then). It comes up over LIT_START..
+ * LIT_STEADY (ramp); one seen LIT_LEARN presents teaches its pieces' looks (sc_add_emit:
+ * texels and colour, not where they sit in VRAM), and a glow with a look so
+ * learned is a light at once: the campfire after a battle, the menu or
+ * another room, or another one like it. (BoF4: the campfire's 2 pieces stay
+ * for good; Nina's wind spell stays 130 VBlanks and comes up, as before, but
+ * is not learned.)
  * Out: s_lit (world, GTE axes), for the lights that cast (steps to come) and
  * TCP shadow_cache "lights". */
-enum { LIT_MAX = 16, LIT_JOIN = 24, LIT_STEADY = 30, LIT_GONE = 20 };
+enum { LIT_MAX = 16, LIT_JOIN = 24, LIT_START = 15, LIT_STEADY = 30, LIT_GONE = 20, LIT_LEARN = 90,
+       LIT_LOOKS = 1024 };
 #define LIT_DARK 0.02f   /* a glowing piece's brightest channel below this adds nothing */
 #define LIT_MATCH 160.0f
-typedef struct { float w[3]; float sx, sy, z, size, after, c[3]; unsigned hits, seen; int active; } PfxLight;
+#define LIT_ALL 0.9f     /* seen in this share of the light steps since it was first */
+typedef struct { float w[3]; float sx, sy, z, size, after, c[3], ramp; unsigned hits, seen, first; int active, up, known; } PfxLight;
 static PfxLight s_lit[LIT_MAX];
 static int      s_lit_n = 0;
+static unsigned s_lit_steps = 0;   /* pfx_lights_update calls (fresh presents) */
+static uint32_t s_lit_look[LIT_LOOKS];   /* the learned looks (open addressing, 0 = empty) */
+static int      s_lit_looks = 0;
+static uint32_t *lit_look_slot(uint32_t key) {
+    uint32_t i = (key * 2654435761u) >> 22;   /* 10 bits: LIT_LOOKS */
+    while (s_lit_look[i] && s_lit_look[i] != key) i = (i + 1) & (LIT_LOOKS - 1);
+    return &s_lit_look[i];
+}
+static int lit_look_known(uint32_t key) { return key && s_lit_looks > 0 && *lit_look_slot(key) == key; }
+static void lit_look_learn(uint32_t key) {
+    if (!key || lit_look_known(key)) return;
+    if (s_lit_looks >= LIT_LOOKS * 3 / 4) { memset(s_lit_look, 0, sizeof s_lit_look); s_lit_looks = 0; }   /* full: learn anew */
+    *lit_look_slot(key) = key;
+    s_lit_looks++;
+}
 static void pfx_lights_update(void) {
     const ScSlot *sc = sc_presented();
+    s_lit_steps++;
     for (int i = 0; i < s_lit_n; i++) s_lit[i].active = 0;
     if (!sc || !sc->cam_ok || sc->en <= 0) goto age;
     {
@@ -1805,11 +1831,13 @@ static void pfx_lights_update(void) {
         /* groups: the pieces joined to a nearby earlier one (on the picture,
          * and in depth when both have one) */
         enum { G_MAX = 32 };
-        float g[G_MAX][10];  /* sum x*a, sum y*a, sum a, sum z*a and sum a over the pieces with a depth, count,
-                                most 3D triangles drawn after a piece, sum rgb*a */
-        int ng = 0;
+        float g[G_MAX][11];  /* sum x*a, sum y*a, sum a, sum z*a and sum a over the pieces with a depth, count,
+                                most 3D triangles drawn after a piece, sum rgb*a, a piece's look learned */
+        int ng = 0, gl[G_MAX];
+        static uint8_t pg[1024];   /* each piece's group (255: none) */
         for (int i = 0; i < sc->en; i++) {
             const float *e = sc->ev + (size_t)i * SC_EV;
+            pg[i] = 255;
             /* a piece that adds nothing (black) gives no light: BoF4 hides the
              * party member standing behind the leader by drawing it additive
              * in black, which lit the field round them after a battle */
@@ -1825,11 +1853,13 @@ static void pfx_lights_update(void) {
                 if (z > 0.0f && g[k][4] > 0.0f && fabsf(z - g[k][3] / g[k][4]) > 0.2f * z) continue;
                 break;
             }
-            if (k == ng) { if (ng == G_MAX) continue; memset(g[ng], 0, sizeof g[ng]); ng++; }
+            if (k == ng) { if (ng == G_MAX) continue; memset(g[ng], 0, sizeof g[ng]); gl[ng] = -1; ng++; }
+            pg[i] = (uint8_t)k;
             g[k][0] += x * a; g[k][1] += y * a; g[k][2] += a; g[k][5] += 1.0f;
             g[k][6] = fmaxf(g[k][6], (float)sc->n - e[4]);
             for (int c = 0; c < 3; c++) g[k][7 + c] += e[5 + c] * a;
             if (z > 0.0f) { g[k][3] += z * a; g[k][4] += a; }
+            if (lit_look_known((uint32_t)e[15])) g[k][10] = 1.0f;
         }
         for (int k = 0; k < ng; k++) {
             const float sx = g[k][0] / g[k][2], sy = g[k][1] / g[k][2];
@@ -1876,6 +1906,7 @@ static void pfx_lights_update(void) {
                     for (int i = 1; i < s_lit_n; i++) if (s_lit[i].seen < s_lit[m].seen) m = i;
                 }
                 memset(&s_lit[m], 0, sizeof s_lit[m]);
+                s_lit[m].first = s_lit_steps;
                 memcpy(s_lit[m].w, w, sizeof w);
                 for (int c = 0; c < 3; c++) s_lit[m].c[c] = g[k][7 + c] / g[k][2];
             }
@@ -1884,8 +1915,18 @@ static void pfx_lights_update(void) {
             for (int c = 0; c < 3; c++) L->c[c] = 0.9f * L->c[c] + 0.1f * g[k][7 + c] / g[k][2];   /* its colour: the pieces' (emit_tex_rgb) */
             L->sx = sx; L->sy = sy; L->z = z; L->size = g[k][2]; L->after = g[k][4] > 0.0f ? -1.0f : g[k][6];
             L->hits++; L->seen = s_pfx_presents;
-            L->active = L->hits >= LIT_STEADY;
+            /* a learned look: at once (2 presents: not a one-off) and at full */
+            if (g[k][10] > 0.0f && L->hits >= 2) L->known = 1;
+            if (L->hits >= LIT_STEADY ||
+                (L->hits >= LIT_START && (float)L->hits >= LIT_ALL * (float)(s_lit_steps - L->first + 1))) L->up = 1;
+            L->active = L->known || L->up;
+            L->ramp = L->known ? 1.0f
+                    : fminf(fmaxf((float)((int)L->hits - LIT_START + 1) / (float)(LIT_STEADY - LIT_START + 1), 0.0f), 1.0f);
+            gl[k] = m;
         }
+        for (int i = 0; i < sc->en; i++)   /* a light that stays teaches its pieces' looks */
+            if (pg[i] != 255 && gl[pg[i]] >= 0 && s_lit[gl[pg[i]]].hits >= LIT_LEARN)
+                lit_look_learn((uint32_t)sc->ev[(size_t)i * SC_EV + 15]);
     }
 age:
     for (int i = 0; i < s_lit_n;) {   /* gone: not seen for a while */
@@ -1896,20 +1937,20 @@ age:
 int gl_renderer_lights_json(char *out, int cap) {
     GL_RT_SYNC("lights_json");
     const ScSlot *sc = sc_presented();
-    int k = snprintf(out, (size_t)cap, "\"glow_pieces\":[%u,%u,%u],\"glow_now\":%d,\"points_now\":%d,\"tris_now\":%d,\"uncovered\":%d,\"lights\":[",
+    int k = snprintf(out, (size_t)cap, "\"glow_pieces\":[%u,%u,%u],\"glow_now\":%d,\"points_now\":%d,\"tris_now\":%d,\"uncovered\":%d,\"looks\":%d,\"lights\":[",
                      s_emit_seen[0], s_emit_seen[1], s_emit_seen[2], sc ? sc->en : -1, sc ? sc->npts : -1, sc ? sc->n : -1,
-                     s_unc_last);
-    for (int i = 0; i < s_lit_n && k < cap - 160; i++) {
+                     s_unc_last, s_lit_looks);
+    for (int i = 0; i < s_lit_n && k < cap - 200; i++) {
         const PfxLight *L = &s_lit[i];
-        k += snprintf(out + k, (size_t)(cap - k), "%s{\"world\":[%.0f,%.0f,%.0f],\"screen\":[%.1f,%.1f],\"z\":%.0f,\"size\":%.0f,\"after\":%.0f,\"rgb\":[%.2f,%.2f,%.2f],\"hits\":%u,\"active\":%d}",
+        k += snprintf(out + k, (size_t)(cap - k), "%s{\"world\":[%.0f,%.0f,%.0f],\"screen\":[%.1f,%.1f],\"z\":%.0f,\"size\":%.0f,\"after\":%.0f,\"rgb\":[%.2f,%.2f,%.2f],\"hits\":%u,\"active\":%d,\"known\":%d,\"ramp\":%.2f}",
                       i ? "," : "", L->w[0], L->w[1], L->w[2], L->sx, L->sy, L->z, L->size, L->after,
-                      L->c[0], L->c[1], L->c[2], L->hits, L->active);
+                      L->c[0], L->c[1], L->c[2], L->hits, L->active, L->known, L->ramp);
     }
     k += snprintf(out + k, (size_t)(cap - k), "],\"wg_agree\":[%d,%d,%d],\"bdm\":[%u,%u,%u,%d],\"pieces\":[", s_wg_in, s_wg_on, s_wg_trust, s_dbg_bdm[0], s_dbg_bdm[1], s_dbg_bdm[2], s_b3d_on);
-  /* this frame's: x, y, z, area, 3D before it */
-    for (int i = 0; sc && i < sc->en && i < 48 && k < cap - 80; i++) {
+  /* this frame's: x, y, z, area, 3D before it, look */
+    for (int i = 0; sc && i < sc->en && i < 48 && k < cap - 96; i++) {
         const float *e = sc->ev + (size_t)i * SC_EV;
-        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f]", i ? "," : "", e[0], e[1], e[2], e[3], e[4]);
+        k += snprintf(out + k, (size_t)(cap - k), "%s[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]", i ? "," : "", e[0], e[1], e[2], e[3], e[4], e[15]);
     }
     return k + snprintf(out + k, (size_t)(cap - k), "]");
 }
@@ -2004,7 +2045,9 @@ static void pfx_fire_build(const PfxPass *ps, float aspect, int lw, int lh) {
             const float *c = s_lit[pick[k]].c, mx = fmaxf(c[0], fmaxf(c[1], c[2]));
             for (int i = 0; i < 3; i++) s_fl_col[nl][i] = mx > 0.05f ? c[i] / mx : (fcol ? fcol[i] : 1.0f);
             const float big = fminf(fmaxf(sqrtf(s_lit[pick[k]].size / LIT_FULL), 0.25f), 1.0f);
-            s_fl_col[nl][3] = big;   /* light-out.glsl: strength, and reach (the map's depth stays over `reach`) */
+            /* light-out.glsl: strength, and reach (the map's depth stays over
+             * `reach`); a new light's grow over its ramp */
+            s_fl_col[nl][3] = big * s_lit[pick[k]].ramp;
         }
         nl++;
     }

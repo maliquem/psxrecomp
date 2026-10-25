@@ -824,7 +824,7 @@ enum { SC_ANC_MAX = 64 };
 /* atl: the cut-outs of the frame's sprite pieces (1 = drawn texel), copied from
  * VRAM as each piece was drawn (the game may load the next animation's pieces
  * before the picture is shown), packed in rows of SC_ATL x SC_ATL. */
-enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 15 };
+enum { SC_ATL = 512, SC_PTS_MAX = 256, SC_EV = 16 };
 typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; ScCam cam; int cam_ok; unsigned cam_ver;
                  float *sv; int sn, scap; float anc[SC_ANC_MAX][3]; int nanc;
                  float *sb;   /* per 2D triangle: VRAM y below its lowest drawn texel row, -1e30 = none known */
@@ -832,7 +832,7 @@ typedef struct { int area[4]; int n, cap, shown, conv; unsigned use; float *v; S
                  float *ev; int en, ecap;   /* glowing pieces (light sources): x, y (VRAM px), SZ (0 = none), area,
                                                3D triangles drawn before it, colour (rgb, 1 = full), its
                                                corners (x, y VRAM px x 3), the share of the colour it adds
-                                               (1, mode 3: 0.25) */
+                                               (1, mode 3: 0.25), its look (emit_tex_rgb, 0 = none) */
                  float pts[SC_PTS_MAX][3]; int npts;   /* the points projected with the camera (view space) */
                } ScSlot;
 static ScSlot   s_sc[SC_SLOTS];
@@ -923,8 +923,10 @@ static void sc_restart(ScSlot *sl) {
  * px), when PGXP has none sub-pixel; rgb, its colour (emit_flat_rgb,
  * emit_tex_rgb). */
 static unsigned s_emit_seen[3];   /* TCP: additive pieces with depth and sub-pixel corners, with depth only, without depth */
+static uint32_t s_emit_key = 0;   /* the next sc_add_emit piece's look (emit_tex_rgb) */
 /* A flat glowing piece's colour: its vertices' (15-bit). */
 static void emit_flat_rgb(const uint16_t *cs, float *rgb) {
+    s_emit_key = 0;   /* a flat colour is no look of its own */
     rgb[0] = rgb[1] = rgb[2] = 0.0f;
     for (int i = 0; i < 3; i++) {
         rgb[0] += (float)(cs[i] & 31) / 93.0f;
@@ -935,14 +937,21 @@ static void emit_flat_rgb(const uint16_t *cs, float *rgb) {
 /* A textured glowing piece's colour as the game draws it: its texels (4x4
  * over its uv box, through the CLUT; transparent ones left out, bright ones
  * counting most) times its vertex colour (col: mod / 255, 128 = as is; raw:
- * not modulated). A mod's texture bank: the vertex colour alone. */
+ * not modulated). A mod's texture bank: the vertex colour alone.
+ * Its look (s_emit_key, 24 bits): those texels, the uv box's size and the
+ * vertex colour, wherever the texture sits in VRAM (gl_postfx.inc learns the
+ * looks of the lights that stay); one colour all over is none (0). */
 static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth, int cx, int cy,
                          const float *col, int raw, float *rgb) {
     float m[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < 3; i++)
         for (int c = 0; c < 3; c++) m[c] += (raw ? 1.0f / 3.0f : col[i * 3 + c] * (255.0f / 128.0f) / 3.0f);
     float s[3] = {0.0f, 0.0f, 0.0f}, w = 0.0f;
+    s_emit_key = 0;
     if (s_vram && !s_selected_bank_tex) {
+        uint32_t h = 2166136261u;   /* FNV-1a */
+        int vary = 0;
+        uint16_t t0 = 0;
         int u0 = us[0], u1 = us[0], v0 = vs[0], v1 = vs[0];
         for (int i = 1; i < 3; i++) {
             u0 = us[i] < u0 ? us[i] : u0; u1 = us[i] > u1 ? us[i] : u1;
@@ -956,11 +965,19 @@ static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth
                 if (depth == 0) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
                 else if (depth == 1) t = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((bx + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
                 else t = s_vram[row + ((bx + u) & 1023)];
+                if (i + j == 0) t0 = t; else vary |= t != t0;
+                h = (h ^ t) * 16777619u;
                 if (!t) continue;
                 const float r = (float)(t & 31) / 31.0f, g = (float)((t >> 5) & 31) / 31.0f, b = (float)((t >> 10) & 31) / 31.0f;
                 const float l = r + g + b;
                 s[0] += r * l; s[1] += g * l; s[2] += b * l; w += l;
             }
+        if (vary) {
+            h = (h ^ (uint32_t)(depth | (u1 - u0) << 2 | (v1 - v0) << 10)) * 16777619u;
+            for (int c = 0; c < 3; c++) h = (h ^ (uint32_t)(m[c] * 31.0f + 0.5f)) * 16777619u;
+            s_emit_key = (h ^ h >> 24) & 0xFFFFFFu;
+            if (!s_emit_key) s_emit_key = 1;
+        }
     }
     for (int c = 0; c < 3; c++) rgb[c] = (w > 0.0f ? s[c] / w : 1.0f) * m[c];
 }
@@ -998,6 +1015,8 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
     e[5] = rgb[0]; e[6] = rgb[1]; e[7] = rgb[2];
     for (int i = 0; i < 3; i++) { e[8 + 2 * i] = px[i]; e[9 + 2 * i] = py[i]; }
     e[14] = share;
+    e[15] = (float)s_emit_key;   /* 24 bits: exact */
+    s_emit_key = 0;
     sl->en++;
     sl->use = ++s_sc_use;
 }
