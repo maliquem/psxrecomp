@@ -416,6 +416,7 @@ static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) *
  * the native-wide fast-path latch, depth24) is captured when a call is
  * recorded and read back through the ctx_* accessors below during replay. */
 #include "render_thread.h"
+#include "perf_meter.h"
 static int       s_rth_on = 0;
 static uint16_t *s_rth_vram_pub = NULL;   /* gpu.c's VRAM (guest-visible)      */
 static uint16_t *s_rth_vram_priv = NULL;  /* render thread's upload source     */
@@ -8499,6 +8500,13 @@ static double   s_pf_cw_pending[5];            /* flush_ms, wide_ms, batches, wi
 static double   s_pf_buf_cw[GLPERF_NBUF][5];
 static GlPerfSample s_pf_ring[GLPERF_RING];
 static uint64_t     s_pf_ring_seq = 0;
+/* Running totals of the samples, for readers on other threads (perf meter). */
+static _Atomic uint64_t s_pf_tot_frames, s_pf_tot_scene_ns, s_pf_tot_present_ns;
+void gl_renderer_frame_gpu_totals(uint64_t *frames, uint64_t *scene_ns, uint64_t *present_ns) {
+    *frames = atomic_load(&s_pf_tot_frames);
+    *scene_ns = atomic_load(&s_pf_tot_scene_ns);
+    *present_ns = atomic_load(&s_pf_tot_present_ns);
+}
 
 /* Dynamic resolution's render-thread frame cost owns the TIME_ELAPSED target
  * while it measures (rthf_begin): frame_perf stands aside. */
@@ -8628,6 +8636,9 @@ static void gl_perf_present_exit(int wide) {
         s->wide            = s_pf_buf_wide[rd];
         s->frame           = s_pf_buf_frame[rd];
         s_pf_ring_seq++;
+        atomic_fetch_add(&s_pf_tot_scene_ns, (uint64_t)sc);
+        atomic_fetch_add(&s_pf_tot_present_ns, (uint64_t)pr);
+        atomic_fetch_add(&s_pf_tot_frames, 1);   /* last: the totals above are in */
     }
     s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */
     s_pf_count++;
@@ -12245,15 +12256,23 @@ void gl_renderer_host_ledger(GlHostLedger *out) {
     if (out) *out = s_dyn_ledger;
 }
 
+/* The perf meter (perf_meter.h) times the emulation thread's calls; the
+ * render thread replays the same entry points. */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
+    const int pm = !rth_replaying();
+    if (pm) PERF_BEGIN(PM_PRESENT);
     present_vram_impl(disp_x, disp_y, w, h, linear, force_4_3);
     dyn_after_present();
+    if (pm) { perf_meter_note_present(); PERF_END(PM_PRESENT); }
 }
 
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+    const int pm = !rth_replaying();
+    if (pm) PERF_BEGIN(PM_PRESENT);
     int r = present_wide_fbo_impl(disp_x, disp_y, disp_h, linear);
     dyn_after_present();
+    if (pm) { if (r) perf_meter_note_present(); PERF_END(PM_PRESENT); }
     return r;
 }
 

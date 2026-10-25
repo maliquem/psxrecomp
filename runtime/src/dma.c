@@ -17,6 +17,10 @@
 #include "crash_trace.h"
 #include "dirty_ram_interp.h"
 #include "dma_gpu_ll.h"
+
+/* Around DMA channel 2's work (1 = begins, 0 = ends); NULL by default
+ * (perf_meter.c sets it). */
+void (*dma_gpu_perf_observer)(int begin) = NULL;
 #include "gpu.h"
 #include "mdec.h"
 #include "mod_memory.h"
@@ -1096,6 +1100,7 @@ static void try_execute(int ch) {
             start_async_mdec_transfer(1);
             break;
         case 2:
+            if (dma_gpu_perf_observer) dma_gpu_perf_observer(1);
             if ((channels[2].chcr & 1u) != 0u &&
                 ((channels[2].chcr >> 9) & 3u) == 2u) {
                 start_async_gpu_linked_list();
@@ -1111,6 +1116,7 @@ static void try_execute(int ch) {
                 schedule_delayed_complete(2, execute_ch2_gpu(),
                                           DMA_GPU_CYCLES_PER_WORD);
             }
+            if (dma_gpu_perf_observer) dma_gpu_perf_observer(0);
             break;
         case 3:
             execute_ch3_cdrom();
@@ -1271,7 +1277,9 @@ void dma_advance(uint32_t cycles) {
         g_dma_cur_madr = gpu_linked_list.current_addr;
         g_dma_cur_bcr = channels[2].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[2];
+        if (dma_gpu_perf_observer) dma_gpu_perf_observer(1);
         dma_gpu_ll_advance(&gpu_linked_list, cycles, &gpu_ll_ops, NULL);
+        if (dma_gpu_perf_observer) dma_gpu_perf_observer(0);
     }
     DMAAsyncChannel *a = &cdrom_async;
     if (dma_cdrom_transfer_active()) {

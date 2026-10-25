@@ -404,6 +404,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_timing.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
+    ${PSXRECOMP_ROOT}/runtime/src/perf_meter.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_interpolation.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass_plan.c

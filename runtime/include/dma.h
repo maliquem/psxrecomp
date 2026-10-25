@@ -28,6 +28,7 @@ uint32_t dma_read(uint32_t addr);
 void     dma_write(uint32_t addr, uint32_t val);
 void     dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask);
 void     dma_advance(uint32_t cycles);
+extern void (*dma_gpu_perf_observer)(int begin);   /* perf_meter.c */
 /* Cycle-budgeted precise event slicing: guest CPU cycles until a DELIVERABLE
  * DMA IRQ (bit3 unmasked in i_mask). UINT32_MAX if none. */
 uint32_t dma_cycles_to_irq(uint32_t i_mask);

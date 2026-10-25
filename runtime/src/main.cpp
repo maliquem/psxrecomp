@@ -68,6 +68,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "../third_party/stb_image.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
+#include "perf_meter.h"
 #include "latency_ring.h"
 #include "sio.h"
 #include "psx_host_rumble.h"
@@ -680,6 +681,13 @@ struct PerfSummary {
 };
 static PerfSummary s_perf;
 static int      s_perf_wanted = 0;   /* TCP perf_summary asked once: keep measuring */
+static int      s_pm_fast_forward = 0;   /* the manual turbo this VBlank (perf_meter) */
+/* The frame pacer's waits, as the perf meter's WAIT section. */
+static void pm_pacer_wait(FramePacer *p, double period_ms) {
+    PERF_BEGIN(PM_WAIT);
+    frame_pacer_wait(p, period_ms);
+    PERF_END(PM_WAIT);
+}
 static Uint64   s_perf_last_qpc = 0;
 static uint64_t s_perf_last_frame = 0, s_perf_last_emu_cpu = 0, s_perf_last_gl_cpu = 0, s_perf_last_proc_cpu = 0;
 static GlGpuTotals s_perf_last_gpu{};
@@ -749,6 +757,15 @@ extern "C" int psx_perf_summary_json(char *out, int cap) {
         p.gpu.engine_ok, p.gpu.proc_3d_pct, p.gpu.all_3d_pct,
         p.gpu.ok, p.gpu.name, p.gpu.util_pct, p.gpu.mem_util_pct, p.gpu.clock_mhz, p.gpu.pstate,
         p.gpu.vram_used_mb, p.gpu.vram_total_mb, p.gpu.proc_ok, p.gpu.proc_vram_mb, p.gpu.proc_budget_mb);
+}
+/* perf_summary plus the meter's last window (perf_meter.h). */
+extern "C" int psx_perf_summary_meter_json(char *out, int cap) {
+    int n = psx_perf_summary_json(out, cap);
+    if (n > 0 && n < cap - 2) {
+        out[n++] = ',';
+        n += psx_perf_meter_window_json(out + n, cap - n);
+    }
+    return n;
 }
 
 /* Hold-to-act host hotkeys must not fire while the game window does not hold
@@ -9186,6 +9203,14 @@ static bool drain_host_events() {
                 fps_telemetry_toggle();
             }
             else if (!key_repeat &&
+                     host_keymap_match_event(HOST_KEYMAP_PERF_RECORD,
+                                             (int)key, (int)scancode,
+                                             (int)mod)) {
+                psx_perf_meter_set_recording(!psx_perf_meter_recording());
+                host_osd_push(psx_perf_meter_recording() ? "Performance recording on"
+                                                         : "Performance recording off", 1500);
+            }
+            else if (!key_repeat &&
                      host_keymap_match_event(HOST_KEYMAP_SCANLINES,
                                              (int)key, (int)scancode,
                                              (int)mod)) {
@@ -9268,10 +9293,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
+    PERF_BEGIN(PM_DEBUG);
     debug_server_wait_if_paused();
     debug_server_poll();
     debug_server_record_frame();
     debug_server_check_watchpoints();
+    PERF_END(PM_DEBUG);
 
     /* Check debug server input override. */
     int override = debug_server_get_input_override();
@@ -9341,7 +9368,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 SDL_SetWindowTitle(sdl_window, title);
             }
             if (!g_headless) {
-                char osd[200];
+                char osd[360];
                 const PerfSummary &p = s_perf;
                 if (p.valid) {
                     /* Three lines: the rates; the display's intervals and our
@@ -9371,13 +9398,27 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                         snprintf(gpu + gn, sizeof(gpu) - (size_t)gn, " %uMHz P%d", p.gpu.clock_mhz, p.gpu.pstate);
                     char vram[24] = "";
                     if (p.gpu.proc_ok) snprintf(vram, sizeof(vram), " | VRAM %.2fG", p.gpu.proc_vram_mb / 1024.0);
+                    PsxPerfWindow mw;
+                    psx_perf_meter_window(&mw);
+                    char meter[160] = "";
+                    if (mw.valid)
+                        snprintf(meter, sizeof(meter),
+                                 "\nVBl %.1fms busy %.1f p99 %.1f | game %.1f gpu %.1f pres %.1f aud %.1f dbg %.1f%s%s",
+                                 mw.wall_avg, mw.busy_avg, mw.busy_p99, mw.game_avg, mw.sec_avg[PM_GPU],
+                                 mw.sec_avg[PM_PRESENT], mw.sec_avg[PM_AUDIO], mw.sec_avg[PM_DEBUG],
+                                 "", psx_perf_meter_recording() ? " REC" : "");
+                    if (mw.valid && (mw.render_cpu_avg > 0.0 || mw.gpu_frames)) {
+                        const size_t ml = std::strlen(meter);
+                        snprintf(meter + ml, sizeof(meter) - ml, " | rnd %.1f gpu post %.1fms",
+                                 mw.render_cpu_avg, mw.gpu_post_avg);
+                    }
                     snprintf(osd, sizeof(osd),
                              "Game %.0f FPS  %.2fx | Display %.0f FPS%s\n"
                              "Frame %.1fms p99 %.1f max %.1f 1%% %.0f%s\n"
-                             "%s%s%s",
+                             "%s%s%s%s",
                              fps, speed, p.pace.presents > 0 ? p.pace.fps : display_fps, gen,
                              p.pace.avg_ms, p.pace.p99_ms, p.pace.max_ms, p.pace.low1_fps, gtime,
-                             cpu, gpu, vram);
+                             cpu, gpu, vram, meter);
                 } else if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
                              "Game %.0f FPS  %.2fx | Display %.0f FPS",
@@ -9648,8 +9689,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * Rollback resim: skip host audio pump (uncapped frames) so SPU/CD audio
      * paths cannot fork peers during the episode window. */
     if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active()) {
+        PERF_BEGIN(PM_AUDIO);
         sdl_audio_update(fmv_skip_active,
                          turbo_loads_active && g_turbo_audio_sink_enabled);
+        PERF_END(PM_AUDIO);
     }
 #endif
 
@@ -9736,6 +9779,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         } else {
             ff_refused_down = 0;
         }
+        s_pm_fast_forward = ff_wanted ? 1 : 0;
         if (ff_wanted) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
@@ -9752,7 +9796,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             turbo_was_down = 1;
             if (mult >= 2 && g_frame_period_ms > 0.0) {
                 uint64_t perf_start = runtime_perf_section_begin();
-                frame_pacer_wait(&s_frame_pacer,
+                pm_pacer_wait(&s_frame_pacer,
                                  g_frame_period_ms / (double)mult);
                 runtime_perf_section_end(perf_start,
                                          &g_runtime_perf.pacer_ticks);
@@ -9786,7 +9830,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         if (g_turbo_load_wall_multiplier >= 2 &&
             g_frame_period_ms > 0.0) {
             uint64_t perf_start = runtime_perf_section_begin();
-            frame_pacer_wait(
+            pm_pacer_wait(
                 &s_frame_pacer,
                 g_frame_period_ms / (double)g_turbo_load_wall_multiplier);
             runtime_perf_section_end(
@@ -9853,7 +9897,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         uint64_t perf_start = runtime_perf_section_begin();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
-            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            pm_pacer_wait(&s_frame_pacer, g_frame_period_ms);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
             if (g_dynres.active) g_dynres.pacer_ticks += waited;
             g_frame_report_wait_ticks += waited;
@@ -11228,10 +11272,21 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
 }
 
 
+static void sdl_vblank_present_(void);
 static void sdl_vblank_present(void) {
+    /* the meter's VBlank boundary (perf_meter.h), then the epilogue as its
+     * VBLANK section (what its own sections do not cover) */
+    perf_meter_vblank(fps_telemetry_enabled() || s_perf_wanted, s_pm_fast_forward);
+    PERF_BEGIN(PM_VBLANK);
+    sdl_vblank_present_();
+    PERF_END(PM_VBLANK);
+}
+static void sdl_vblank_present_(void) {
     sync_guest_cadence_to_video_standard();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
+    PERF_BEGIN(PM_PRESENT);
     render_thread_vblank();
+    PERF_END(PM_PRESENT);
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
      * on the same VBlank boundary (BB fast-poll tails forked #2 vs #3). */
@@ -11254,7 +11309,7 @@ static void sdl_vblank_present(void) {
     }
     uint64_t perf_start = runtime_perf_section_begin();
     if (present_should_wall_pace())
-        frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+        pm_pacer_wait(&s_frame_pacer, g_frame_period_ms);
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     latency_ring_mark(LAT_PACED);
 }

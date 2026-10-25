@@ -278,14 +278,18 @@ static void wake_render(int force) {
 
 /* Block until pred() holds; the render thread wakes us after every record. */
 typedef int (*Pred)(uint64_t arg);
+void (*rt_wait_observer)(int begin) = NULL;
 static void emu_wait(Pred pred, uint64_t arg) {
     if (pred(arg)) return;
+    void (*obs)(int) = rt_wait_observer;
+    if (obs) obs(1);
     wake_render(1);
     mtx_lock(&R.mtx);
     atomic_store(&R.emu_sleeping, 1);
     while (!pred(arg)) cnd_wait(&R.cv_emu, &R.mtx);
     atomic_store(&R.emu_sleeping, 0);
     mtx_unlock(&R.mtx);
+    if (obs) obs(0);
 }
 
 static int pred_space(uint64_t need_end) {   /* need_end: wpos after the write */

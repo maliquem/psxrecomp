@@ -599,6 +599,11 @@ typedef struct GlRthCosts {
 } GlRthCosts;
 void gl_renderer_render_thread_measure(int on);
 void gl_renderer_render_thread_costs(GlRthCosts *out);
+/* frame_perf's GPU timer queries (debug-tools builds), running totals over
+ * the frames read back: the scene draws' span (between two presents: an
+ * upper bound, idle gaps included) and the present (post effects, the
+ * blit; one burst: its true cost). Any thread, never syncs. */
+void gl_renderer_frame_gpu_totals(uint64_t *frames, uint64_t *scene_ns, uint64_t *present_ns);
 
 /* Narrow a native-wide display aspect num:den to the widest whose surface
  * this context can allocate at its internal scale (psx_gl_fit_wide_aspect;

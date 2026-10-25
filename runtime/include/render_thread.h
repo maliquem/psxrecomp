@@ -127,6 +127,9 @@ typedef struct RtStats {
     int      max_frames, running, held;
 } RtStats;
 void rt_get_stats(RtStats *out);
+/* Called around every wait of the emulation thread on the render thread
+ * (1 = begins, 0 = ends); NULL by default (perf_meter.c sets it). */
+extern void (*rt_wait_observer)(int begin);
 
 /* Ring of the most recent sync points (newest first). Returns the count. */
 typedef struct RtAcquireEvent {

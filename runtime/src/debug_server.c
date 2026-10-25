@@ -19,6 +19,7 @@
 #include "debug_server.h"
 #include "host_launch_timing.h"
 #include "host_sampler.h"
+#include "perf_meter.h"
 #include "savestate.h"
 #include "guest_cycle_profile.h"
 #include "host_osd.h"
@@ -11005,12 +11006,30 @@ static void handle_frame_gen(int id, const char *json)
  *   P-state, VRAM; this process's VRAM and budget}.
  *   The first request starts the measuring: valid is 0 for about a second. */
 int psx_perf_summary_json(char *out, int cap);
+int psx_perf_summary_meter_json(char *out, int cap);
 static void handle_perf_summary(int id, const char *json)
 {
     (void)json;
-    char buf[2048];
-    if (psx_perf_summary_json(buf, sizeof buf) <= 0) buf[0] = 0;
+    char buf[4096];
+    psx_perf_meter_keepalive();
+    if (psx_perf_summary_meter_json(buf, sizeof buf) <= 0) buf[0] = 0;
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"valid\":0");
+}
+
+/* perf_frames: {"since":N} -> the perf meter's records from N (perf_meter.h),
+ * each [seq, frame, wall, game, gpu_emu, present, audio, wait, debug, vblank,
+ * render_cpu, gpu, gpu_post, render_frames, gpu_frames, presents, fast_forward]
+ * (ms); "next" is the since for the next call ({"since":-1}: none, the next). Keeps the meter on ~10 s;
+ * {"record":0|1} also switches the title's recording. */
+static void handle_perf_frames(int id, const char *json)
+{
+    static char buf[512 * 200 + 256];
+    psx_perf_meter_keepalive();
+    const int rec = json_get_int(json, "record", -1);
+    if (rec >= 0) psx_perf_meter_set_recording(rec);
+    const long long since = json_get_int(json, "since", 0);   /* -1: from now on */
+    psx_perf_meter_frames_json(since < 0 ? UINT64_MAX : (uint64_t)since, buf, (int)sizeof buf);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
 }
 
 /* Presented-image ring (see present_image_ring.h):
@@ -16187,6 +16206,7 @@ static const CmdEntry s_commands[] = {
     { "render_thread",     handle_render_thread },
     { "frame_gen",         handle_frame_gen },
     { "perf_summary",      handle_perf_summary },
+    { "perf_frames",       handle_perf_frames },
     { "present_image_ring_get",   handle_present_image_ring_get },
     { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },

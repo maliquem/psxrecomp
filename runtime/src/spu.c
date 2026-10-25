@@ -1475,6 +1475,10 @@ static void spu_out_push(const int16_t *src, uint32_t frames) {
     }
 }
 
+/* Around the samples spu_catch_up renders (1 = begins, 0 = ends); NULL by
+ * default (perf_meter.c sets it). */
+void (*spu_perf_observer)(int begin) = NULL;
+
 void spu_catch_up(void) {
     const uint64_t now = psx_get_cycle_count();
     if (!s_clock_valid) {
@@ -1489,12 +1493,15 @@ void spu_catch_up(void) {
     s_clock += frames * SPU_CYCLES_PER_SAMPLE;
     const int keep = !(s_output_suppressed && s_output_suppressed());
     static int16_t block[2048 * 2];
+    void (*obs)(int) = spu_perf_observer;
+    if (obs) obs(1);
     while (frames) {
         const int n = frames > 2048u ? 2048 : (int)frames;
         spu_render_block(block, n);
         if (keep) spu_out_push(block, (uint32_t)n);
         frames -= (uint64_t)n;
     }
+    if (obs) obs(0);
     s_catching_up = 0;
 }
 

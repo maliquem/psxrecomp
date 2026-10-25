@@ -13,6 +13,7 @@ void spu_init(void);
  * register/DMA/CD-input access does this first; the host pump calls it, then
  * drains the queue. */
 void spu_catch_up(void);
+extern void (*spu_perf_observer)(int begin);   /* perf_meter.c */
 uint32_t spu_output_available(void);
 uint32_t spu_output_pop(int16_t* out_stereo, uint32_t max_frames);
 void spu_output_drop(uint32_t frames);   /* oldest first */

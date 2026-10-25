@@ -24,6 +24,7 @@ typedef enum HostKeymapAction {
     HOST_KEYMAP_SCANLINES,        /* default F6 */
     HOST_KEYMAP_TURBO_TOGGLE,     /* default F9; latches Turbo until pressed again */
     HOST_KEYMAP_CAPTURE_MARK,     /* default Ctrl+M; freezes the debug capture rings */
+    HOST_KEYMAP_PERF_RECORD,      /* default Shift+F; records the perf meter (perf_meter.h) */
     HOST_KEYMAP_ACTION_COUNT
 } HostKeymapAction;
 
