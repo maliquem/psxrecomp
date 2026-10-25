@@ -55,6 +55,8 @@ static GLuint s_hdr_ad_tex[2], s_hdr_ad_fbo[2];
 static int    s_hdr_dyn_failed = 0, s_hdr_ad_cur = 0, s_hdr_ad_valid = 0;
 static uint64_t s_hdr_ad_t = 0;         /* SDL counter at the last measure */
 static float  s_hdr_dyn_state[4];       /* the last probe's followed state (TCP) */
+static int    s_hdr_time_req = 0;       /* TCP hdr "time": fence the next pass and time it */
+static float  s_hdr_time_us = 0.0f;
 static GLint  s_hdr_st_uSrc = -1, s_hdr_st_uMask = -1, s_hdr_st_uLmask = -1, s_hdr_st_uMrect = -1,
               s_hdr_st_uP = -1, s_hdr_st_uGamma = -1, s_hdr_st_uMr = -1, s_hdr_st_uPic = -1;
 static GLint  s_hdr_ad_uSt = -1, s_hdr_ad_uPrev = -1, s_hdr_ad_uK = -1;
@@ -585,6 +587,9 @@ static void hdr_finish(void) {
     }
     PfxGlState saved;
     pfx_state_save(&saved);
+    const int timed = s_hdr_time_req;   /* TCP hdr "time": this pass's GPU cost, fenced */
+    uint64_t t0 = 0;
+    if (timed) { glFinish(); t0 = SDL_GetPerformanceCounter(); }
     glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -619,17 +624,26 @@ static void hdr_finish(void) {
     p_glBindVertexArray(s_present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
+    if (timed) {
+        glFinish();
+        s_hdr_time_us = (float)((double)(SDL_GetPerformanceCounter() - t0) * 1e6 /
+                                (double)SDL_GetPerformanceFrequency());
+        s_hdr_time_req = 0;
+    }
     s_hdr_frames++;
     if (boost) s_hdr_boosted++;
     if (s_hdr_probe_req) {
         s_hdr_probe_req = 0;
-        hdr_probe_take(ww, wh, paper, peak);
         memset(s_hdr_dyn_state, 0, sizeof s_hdr_dyn_state);
+        float pe = paper;   /* the paper white this frame used */
         if (dyn) {
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hdr_ad_fbo[s_hdr_ad_cur]);
             glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, s_hdr_dyn_state);
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+            pe = fminf(paper * fminf(fmaxf(powf(0.18f / fmaxf(exp2f(s_hdr_dyn_state[0]), 1e-4f),
+                                                0.2f * s_hdr_adapt), 0.85f), 1.3f), peak);
         }
+        hdr_probe_take(ww, wh, pe, peak);
     }
     p_glActiveTexture(PSXGL_TEXTURE0 + 3);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -695,6 +709,7 @@ void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float k
         snprintf(s_hdr_probe_path, sizeof s_hdr_probe_path, "%s", probe_path);
         s_hdr_probe.done = 0;
         s_hdr_probe_req = 1;
+        s_hdr_time_req = 1;   /* the same frame's cost, before its read-back */
     }
     pfx_mask_wanted_update();
 }
@@ -709,7 +724,7 @@ int gl_renderer_hdr_json(char *out, size_t cap) {
         "\"dynamic\":%d,\"adapt\":%.3f,\"area\":%.4f,\"speed\":%.3f,"
         "\"followed\":{\"light\":%.4f,\"lifted_share\":%.5f,\"mean_light\":%.4f,\"exposure\":%.3f,\"boost_scale\":%.3f},"
         "\"probe\":{\"done\":%d,\"w\":%d,\"h\":%d,\"max_nits\":%.1f,\"mean_nits\":%.2f,"
-        "\"over_paper\":%.5f,\"paper_nits\":%.1f,\"peak_nits\":%.1f,\"png\":%d}}",
+        "\"over_paper\":%.5f,\"paper_nits\":%.1f,\"peak_nits\":%.1f,\"png\":%d,\"cost_us\":%.1f}}",
         s_hdr_want > 0, s_hdr_float, s_hdr_on, s_hdr_display,
         s_hdr_sdr_white * 80.0f, s_hdr_headroom, s_hdr_last_paper * 80.0f, s_hdr_last_peak * 80.0f,
         s_hdr_paper_nits, s_hdr_peak_nits, s_hdr_boost, s_hdr_knee,
@@ -720,5 +735,6 @@ int gl_renderer_hdr_json(char *out, size_t cap) {
         fminf(fmaxf(powf(0.18f / fmaxf(exp2f(s_hdr_dyn_state[0]), 1e-4f), 0.2f * s_hdr_adapt), 0.85f), 1.3f),
         fminf(1.0f, sqrtf(s_hdr_area / fmaxf(s_hdr_dyn_state[1], 1e-6f))),
         s_hdr_probe.done, s_hdr_probe.w, s_hdr_probe.h, s_hdr_probe.max_nits, s_hdr_probe.mean_nits,
-        s_hdr_probe.over_paper, s_hdr_probe.paper_nits, s_hdr_probe.peak_nits, s_hdr_probe.written);
+        s_hdr_probe.over_paper, s_hdr_probe.paper_nits, s_hdr_probe.peak_nits, s_hdr_probe.written,
+        s_hdr_time_us);
 }
