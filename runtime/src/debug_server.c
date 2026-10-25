@@ -8773,6 +8773,7 @@ static void handle_fmv_chroma(int id, const char *json)
  * (0..1), "paper" / "peak" (nits, 0 = the display's), "knee" (0..0.95),
  * "gamma" (0 sRGB curve, 1 gamma 2.2), "debug" (1 tints lifted pixels),
  * "dynamic" (0/1: dynamic tone mapping), "adapt" (0..1), "area" (0..1),
+ * "contrast" (0..1: both of) "shadows" / "scene", "exp_min" / "exp_max",
  * "probe" ("" or a PNG path: the next finished frame is read back; ask again
  * for the result). */
 static float hdr_json_float(const char *json, const char *key, float def)
@@ -8802,6 +8803,10 @@ static void handle_hdr(int id, const char *json)
                         json_get_int(json, "gamma", -1), json_get_int(json, "debug", -1),
                         json_get_int(json, "dynamic", -1), hdr_json_float(json, "adapt", -1.0f),
                         hdr_json_float(json, "area", -1.0f), pp);
+    const float con = hdr_json_float(json, "contrast", -1.0f);
+    gl_renderer_hdr_set_contrast(con >= 0.0f ? con : hdr_json_float(json, "shadows", -1.0f),
+                                 con >= 0.0f ? con : hdr_json_float(json, "scene", -1.0f),
+                                 hdr_json_float(json, "exp_min", -1.0f), hdr_json_float(json, "exp_max", -1.0f));
     static char body[1024];
     gl_renderer_hdr_json(body, sizeof body);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);

@@ -2222,6 +2222,7 @@ static void postfx_pillar_fill(int lx, int ly, int lw, int lh);
 typedef struct {
     int   done, w, h, written;
     float max_nits, mean_nits, over_paper, paper_nits, peak_nits;
+    float pct[4];                       /* light percentiles 5 50 95 99 (nits) */
 } GlHdrProbe;
 static int    s_hdr_want = -1;          /* PSX_HDR, read once before the window */
 static int    s_hdr_float = 0;          /* the window got a float back buffer */
@@ -2249,7 +2250,10 @@ static uint64_t s_hdr_frames = 0, s_hdr_boosted = 0;
 static char   s_hdr_probe_path[512];
 static int    s_hdr_probe_req = 0;
 static GlHdrProbe s_hdr_probe;
+static float  s_hdr_scene_v = 0.0f;     /* PSX_HDR_SCENE (or _CONTRAST): bright scenery lift, 0..1 */
 static int hdr_boost_wanted(void) { return s_hdr_on && s_hdr_boost > 0.0f; }
+/* the masks at the swap: the lights' boost or the scenery's lift */
+static int hdr_mask_wanted(void) { return s_hdr_on && (s_hdr_boost > 0.0f || s_hdr_scene_v > 0.0f); }
 static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb);
 static void hdr_mask_present(int fresh, int lx, int ly, int lw, int lh);
 static void hdr_mask_noted(int ok, int lx, int ly, int lw, int lh);
@@ -2265,7 +2269,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
     s_hdr_pic_rect[0] = lx; s_hdr_pic_rect[1] = ly; s_hdr_pic_rect[2] = lw; s_hdr_pic_rect[3] = lh;
     if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && postfx_active())
         postfx_present(path != GL_PRES_INTERP, 1, lx, ly, lw, lh);
-    else if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && hdr_boost_wanted())
+    else if ((path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP) && hdr_mask_wanted())
         hdr_mask_present(path != GL_PRES_INTERP, lx, ly, lw, lh);
     if (path == GL_PRES_VRAM || path == GL_PRES_WIDE || path == GL_PRES_INTERP)
         postfx_pillar_fill(lx, ly, lw, lh);     /* blurred side bars (opt-in) */
@@ -13818,7 +13822,7 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
     s_sc_gen_read = 1;   /* the real frame's casters (sc_presented) */
     s_hdr_mask_ok = 0;
     if (postfx_active()) postfx_present(0, 0, lx, ly, lw, lh);
-    else if (hdr_boost_wanted()) hdr_mask_present(s_pfx_src_gen, lx, ly, lw, lh);
+    else if (hdr_mask_wanted()) hdr_mask_present(s_pfx_src_gen, lx, ly, lw, lh);
     s_sc_gen_read = 0;
     s_pfx_src_gen = 0;
     postfx_pillar_fill(lx, ly, lw, lh);

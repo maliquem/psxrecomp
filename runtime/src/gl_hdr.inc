@@ -42,7 +42,17 @@
  *     the picture) the boost shrinks by sqrt(area / share), so a flash over the
  *     whole screen does not go to the display's peak;
  *   - a soft shoulder from 80% of the display's peak to the peak, so nothing
- *     clips (also when PSX_HDR_PEAK asks for more than the display has). */
+ *     clips (also when PSX_HDR_PEAK asks for more than the display has).
+ *
+ * Contrast (opt-in, PSX_HDR_CONTRAST 0..1, or PSX_HDR_SHADOWS / PSX_HDR_SCENE
+ * apart): the stops under mid grey (0.18) stretch, more the darker (deeper
+ * shadows, the whole picture: whites stay where they are), and the scenery's
+ * stops over mid grey stretch up to white (bright 3D scenery above the paper
+ * white: the 3D mark with nothing see-through over it, so sprites, text boxes
+ * and the HUD keep the paper white; up to 2^(2.47 x 0.45) = 2.2 x paper at
+ * full). Dynamic: the scenery's lift shrinks while the share it lifts is over
+ * PSX_HDR_SCENE_AREA (30%), and the exposure follows within
+ * PSX_HDR_EXPOSURE_MIN..MAX (0.85..1: a dark scene is not lifted). */
 
 /* Dynamic tone mapping (see above). */
 enum { HDR_DYN_W = 64, HDR_DYN_H = 36 };
@@ -50,6 +60,10 @@ static int    s_hdr_dyn = 0;            /* PSX_HDR_DYNAMIC */
 static float  s_hdr_adapt = 0.5f;       /* PSX_HDR_ADAPT: exposure following, 0..1 */
 static float  s_hdr_area = 0.015f;      /* PSX_HDR_AREA: lifted share with the full boost */
 static float  s_hdr_speed = 0.5f;       /* PSX_HDR_SPEED: seconds (time constant) */
+static float  s_hdr_shadows_v = 0.0f;   /* PSX_HDR_SHADOWS (or _CONTRAST): 0..1 */
+static float  s_hdr_scene_area = 0.3f;  /* PSX_HDR_SCENE_AREA: lifted scenery share with the full lift */
+static float  s_hdr_exp_min = 0.85f, s_hdr_exp_max = 1.0f;   /* PSX_HDR_EXPOSURE_MIN / _MAX */
+static GLint  s_hdr_st_uCon = -1, s_hdr_uCon = -1;
 static GLuint s_hdr_st_prog = 0, s_hdr_ad_prog = 0, s_hdr_st_tex = 0, s_hdr_st_fbo = 0;
 static GLuint s_hdr_ad_tex[2], s_hdr_ad_fbo[2];
 static int    s_hdr_dyn_failed = 0, s_hdr_ad_cur = 0, s_hdr_ad_valid = 0;
@@ -80,6 +94,19 @@ static void hdr_env_once(void) {
     if ((e = getenv("PSX_HDR_ADAPT")) && *e) s_hdr_adapt = (float)atof(e);
     if ((e = getenv("PSX_HDR_AREA")) && *e) s_hdr_area = (float)atof(e);
     if ((e = getenv("PSX_HDR_SPEED")) && *e) s_hdr_speed = (float)atof(e);
+    if ((e = getenv("PSX_HDR_CONTRAST")) && *e) s_hdr_shadows_v = s_hdr_scene_v = (float)atof(e);
+    if ((e = getenv("PSX_HDR_SHADOWS")) && *e) s_hdr_shadows_v = (float)atof(e);
+    if ((e = getenv("PSX_HDR_SCENE")) && *e) s_hdr_scene_v = (float)atof(e);
+    if ((e = getenv("PSX_HDR_SCENE_AREA")) && *e) s_hdr_scene_area = (float)atof(e);
+    if ((e = getenv("PSX_HDR_EXPOSURE_MIN")) && *e) s_hdr_exp_min = (float)atof(e);
+    if ((e = getenv("PSX_HDR_EXPOSURE_MAX")) && *e) s_hdr_exp_max = (float)atof(e);
+    if (!(s_hdr_shadows_v >= 0.0f)) s_hdr_shadows_v = 0.0f;
+    if (s_hdr_shadows_v > 1.0f) s_hdr_shadows_v = 1.0f;
+    if (!(s_hdr_scene_v >= 0.0f)) s_hdr_scene_v = 0.0f;
+    if (s_hdr_scene_v > 1.0f) s_hdr_scene_v = 1.0f;
+    if (!(s_hdr_scene_area > 0.01f)) s_hdr_scene_area = 0.3f;
+    if (!(s_hdr_exp_min > 0.25f) || s_hdr_exp_min > 1.0f) s_hdr_exp_min = 0.85f;
+    if (!(s_hdr_exp_max >= 1.0f) || s_hdr_exp_max > 2.0f) s_hdr_exp_max = 1.0f;
     if (!(s_hdr_adapt >= 0.0f)) s_hdr_adapt = 0.0f;
     if (s_hdr_adapt > 1.0f) s_hdr_adapt = 1.0f;
     if (!(s_hdr_area > 0.0005f)) s_hdr_area = 0.015f;
@@ -182,12 +209,35 @@ static const char *HDR_COMMON =
     "uniform vec4 u_p;\n"          /* paper, peak/paper - 1, boost, knee */
     "uniform int u_gamma;\n"       /* 0: sRGB curve, 1: gamma 2.2 */
     "uniform int u_mr;\n"          /* mask softening radius (px) */
+    "uniform vec4 u_con;\n"       /* contrast: shadow stretch, scenery stretch, exposure max, min */
     "vec3 eotf(vec3 c){\n"
     "  if (u_gamma == 1) return pow(c, vec3(2.2));\n"
     "  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
     "}\n"
+    "float luma(vec3 l){ return dot(l, vec3(0.2126, 0.7152, 0.0722)); }\n"
+    /* deeper shadows: under mid grey the stops stretch, from none at it to
+     * the full stretch 4 stops under it (the whites never move) */
+    "vec3 shadows(vec3 lin){\n"
+    "  float Y = luma(lin);\n"
+    "  if (u_con.x <= 0.0 || Y <= 1e-6) return lin;\n"
+    "  float x = log2(Y / 0.18);\n"
+    "  return x >= 0.0 ? lin : lin * exp2(x * u_con.x * smoothstep(0.0, 4.0, -x));\n"
+    "}\n"
+    /* the scenery a pixel shows: the 3D mark, nothing see-through over it */
+    "float scene_w(ivec2 p){\n"
+    "  if (u_con.y <= 0.0 || u_mrect.z <= 0) return 0.0;\n"
+    "  ivec2 q = p - u_mrect.xy;\n"
+    "  if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, u_mrect.zw))) return 0.0;\n"
+    "  vec4 m = texelFetch(u_mask, q, 0);\n"
+    "  return m.g * (1.0 - m.b);\n"
+    "}\n"
+    /* its stops over mid grey stretch (none at it, the full stretch at white) */
+    "float scene_t(float Y){\n"
+    "  float x = log2(max(Y, 1e-6) / 0.18);\n"
+    "  return x <= 0.0 ? 0.0 : x * smoothstep(0.0, 2.47, x);\n"
+    "}\n"
     "float lift_w(ivec2 p, vec3 c){\n"
-    "  if (u_mrect.z <= 0) return 0.0;\n"
+    "  if (u_mrect.z <= 0 || u_p.z <= 0.0) return 0.0;\n"
     "  ivec2 q = p - u_mrect.xy;\n"
     "  if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, u_mrect.zw))) return 0.0;\n"
     /* a soft mask (3x3 taps u_mr apart): a light's edge fades in */
@@ -206,20 +256,25 @@ static const char *HDR_MAIN =
     "out vec4 o;\n"
     "uniform sampler2D u_state;\n" /* the followed measure (dynamic): log2 light, lifted share */
     "uniform int u_dyn;\n"
-    "uniform vec4 u_dynp;\n"       /* exposure following, full-boost share, display peak (0: none), - */
+    "uniform vec4 u_dynp;\n"       /* exposure following, full-boost share, display peak (0: none), scenery share */
     "uniform int u_dbg;\n"         /* 1: lifted pixels tinted magenta */
     "void main(){\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec3 c = clamp(texelFetch(u_src, p, 0).rgb, 0.0, 1.0);\n"
     "  vec3 lin = eotf(c);\n"
-    "  float paper = u_p.x, peak = (u_p.y + 1.0) * u_p.x, boost = u_p.z;\n"
+    "  float Y = luma(lin);\n"
+    "  lin = shadows(lin);\n"
+    "  float paper = u_p.x, peak = (u_p.y + 1.0) * u_p.x, boost = u_p.z, h = u_con.y;\n"
     "  if (u_dyn == 1) {\n"
     "    vec4 st = texelFetch(u_state, ivec2(0), 0);\n"
-    "    paper = min(paper * clamp(pow(0.18 / exp2(st.r), 0.2 * u_dynp.x), 0.85, 1.3), peak);\n"
+    "    paper = min(paper * clamp(pow(0.18 / exp2(st.r), 0.2 * u_dynp.x), u_con.w, u_con.z), peak);\n"
     "    boost *= min(1.0, sqrt(u_dynp.y / max(st.g, 1e-6)));\n"
+    "    h *= min(1.0, sqrt(u_dynp.w / max(st.a, 1e-6)));\n"
     "  }\n"
     "  float w = boost > 0.0 ? lift_w(p, c) : 0.0;\n"
     "  float g = 1.0 + w * boost * (peak / paper - 1.0);\n"
+    "  float sw = h > 0.0 ? scene_w(p) : 0.0;\n"
+    "  if (sw > 0.0) g = max(g, min(exp2(sw * h * scene_t(Y)), peak / paper));\n"
     "  vec3 r = lin * paper * g;\n"
     /* the shoulder: 80% of the display's peak to its peak, nothing clips */
     "  float M = max(r.r, max(r.g, r.b)), dm = u_dynp.z, ks = 0.8 * dm;\n"
@@ -230,20 +285,21 @@ static const char *HDR_MAIN =
 
 /* The measure, one texel per cell of the picture (4x4 taps): log2 light (a
  * floor of 0.005, so black bars and night do not sink it), lifted share,
- * mean light. */
+ * mean light, the scenery's lifted share (contrast). */
 static const char *HDR_STATS =
     "out vec4 o;\n"
     "uniform ivec4 u_pic;\n"       /* the picture's rect, window px */
     "void main(){\n"
     "  vec2 cell = vec2(u_pic.zw) / vec2(64, 36);\n"
-    "  float sg = 0.0, sw = 0.0, sl = 0.0;\n"
+    "  float sg = 0.0, sw = 0.0, sl = 0.0, sa = 0.0;\n"
     "  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {\n"
     "    ivec2 p = u_pic.xy + ivec2((floor(gl_FragCoord.xy) + (vec2(i, j) + 0.5) * 0.25) * cell);\n"
     "    vec3 c = clamp(texelFetch(u_src, p, 0).rgb, 0.0, 1.0);\n"
-    "    float L = dot(eotf(c), vec3(0.2126, 0.7152, 0.0722));\n"
+    "    float L = luma(eotf(c));\n"
     "    sg += log2(max(L, 0.005)); sw += lift_w(p, c); sl += L;\n"
+    "    sa += scene_w(p) * min(scene_t(L) / 2.47, 1.0);\n"
     "  }\n"
-    "  o = vec4(sg, sw, sl, 16.0) * (1.0 / 16.0);\n"
+    "  o = vec4(sg, sw, sl, sa) * (1.0 / 16.0);\n"
     "}\n";
 
 /* The cells into one texel, followed in time: light at u_k (u_k.y on a cut,
@@ -262,7 +318,8 @@ static const char *HDR_ADAPT =
     "  vec4 q = texelFetch(u_prev, ivec2(0), 0);\n"
     "  if (u_k.x >= 1.0) { o = s; return; }\n"
     "  float kl = abs(s.r - q.r) > 1.5 ? u_k.y : u_k.x;\n"
-    "  o = vec4(mix(q.r, s.r, kl), s.g > q.g ? s.g : mix(q.g, s.g, u_k.x), mix(q.b, s.b, kl), 1.0);\n"
+    "  o = vec4(mix(q.r, s.r, kl), s.g > q.g ? s.g : mix(q.g, s.g, u_k.x), mix(q.b, s.b, kl),\n"
+    "           mix(q.a, s.a, kl));\n"
     "}\n";
 
 /* The scene's lights (sc_presented's glowing pieces, as pfx_lights_update
@@ -374,11 +431,10 @@ static int hdr_lights_build(int lw, int lh) {
 static void hdr_mask_noted(int ok, int lx, int ly, int lw, int lh) {
     s_hdr_mask_ok = ok && s_mask_tex && lw > 0 && lh > 0;
     s_hdr_mrect[0] = lx; s_hdr_mrect[1] = ly; s_hdr_mrect[2] = lw; s_hdr_mrect[3] = lh;
-    s_hdr_lights = s_hdr_mask_ok ? hdr_lights_build(lw, lh) : 0;
-    if (!s_hdr_lm_tex) s_hdr_mask_ok = 0;
+    s_hdr_lights = s_hdr_mask_ok && hdr_boost_wanted() ? hdr_lights_build(lw, lh) : 0;
 }
 
-/* A present with no post-effect chain running: the mask for the boost alone. */
+/* A present with no post-effect chain running: the mask for HDR alone. */
 static void hdr_mask_present(int fresh, int lx, int ly, int lw, int lh) {
     if (!s_ctx || !post_clip_rect(&lx, &ly, &lw, &lh, 8)) {
         s_mask_src_valid = s_mask_ctr_valid = 0;
@@ -416,12 +472,37 @@ static void hdr_probe_take(int ww, int wh, float paper, float peak) {
     float mx = 0.0f;
     uint64_t over = 0;
     const float lim = paper * 1.02f;
+    /* light percentiles over the picture (not its bars): log2 nits -6..12, 0.05 stop */
+    enum { HB = 360 };
+    static uint32_t hist[HB];
+    memset(hist, 0, sizeof hist);
+    int pr[4] = { s_hdr_pic_rect[0], s_hdr_pic_rect[1], s_hdr_pic_rect[2], s_hdr_pic_rect[3] };
+    if (!post_clip_rect(&pr[0], &pr[1], &pr[2], &pr[3], 8)) { pr[0] = pr[1] = 0; pr[2] = ww; pr[3] = wh; }
+    uint64_t hn = 0;
     for (size_t i = 0; i < n; i++) {
         const float r = hdr_h2f(px[i * 4]), g = hdr_h2f(px[i * 4 + 1]), b = hdr_h2f(px[i * 4 + 2]);
         const float m = fmaxf(r, fmaxf(g, b));
-        sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const float Y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        sum += Y;
         if (m > mx) mx = m;
         if (m > lim) over++;
+        const int x = (int)(i % (size_t)ww), y = (int)(i / (size_t)ww);
+        if (x < pr[0] || y < pr[1] || x >= pr[0] + pr[2] || y >= pr[1] + pr[3]) continue;
+        int k = (int)floorf((log2f(fmaxf(Y * 80.0f, 1.0f / 64.0f)) + 6.0f) * 20.0f);
+        hist[k < 0 ? 0 : k >= HB ? HB - 1 : k]++;
+        hn++;
+    }
+    {
+        const float want[4] = { 0.05f, 0.5f, 0.95f, 0.99f };
+        uint64_t acc = 0;
+        int w = 0;
+        for (int k = 0; k < HB && w < 4; k++) {
+            acc += hist[k];
+            while (w < 4 && hn && (double)acc >= want[w] * (double)hn) {
+                s_hdr_probe.pct[w] = exp2f((float)(k + 1) / 20.0f - 6.0f);
+                w++;
+            }
+        }
     }
     s_hdr_probe.max_nits = mx * 80.0f;
     s_hdr_probe.mean_nits = (float)(sum / (double)n * 80.0);
@@ -463,12 +544,14 @@ static void hdr_probe_take(int ww, int wh, float paper, float peak) {
 
 /* Uniforms the measure and the last pass share (HDR_COMMON). */
 static void hdr_common_uniforms(GLint uSrc, GLint uMask, GLint uLmask, GLint uMrect, GLint uP,
-                                GLint uGamma, GLint uMr, int boost, float paper, float peak, int wh) {
+                                GLint uGamma, GLint uMr, GLint uCon, int mask_ok, int boost,
+                                float paper, float peak, int wh) {
     p_glUniform1i(uSrc, 0);
     p_glUniform1i(uMask, 1);
     p_glUniform1i(uLmask, 2);
-    p_glUniform4i(uMrect, s_hdr_mrect[0], s_hdr_mrect[1], boost ? s_hdr_mrect[2] : 0, s_hdr_mrect[3]);
-    p_glUniform4f(uP, paper, peak / paper - 1.0f, s_hdr_boost, s_hdr_knee);
+    p_glUniform4i(uMrect, s_hdr_mrect[0], s_hdr_mrect[1], mask_ok ? s_hdr_mrect[2] : 0, s_hdr_mrect[3]);
+    p_glUniform4f(uP, paper, peak / paper - 1.0f, boost ? s_hdr_boost : 0.0f, s_hdr_knee);
+    p_glUniform4f(uCon, 0.4f * s_hdr_shadows_v, 0.45f * s_hdr_scene_v, s_hdr_exp_max, s_hdr_exp_min);
     p_glUniform1i(uGamma, s_hdr_gamma);
     p_glUniform1i(uMr, wh >= 1080 ? wh / 540 : 1);
 }
@@ -476,7 +559,7 @@ static void hdr_common_uniforms(GLint uSrc, GLint uMask, GLint uLmask, GLint uMr
 /* Dynamic tone mapping: this frame measured (the composed copy on unit 0,
  * the masks on 1 and 2) and followed into s_hdr_ad_tex[s_hdr_ad_cur]. 0 when
  * it cannot run (the last pass then maps as without it). */
-static int hdr_dyn_measure(int ww, int wh, int boost, float paper, float peak) {
+static int hdr_dyn_measure(int ww, int wh, int mask_ok, int boost, float paper, float peak) {
     if (s_hdr_dyn_failed) return 0;
     if (!s_hdr_st_prog) {
         char st[4096], ad[2048];
@@ -500,6 +583,7 @@ static int hdr_dyn_measure(int ww, int wh, int boost, float paper, float peak) {
         s_hdr_st_uGamma = p_glGetUniformLocation(s_hdr_st_prog, "u_gamma");
         s_hdr_st_uMr = p_glGetUniformLocation(s_hdr_st_prog, "u_mr");
         s_hdr_st_uPic = p_glGetUniformLocation(s_hdr_st_prog, "u_pic");
+        s_hdr_st_uCon = p_glGetUniformLocation(s_hdr_st_prog, "u_con");
         s_hdr_ad_uSt = p_glGetUniformLocation(s_hdr_ad_prog, "u_st");
         s_hdr_ad_uPrev = p_glGetUniformLocation(s_hdr_ad_prog, "u_prev");
         s_hdr_ad_uK = p_glGetUniformLocation(s_hdr_ad_prog, "u_k");
@@ -514,7 +598,7 @@ static int hdr_dyn_measure(int ww, int wh, int boost, float paper, float peak) {
     glViewport(0, 0, HDR_DYN_W, HDR_DYN_H);
     p_glUseProgram(s_hdr_st_prog);
     hdr_common_uniforms(s_hdr_st_uSrc, s_hdr_st_uMask, s_hdr_st_uLmask, s_hdr_st_uMrect, s_hdr_st_uP,
-                        s_hdr_st_uGamma, s_hdr_st_uMr, boost, paper, peak, wh);
+                        s_hdr_st_uGamma, s_hdr_st_uMr, s_hdr_st_uCon, mask_ok, boost, paper, peak, wh);
     p_glUniform4i(s_hdr_st_uPic, pic[0], pic[1], pic[2], pic[3]);
     p_glBindVertexArray(s_present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -572,6 +656,7 @@ static void hdr_finish(void) {
         s_hdr_uState = p_glGetUniformLocation(s_hdr_prog, "u_state");
         s_hdr_uDyn = p_glGetUniformLocation(s_hdr_prog, "u_dyn");
         s_hdr_uDynp = p_glGetUniformLocation(s_hdr_prog, "u_dynp");
+        s_hdr_uCon = p_glGetUniformLocation(s_hdr_prog, "u_con");
     }
     if (!s_hdr_fbo || s_hdr_w != ww || s_hdr_h != wh) {
         if (s_hdr_fbo) { p_glDeleteFramebuffers(1, &s_hdr_fbo); glDeleteTextures(1, &s_hdr_tex); }
@@ -597,15 +682,16 @@ static void hdr_finish(void) {
     p_glBlitFramebuffer(0, 0, ww, wh, 0, 0, ww, wh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glViewport(0, 0, ww, wh);
-    const int boost = hdr_display && s_hdr_boost > 0.0f && s_hdr_mask_ok && s_hdr_lights > 0 &&
-                      !s_hdr_overlay && peak > paper;
+    /* the masks: this present's, with no big overlay over the picture */
+    const int mask_ok = hdr_display && s_hdr_mask_ok && !s_hdr_overlay;
+    const int boost = mask_ok && s_hdr_boost > 0.0f && s_hdr_lights > 0 && s_hdr_lm_tex && peak > paper;
     p_glActiveTexture(PSXGL_TEXTURE0 + 2);
     glBindTexture(GL_TEXTURE_2D, boost ? s_hdr_lm_tex : 0);
     p_glActiveTexture(PSXGL_TEXTURE0 + 1);
-    glBindTexture(GL_TEXTURE_2D, boost ? s_mask_tex : 0);
+    glBindTexture(GL_TEXTURE_2D, mask_ok ? s_mask_tex : 0);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_hdr_tex);
-    const int dyn = hdr_display && s_hdr_dyn && hdr_dyn_measure(ww, wh, boost, paper, peak);
+    const int dyn = hdr_display && s_hdr_dyn && hdr_dyn_measure(ww, wh, mask_ok, boost, paper, peak);
     /* the shoulder at the display's own peak: dynamic, or asked for more than it has */
     const float dmax = s_hdr_sdr_white * s_hdr_headroom;
     const float shoulder = hdr_display && (dyn || peak > dmax * 1.001f) ? dmax : 0.0f;
@@ -616,10 +702,11 @@ static void hdr_finish(void) {
     glBindTexture(GL_TEXTURE_2D, dyn ? s_hdr_ad_tex[s_hdr_ad_cur] : 0);
     p_glActiveTexture(PSXGL_TEXTURE0);
     hdr_common_uniforms(s_hdr_uSrc, s_hdr_uMask, s_hdr_uLmask, s_hdr_uMrect, s_hdr_uP,
-                        s_hdr_uGamma, s_hdr_uMr, boost, paper, peak, wh);
+                        s_hdr_uGamma, s_hdr_uMr, s_hdr_uCon, hdr_display ? mask_ok : 0, boost,
+                        paper, peak, wh);
     p_glUniform1i(s_hdr_uState, 3);
     p_glUniform1i(s_hdr_uDyn, dyn);
-    p_glUniform4f(s_hdr_uDynp, s_hdr_adapt, s_hdr_area, shoulder, 0.0f);
+    p_glUniform4f(s_hdr_uDynp, s_hdr_adapt, s_hdr_area, shoulder, s_hdr_scene_area);
     p_glUniform1i(s_hdr_uDbg, s_hdr_debug);
     p_glBindVertexArray(s_present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -641,7 +728,7 @@ static void hdr_finish(void) {
             glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, s_hdr_dyn_state);
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
             pe = fminf(paper * fminf(fmaxf(powf(0.18f / fmaxf(exp2f(s_hdr_dyn_state[0]), 1e-4f),
-                                                0.2f * s_hdr_adapt), 0.85f), 1.3f), peak);
+                                                0.2f * s_hdr_adapt), s_hdr_exp_min), s_hdr_exp_max), peak);
         }
         hdr_probe_take(ww, wh, pe, peak);
     }
@@ -714,6 +801,16 @@ void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float k
     pfx_mask_wanted_update();
 }
 
+void gl_renderer_hdr_set_contrast(float shadows, float scene, float exp_min, float exp_max) {
+    GL_RT_SYNC("hdr_contrast");
+    hdr_env_once();
+    if (shadows >= 0.0f) s_hdr_shadows_v = shadows > 1.0f ? 1.0f : shadows;
+    if (scene >= 0.0f) s_hdr_scene_v = scene > 1.0f ? 1.0f : scene;
+    if (exp_min > 0.25f && exp_min <= 1.0f) s_hdr_exp_min = exp_min;
+    if (exp_max >= 1.0f && exp_max <= 2.0f) s_hdr_exp_max = exp_max;
+    pfx_mask_wanted_update();
+}
+
 int gl_renderer_hdr_json(char *out, size_t cap) {
     return snprintf(out, cap,
         "\"hdr\":{\"wanted\":%d,\"float_buffer\":%d,\"on\":%d,\"display_hdr\":%d,"
@@ -722,19 +819,26 @@ int gl_renderer_hdr_json(char *out, size_t cap) {
         "\"gamma\":\"%s\",\"debug\":%d,\"mask\":%d,\"lights\":%d,\"overlay\":%d,"
         "\"frames\":%llu,\"boosted_frames\":%llu,"
         "\"dynamic\":%d,\"adapt\":%.3f,\"area\":%.4f,\"speed\":%.3f,"
-        "\"followed\":{\"light\":%.4f,\"lifted_share\":%.5f,\"mean_light\":%.4f,\"exposure\":%.3f,\"boost_scale\":%.3f},"
+        "\"shadows\":%.3f,\"scene\":%.3f,\"scene_area\":%.3f,\"exposure_min\":%.3f,\"exposure_max\":%.3f,"
+        "\"followed\":{\"light\":%.4f,\"lifted_share\":%.5f,\"mean_light\":%.4f,\"scene_share\":%.4f,"
+        "\"exposure\":%.3f,\"boost_scale\":%.3f,\"scene_scale\":%.3f},"
         "\"probe\":{\"done\":%d,\"w\":%d,\"h\":%d,\"max_nits\":%.1f,\"mean_nits\":%.2f,"
-        "\"over_paper\":%.5f,\"paper_nits\":%.1f,\"peak_nits\":%.1f,\"png\":%d,\"cost_us\":%.1f}}",
+        "\"over_paper\":%.5f,\"paper_nits\":%.1f,\"peak_nits\":%.1f,\"png\":%d,\"cost_us\":%.1f,"
+        "\"p5_nits\":%.2f,\"p50_nits\":%.1f,\"p95_nits\":%.1f,\"p99_nits\":%.1f,\"contrast_stops\":%.2f}}",
         s_hdr_want > 0, s_hdr_float, s_hdr_on, s_hdr_display,
         s_hdr_sdr_white * 80.0f, s_hdr_headroom, s_hdr_last_paper * 80.0f, s_hdr_last_peak * 80.0f,
         s_hdr_paper_nits, s_hdr_peak_nits, s_hdr_boost, s_hdr_knee,
         s_hdr_gamma ? "2.2" : "srgb", s_hdr_debug, s_hdr_mask_ok, s_hdr_lights, s_hdr_overlay,
         (unsigned long long)s_hdr_frames, (unsigned long long)s_hdr_boosted,
         s_hdr_dyn, s_hdr_adapt, s_hdr_area, s_hdr_speed,
-        exp2f(s_hdr_dyn_state[0]), s_hdr_dyn_state[1], s_hdr_dyn_state[2],
-        fminf(fmaxf(powf(0.18f / fmaxf(exp2f(s_hdr_dyn_state[0]), 1e-4f), 0.2f * s_hdr_adapt), 0.85f), 1.3f),
+        s_hdr_shadows_v, s_hdr_scene_v, s_hdr_scene_area, s_hdr_exp_min, s_hdr_exp_max,
+        exp2f(s_hdr_dyn_state[0]), s_hdr_dyn_state[1], s_hdr_dyn_state[2], s_hdr_dyn_state[3],
+        fminf(fmaxf(powf(0.18f / fmaxf(exp2f(s_hdr_dyn_state[0]), 1e-4f), 0.2f * s_hdr_adapt),
+                    s_hdr_exp_min), s_hdr_exp_max),
         fminf(1.0f, sqrtf(s_hdr_area / fmaxf(s_hdr_dyn_state[1], 1e-6f))),
+        fminf(1.0f, sqrtf(s_hdr_scene_area / fmaxf(s_hdr_dyn_state[3], 1e-6f))),
         s_hdr_probe.done, s_hdr_probe.w, s_hdr_probe.h, s_hdr_probe.max_nits, s_hdr_probe.mean_nits,
         s_hdr_probe.over_paper, s_hdr_probe.paper_nits, s_hdr_probe.peak_nits, s_hdr_probe.written,
-        s_hdr_time_us);
+        s_hdr_time_us, s_hdr_probe.pct[0], s_hdr_probe.pct[1], s_hdr_probe.pct[2], s_hdr_probe.pct[3],
+        s_hdr_probe.pct[0] > 0.0f ? log2f(s_hdr_probe.pct[2] / s_hdr_probe.pct[0]) : 0.0f);
 }

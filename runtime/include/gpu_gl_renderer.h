@@ -335,7 +335,8 @@ void gl_renderer_fmv_enhance_debug(int mask, const char *dump_prefix);
  * lights optionally lifted toward the display's peak (PSX_HDR_BOOST,
  * PSX_HDR_PAPER / PSX_HDR_PEAK nits, PSX_HDR_KNEE, PSX_HDR_GAMMA=2.2;
  * dynamic tone mapping: PSX_HDR_DYNAMIC=1, PSX_HDR_ADAPT, PSX_HDR_AREA,
- * PSX_HDR_SPEED).
+ * PSX_HDR_SPEED, PSX_HDR_EXPOSURE_MIN/_MAX; contrast: PSX_HDR_CONTRAST or
+ * PSX_HDR_SHADOWS / PSX_HDR_SCENE, PSX_HDR_SCENE_AREA).
  * wanted: PSX_HDR asks for it (read before the window exists);
  * window_attributes: the SDL GL attributes for the next window (0 restores). */
 int  gl_renderer_hdr_wanted(void);
@@ -345,6 +346,9 @@ void gl_renderer_hdr_window_attributes(int on);
 void gl_renderer_hdr_set(float boost, float paper_nits, float peak_nits, float knee,
                          int gamma, int debug, int dynamic, float adapt, float area,
                          const char *probe_path);
+/* Contrast (TCP hdr): shadows and scenery 0..1, the dynamic exposure's range;
+ * a negative value keeps the current one. */
+void gl_renderer_hdr_set_contrast(float shadows, float scene, float exp_min, float exp_max);
 int  gl_renderer_hdr_json(char *out, size_t cap);
 void gl_renderer_note_present_depth24(int d24);
 int  gl_renderer_cpu_auth_dual(void);

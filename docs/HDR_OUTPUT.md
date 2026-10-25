@@ -40,6 +40,11 @@ Opt-in and off by default. `PSX_HDR=1` asks for it; with it unset nothing in
 | `PSX_HDR_ADAPT` | 0..1, how much the paper white follows the scene | 0.5 |
 | `PSX_HDR_AREA` | lifted share of the picture that keeps the full boost | 0.015 |
 | `PSX_HDR_SPEED` | following time constant, seconds | 0.5 |
+| `PSX_HDR_EXPOSURE_MIN` / `_MAX` | range of the dynamic exposure | 0.85 / 1.0 |
+| `PSX_HDR_CONTRAST` | 0..1, sets both of the next two | 0 |
+| `PSX_HDR_SHADOWS` | 0..1, deeper shadows (whole picture) | 0 |
+| `PSX_HDR_SCENE` | 0..1, bright 3D scenery over the paper white | 0 |
+| `PSX_HDR_SCENE_AREA` | lifted scenery share that keeps the full lift (dynamic) | 0.3 |
 
 Boost 0 with Windows' paper white is, pixel for pixel, what an SDR window
 shows in HDR mode. On an SDR display the paper white is 1 and nothing is
@@ -71,13 +76,35 @@ last pass reads it directly (no CPU read-back):
 - a soft shoulder (tanh) from 80% of the display's peak to the peak, also
   when `PSX_HDR_PEAK` asks for more than the display has.
 
+## Contrast
+
+In stops around mid grey (0.18 of the paper white), luma-scaled so hues
+stay:
+
+- shadows (whole picture): under mid grey the stops stretch by
+  0.4 × shadows, from none at mid grey to all of it 4 stops under (smoothstep):
+  whites never move, the HUD's darks deepen a little with the rest;
+- scenery: where the 3D mark is and nothing see-through is over it (mask3d
+  green × (1 − blue)), the stops over mid grey stretch by 0.45 × scene, fully
+  at white: 2^(2.47 × 0.45) = 2.2 × paper at 1, capped at the peak; sprites,
+  text boxes and the HUD are not marked and keep the paper white. With the
+  lights' boost the larger of the two gains wins. Dynamic: × min(1,
+  sqrt(scene_area / lifted scenery share)).
+
+Measured (2986x1680, boost 0.6): stops between the 5th and 95th light
+percentile, field 4.95 → 5.85 (0.5) → 6.70 (1); battle 4.50 → 5.10 → 5.75;
+bright sunlit scenery up to ~410 / ~600 nits; HUD unchanged. Cost with
+everything on: 0.46 ms.
+
 ## Debug server
 
 `{"cmd":"hdr"}` reports the state (float buffer, display HDR, SDR white and
 headroom as SDL reports them, paper and peak in use, lights, followed
-measure). Live settings: `boost`, `paper`, `peak`, `knee`, `gamma`, `debug`
+measure). Live settings: `boost`, `paper`, `peak`, `knee`, `gamma`, `debug`,
+`contrast` / `shadows` / `scene`, `exp_min` / `exp_max`
 (1 tints lifted pixels), `dynamic`, `adapt`, `area`. `"probe":"<png>"` reads
-the next finished frame back (half floats): max / mean nits, share over the
+the next finished frame back (half floats): max / mean nits, light percentiles
+(5/50/95/99, contrast in stops), share over the
 paper white, a false-colour PNG at half size (grey = SDR range, yellow to red
 = lifted) and the fenced GPU cost of the pass (`cost_us`; ~0.35-0.45 ms at
 2986x1680 on the GPU above at a low clock).
