@@ -18,6 +18,10 @@ extern "C" {
 
 /* Top-left text toast. duration_ms <= 0 uses 2000. */
 void host_osd_push(const char *msg, int duration_ms);
+/* A title showing the toasts itself (psx_mod_set_osd_handler): push hands
+ * each one to it first; it returns 1 when it took the toast. NULL = none. */
+typedef int (*HostOsdHandler)(const char *msg, int duration_ms);
+void host_osd_set_handler(HostOsdHandler handler);
 
 /* Persistent top-left status text. Passing NULL/empty clears it. */
 void host_osd_set_status(const char *msg);

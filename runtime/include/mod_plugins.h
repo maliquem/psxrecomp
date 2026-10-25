@@ -1222,6 +1222,41 @@ void psx_mod_title_page_redraw(void);
  * show. NULL removes; cleared at each session's activation. */
 void psx_mod_set_title_hud(PSXModCanvasRenderer render);
 void psx_mod_title_hud_redraw(void);
+/* A title's notices (toasts) over everything: the same kind of canvas, drawn
+ * after every effect and over the save state menu, a page and the HUD too
+ * (blended over them), so a notice shows whatever is open. `render` runs
+ * when psx_mod_title_toast_redraw() asked and returns 0 = nothing to show,
+ * 1 = drawn, 2 = drawn and still moving: it runs again at the next present,
+ * also while a menu or page holds the game (no VBlanks then). NULL removes;
+ * cleared at each session's activation. */
+void psx_mod_set_title_toast(PSXModCanvasRenderer render);
+void psx_mod_title_toast_redraw(void);
+/* The framework's own notices (host_osd_push: "Saved slot 1", "Fast
+ * forward: 4x"...) go to `handler` first (main thread): it returns 1 when the
+ * title shows the notice itself (the framework's top-left panel then shows
+ * nothing), 0 to have the framework draw it as usual. Status and diagnostic
+ * rows and the volume bar stay the framework's. NULL restores; cleared at
+ * each session's activation. */
+typedef int (*PSXModOsdHandler)(const char *msg, int duration_ms);
+void psx_mod_set_osd_handler(PSXModOsdHandler handler);
+/* The kind of P1's host controller, for a title's button prompts: the
+ * assigned gamepad's family (PSX_MOD_PAD_KIND_NONE without one). The debug
+ * host layer counts as OTHER; PSX_PAD_KIND=xbox|playstation|nintendo|other|
+ * none overrides it (tests). */
+enum {
+    PSX_MOD_PAD_KIND_NONE = 0,
+    PSX_MOD_PAD_KIND_OTHER = 1,
+    PSX_MOD_PAD_KIND_XBOX = 2,
+    PSX_MOD_PAD_KIND_PLAYSTATION = 3,
+    PSX_MOD_PAD_KIND_NINTENDO = 4
+};
+int psx_mod_host_pad_kind(void);
+/* Write a title's own pixels into VRAM (w x h halfwords, row by row, at x, y;
+ * wraps at the VRAM's edges): an unmasked CPU->VRAM copy done at once, in the
+ * guest's VRAM and the renderer's (render thread too). For small host-side
+ * art (e.g. button icons in a font page) from a VBlank or hook callback; the
+ * pixels are guest state from then on (save states keep them). */
+void psx_mod_vram_write(int x, int y, int w, int h, const uint16_t *px);
 /* Save the next presented picture (with the OSD, a page or HUD, as shown) as
  * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
  * One request at a time: a newer one replaces a pending one. */

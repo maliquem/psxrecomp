@@ -338,14 +338,19 @@ static void sdl_logical_size(SDL_Renderer *renderer, int *lw, int *lh) {
 }
 #endif
 
+static HostOsdHandler s_handler;
+
+void host_osd_set_handler(HostOsdHandler handler) {
+    s_handler = handler;
+}
+
 void host_osd_push(const char *msg, int duration_ms) {
-#if !HOST_OSD_VISUAL
-    (void)msg;
-    (void)duration_ms;
-    return;
-#else
     if (!msg || !msg[0]) return;
     if (duration_ms <= 0) duration_ms = OSD_DEFAULT_MS;
+    if (s_handler && s_handler(msg, duration_ms)) return;   /* the title shows it */
+#if !HOST_OSD_VISUAL
+    return;
+#else
     snprintf(s_msg, sizeof(s_msg), "%s", msg);
     s_expire_ms = SDL_GetTicks() + (Uint32)duration_ms;
     s_active = 1;

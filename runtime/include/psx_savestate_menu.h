@@ -37,6 +37,11 @@ void psx_savestate_menu_set_page(PsxTitleCanvasRenderer page);
 void psx_savestate_menu_page_redraw(void);
 void psx_savestate_menu_set_hud(PsxTitleCanvasRenderer hud);
 void psx_savestate_menu_hud_redraw(void);
+/* A title's notices over all of it (psx_mod_set_title_toast): blended over
+ * the menu's or page's canvas or the HUD, or shown alone; a renderer that
+ * returns 2 is drawn again at the next present. */
+void psx_savestate_menu_set_toast(PsxTitleCanvasRenderer toast);
+void psx_savestate_menu_toast_redraw(void);
 
 #ifdef __cplusplus
 }

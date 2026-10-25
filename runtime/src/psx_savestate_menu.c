@@ -76,6 +76,11 @@ static PsxTitleCanvasRenderer s_page, s_hud;
 static int s_page_dirty, s_page_on;
 static uint32_t *s_hud_canvas;
 static int s_hud_w, s_hud_dirty, s_hud_on;
+/* A title's notices over all of the above (own canvas; s_mix = them blended
+ * over the canvas shown under them). */
+static PsxTitleCanvasRenderer s_toast;
+static uint32_t *s_toast_canvas, *s_mix;
+static int s_toast_w, s_toast_dirty, s_toast_on, s_toast_again;
 
 static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
 {
@@ -322,7 +327,7 @@ void psx_savestate_menu_note_slots_changed(void)
 
 int psx_savestate_menu_needs_present(void)
 {
-    return s_open || s_page;
+    return s_open || s_page || s_toast_on || (s_toast && s_toast_dirty);
 }
 
 void psx_savestate_menu_set_renderer(PsxSaveStateMenuRenderer renderer)
@@ -339,6 +344,7 @@ void psx_savestate_menu_set_window(int w, int h)
     s_dirty = 1;
     s_page_dirty = 1;
     s_hud_dirty = 1;
+    s_toast_dirty = 1;
 }
 
 void psx_savestate_menu_set_page(PsxTitleCanvasRenderer page)
@@ -366,10 +372,22 @@ void psx_savestate_menu_hud_redraw(void)
     s_hud_dirty = 1;
 }
 
+void psx_savestate_menu_set_toast(PsxTitleCanvasRenderer toast)
+{
+    s_toast = toast;
+    s_toast_dirty = 1;
+    if (!toast) s_toast_on = s_toast_again = 0;
+}
+
+void psx_savestate_menu_toast_redraw(void)
+{
+    s_toast_dirty = 1;
+}
+
 int psx_savestate_menu_overlay_blend(void)
 {
     if (s_open) return s_canvas_on;
-    return (s_page && s_page_on) || (!s_page && s_hud_on);
+    return (s_page && s_page_on) || (!s_page && s_hud_on) || s_toast_on;
 }
 
 static int canvas_width(void)
@@ -413,7 +431,8 @@ static int give(const uint32_t *px, int pw, int ph, const uint32_t **pixels, int
     return px != NULL;
 }
 
-int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+/* The menu's, page's or HUD's image, without the notices. */
+static int base_image(const uint32_t **pixels, int *w, int *h)
 {
     if (!s_open) {
         if (s_page) {
@@ -448,4 +467,55 @@ int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
     if (w) *w = SSM_W;
     if (h) *h = SSM_H;
     return 1;
+}
+
+/* The notices' canvas, drawn when asked or while moving (renderer 2). */
+static void toast_update(void)
+{
+    const int cw = canvas_width();
+    int r;
+    if (!s_toast) { s_toast_on = s_toast_again = 0; return; }
+    if (!s_toast_dirty && !s_toast_again && s_toast_w == cw) return;
+    s_toast_dirty = 0;
+    if (!canvas_buffer(&s_toast_canvas)) { s_toast_on = s_toast_again = 0; return; }
+    memset(s_toast_canvas, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    s_toast_w = cw;
+    r = s_toast(s_toast_canvas, cw, SSM_CANVAS_H);
+    s_toast_on = r != 0;
+    s_toast_again = r == 2;
+}
+
+/* Straight-alpha "over": the notices on top of the canvas under them. */
+static void blend_over(uint32_t *dst, const uint32_t *top, const uint32_t *base, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        const uint32_t t = top[i], b = base[i];
+        const uint32_t ta = t >> 24, ba = b >> 24;
+        uint32_t oa, c, out;
+        int sh;
+        if (ta == 255 || !ba) { dst[i] = t; continue; }
+        if (!ta) { dst[i] = b; continue; }
+        oa = ta + ba * (255 - ta) / 255;
+        out = oa << 24;
+        for (sh = 0; sh <= 16; sh += 8) {
+            c = (((t >> sh) & 255) * ta * 255 + ((b >> sh) & 255) * ba * (255 - ta)) / (oa * 255);
+            out |= (c > 255 ? 255 : c) << sh;
+        }
+        dst[i] = out;
+    }
+}
+
+int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+{
+    const uint32_t *bp = NULL;
+    int bw = 0, bh = 0;
+    const int base = base_image(&bp, &bw, &bh);
+    toast_update();
+    if (!s_toast_on) return base ? give(bp, bw, bh, pixels, w, h) : give(NULL, 0, 0, pixels, w, h);
+    if (!base || !bp) return give(s_toast_canvas, s_toast_w, SSM_CANVAS_H, pixels, w, h);
+    /* the framework's own panel (no title canvas) keeps its look */
+    if (bh != SSM_CANVAS_H || bw != s_toast_w || !canvas_buffer(&s_mix)) return give(bp, bw, bh, pixels, w, h);
+    blend_over(s_mix, s_toast_canvas, bp, bw * bh);
+    return give(s_mix, bw, bh, pixels, w, h);
 }

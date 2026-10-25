@@ -9037,6 +9037,20 @@ uint16_t gpu_vram_peek(int x, int y) {
     return gr_vram_read(x, y);
 }
 
+/* psx_mod_vram_write: a title's own pixels, as an unmasked CPU->VRAM copy,
+ * in the guest's VRAM and the renderer's (as shadow_blob_key_put does). */
+void psx_mod_vram_write(int x, int y, int w, int h, const uint16_t *px) {
+    if (!px || w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            const int vx = (x + i) & 1023, vy = (y + j) & 511;
+            const uint16_t c = px[j * w + i];
+            if (vram[vy * 1024 + vx] == c) continue;
+            vram[vy * 1024 + vx] = c;
+            gr_vram_write(vx, vy, c);
+        }
+}
+
 static void gpu_write_gp0_body(uint32_t val) {
     gp0_write_count++;
 
