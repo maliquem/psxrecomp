@@ -73,6 +73,29 @@ float fire_vis(vec3 P, vec4 fl, int li)
         }
     return sum / 25.0;
 }
+// the scenery's depth (SZ, 0 = none) and place in view space, read at the
+// centres of the internal pixels (as sun.glsl)
+vec2 g_nat, g_grid;
+float sz_at(vec2 uv)
+{
+    float d = texture(u_d, (floor(uv * g_grid) + 0.5) / g_grid).r;
+    return d < 0.99999 ? 256.0 / max(1.0 - d, 1e-7) - 256.0 : 0.0;
+}
+vec3 pos_at(vec2 uv, float z) { return vec3((uv - 0.5) * g_nat * z / u_proj.x, z); }
+// Two native pixels along +d from P on its own face, as a step forward (as
+// sun.glsl: the side whose 1/Z runs straightest). The nearest neighbours'
+// difference stepped once per native line on a floor (its depth moves in
+// small steps line by line), which tilted the normal there: a thin dark
+// line across the firelit floor on every native line.
+vec3 face_step(vec2 uv0, vec3 P, float z, vec2 d)
+{
+    float f1 = sz_at(uv0 + d), f2 = sz_at(uv0 + 2.0 * d);
+    float b1 = sz_at(uv0 - d), b2 = sz_at(uv0 - 2.0 * d);
+    float ef = (f1 > 0.0 && f2 > 0.0) ? abs(1.0 / f2 - 2.0 / f1 + 1.0 / z) : 1e9;
+    float eb = (b1 > 0.0 && b2 > 0.0) ? abs(1.0 / b2 - 2.0 / b1 + 1.0 / z) : 1e9;
+    if (ef >= 1e9 && eb >= 1e9) return vec3(d * g_nat * z / u_proj.x * 2.0, 0.0);   // alone: facing the camera
+    return ef <= eb ? pos_at(uv0 + 2.0 * d, f2) - P : P - pos_at(uv0 - 2.0 * d, b2);
+}
 // light li at P with normal n (n 0: a sprite, facing all ways): x = how much
 // reaches it, y = how much would but something stands in the way (its shadow);
 // k: its size (1 = a campfire's), its reach fl.w * k (the map's depth: fl.w)
@@ -103,16 +126,22 @@ void main()
     vec2 fire = vec2(0.0);
     vec3 firec = vec3(0.0);   // the lights' colours, each by how much of it reaches here
     if (u_flmap.y > 0.0 && (m > 0.5 || is_spr)) {
-        vec2 nat = vec2(u_proj.y * u_size.x / u_size.y, u_proj.y);
+        g_nat = vec2(u_proj.y * u_size.x / u_size.y, u_proj.y);
+        g_grid = g_nat * max(u_proj.z, 1.0);
         float z = zs;
         if (!is_spr) {
             float dd = texelFetch(u_d, p, 0).r;
             z = dd < 0.99999 ? 256.0 / max(1.0 - dd, 1e-7) - 256.0 : 0.0;
         }
         if (z > 0.0) {
-            vec3 P = vec3((v_uv - 0.5) * nat * z / u_proj.x, z);
-            vec3 n = is_spr ? vec3(0.0) : normalize(cross(dFdx(P), dFdy(P)));
-            if (!is_spr && dot(n, P) > 0.0) n = -n;   // face the camera, along its ray
+            vec3 P = pos_at(v_uv, z);
+            vec3 n = vec3(0.0);
+            if (!is_spr) {
+                vec2 p1 = 1.0 / g_nat;
+                n = normalize(cross(face_step(v_uv, P, z, vec2(p1.x, 0.0)),
+                                    face_step(v_uv, P, z, vec2(0.0, p1.y))) + vec3(0.0, 0.0, -1e-6));
+                if (dot(n, P) > 0.0) n = -n;   // face the camera, along its ray
+            }
             vec2 f0 = fire_light(P, n, u_fl0, 0, u_flc0.w), f1 = vec2(0.0);
             if (u_flmap.y > 1.0) f1 = fire_light(P, n, u_fl1, 1, u_flc1.w);
             fire = f0 + f1;
