@@ -9504,13 +9504,21 @@ static void handle_host_key(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":%s}", id, ok ? "true" : "false");
 }
 
-/* host_mouse x=<pt> y=<pt> [wheel=<steps>]: click (or scroll) at a window point. */
-extern int psx_debug_push_host_mouse(float x, float y, int wheel);
+/* host_mouse x=<pt> y=<pt> [wheel=<steps>] [button=left|middle|right]
+ * [action=click|down|up|move]: at a window point, a click (default: left),
+ * a press or release alone, only the move, or a wheel step. */
+extern int psx_debug_push_host_mouse_ex(float x, float y, float wheel, int button, int action);
 static void handle_host_mouse(int id, const char *json)
 {
-    int ok = psx_debug_push_host_mouse((float)json_get_int(json, "x", 0),
-                                       (float)json_get_int(json, "y", 0),
-                                       json_get_int(json, "wheel", 0));
+    char b[16] = "left", a[16] = "click";
+    (void)json_get_str(json, "button", b, sizeof(b));
+    (void)json_get_str(json, "action", a, sizeof(a));
+    const int button = strcmp(b, "right") == 0 ? 3 : strcmp(b, "middle") == 0 ? 2 : 1;
+    const int action = strcmp(a, "down") == 0 ? 1 : strcmp(a, "up") == 0 ? 2 :
+                       strcmp(a, "move") == 0 ? 3 : 0;
+    int ok = psx_debug_push_host_mouse_ex((float)json_get_int(json, "x", 0),
+                                          (float)json_get_int(json, "y", 0),
+                                          (float)json_get_int(json, "wheel", 0), button, action);
     send_fmt("{\"id\":%d,\"ok\":%s}", id, ok ? "true" : "false");
 }
 
