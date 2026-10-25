@@ -168,6 +168,10 @@ void psx_mod_set_overdraw(int x, int y);
  * culls by itself near the edges and cleared (0, 0) after it. Returns 1 while
  * the overdraw is on (the extra applies), else 0. */
 int psx_mod_set_overdraw_extra(int x, int y);
+/* The share of the band (the overdraw, not the extra) in use, of 16: 16 =
+ * whole (the default), 0 = none while it stays on. For a title whose game
+ * runs out of frame time drawing it (its frame rate drops). */
+void psx_mod_set_overdraw_share(int of16);
 /* The GTE data registers (COP2 0..31) as the guest left them. Read-only;
  * returns 0 before the CPU is bound. */
 int psx_mod_gte_data(uint32_t out[32]);

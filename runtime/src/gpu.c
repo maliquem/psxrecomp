@@ -759,9 +759,17 @@ int gpu_set_overdraw_extra(int x, int y) {
 }
 int psx_overdraw_x(void) { return ws_overdraw_x; }
 int psx_overdraw_y(void) { return ws_overdraw_y; }
+/* The share of the band in use, of 16 (psx_mod_set_overdraw_share): a title
+ * that sees its game run out of frame time while drawing the band (more
+ * polygons pass its culls) narrows it. 16 = the whole band (the default). */
+static int ws_overdraw_share = 16;
+void gpu_set_overdraw_share(int of16) { ws_overdraw_share = of16 < 0 ? 0 : of16 > 16 ? 16 : of16; }
+static int ws_od_base(int axis) {
+    return (axis ? ws_overdraw_y : ws_overdraw_x) * ws_overdraw_share / 16;
+}
 /* the band the culls keep now: the overdraw and, while it is on, the extra */
 static int ws_od(int axis) {
-    const int base = axis ? ws_overdraw_y : ws_overdraw_x;
+    const int base = ws_od_base(axis);
     return (ws_overdraw_x || ws_overdraw_y) ? base + (axis ? ws_overdraw_ey : ws_overdraw_ex) : base;
 }
 int psx_overdraw_axis(int axis) { return ws_od(axis); }
@@ -769,7 +777,7 @@ static int ws_cull_xm(void) { return psx_ws_x_margin() + ws_od(0); }
 /* the band the GPU keeps (draw_area_out_poly): the overdraw and the last extra
  * asked for in the last few VBlanks */
 static int ws_od_gpu(int axis) {
-    const int base = axis ? ws_overdraw_y : ws_overdraw_x;
+    const int base = ws_od_base(axis);
     if (!ws_overdraw_x && !ws_overdraw_y) return base;
     if ((uint32_t)s_frame_count - ws_overdraw_lframe > 8u) return base;
     return base + (axis ? ws_overdraw_ly : ws_overdraw_lx);

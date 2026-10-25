@@ -433,6 +433,7 @@ int  psx_ws_is_cull_h_imm(uint32_t imm);
 void gpu_set_overdraw(int x, int y);
 int  gpu_set_overdraw_extra(int x, int y);   /* more, for part of a frame, while it is on (returns on) */
 int  psx_overdraw_x(void);
+void gpu_set_overdraw_share(int of16);   /* the band in use, of 16 (16 = whole) */
 int  psx_overdraw_y(void);
 int  psx_overdraw_axis(int axis);   /* 0 = X, 1 = Y (overlay callback) */
 /* [video.shadow] (config_loader.h): camera 1 = from the GTE at each VBlank,
