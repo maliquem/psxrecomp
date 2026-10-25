@@ -1205,6 +1205,23 @@ void psx_mod_title_page_redraw(void);
  * show. NULL removes; cleared at each session's activation. */
 void psx_mod_set_title_hud(PSXModCanvasRenderer render);
 void psx_mod_title_hud_redraw(void);
+/* A title's notices (toasts) over everything: the same kind of canvas, drawn
+ * after every effect and over the save state menu, a page and the HUD too
+ * (blended over them), so a notice shows whatever is open. `render` runs
+ * when psx_mod_title_toast_redraw() asked and returns 0 = nothing to show,
+ * 1 = drawn, 2 = drawn and still moving: it runs again at the next present,
+ * also while a menu or page holds the game (no VBlanks then). NULL removes;
+ * cleared at each session's activation. */
+void psx_mod_set_title_toast(PSXModCanvasRenderer render);
+void psx_mod_title_toast_redraw(void);
+/* The framework's own notices (host_osd_push: "Saved slot 1", "Fast
+ * forward: 4x"...) go to `handler` first (main thread): it returns 1 when the
+ * title shows the notice itself (the framework's top-left panel then shows
+ * nothing), 0 to have the framework draw it as usual. Status and diagnostic
+ * rows and the volume bar stay the framework's. NULL restores; cleared at
+ * each session's activation. */
+typedef int (*PSXModOsdHandler)(const char *msg, int duration_ms);
+void psx_mod_set_osd_handler(PSXModOsdHandler handler);
 /* Save the next presented picture (with the OSD, a page or HUD, as shown) as
  * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
  * One request at a time: a newer one replaces a pending one. */

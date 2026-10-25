@@ -8926,6 +8926,9 @@ extern "C" int psx_mod_title_page_open(void) { return g_title_page_open; }
 extern "C" void psx_mod_title_page_redraw(void) { psx_savestate_menu_page_redraw(); }
 extern "C" void psx_mod_set_title_hud(PSXModCanvasRenderer render) { psx_savestate_menu_set_hud(render); }
 extern "C" void psx_mod_title_hud_redraw(void) { psx_savestate_menu_hud_redraw(); }
+extern "C" void psx_mod_set_title_toast(PSXModCanvasRenderer render) { psx_savestate_menu_set_toast(render); }
+extern "C" void psx_mod_title_toast_redraw(void) { psx_savestate_menu_toast_redraw(); }
+extern "C" void psx_mod_set_osd_handler(PSXModOsdHandler handler) { host_osd_set_handler(handler); }
 extern "C" int psx_mod_request_screenshot(const char* path) { return present_shot_request(path); }
 
 /* P1's controller as PSX_MOD_PAGE_* bits (the debug host layer too). */
@@ -9502,6 +9505,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_local_mouse_begin(sdl_window, local_mouse_live(override));
         if (!drain_host_events()) return ep;
         host_pause_service();
+        {
+            int ww = 0, wh = 0;   /* a title's HUD and notices follow the window's aspect in play too */
+            if (sdl_window) SDL_GetWindowSize(sdl_window, &ww, &wh);
+            psx_savestate_menu_set_window(ww, wh);
+        }
         savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
         fast_forward_toggle_poll_buttons();
@@ -20510,6 +20518,8 @@ int main(int argc, char** argv) {
         g_mod_fast_forward_speed = 0;
         title_page_close();
         psx_savestate_menu_set_hud(nullptr);
+        psx_savestate_menu_set_toast(nullptr);
+        host_osd_set_handler(nullptr);
         debug_server_set_restricted(0);
         psx_savestate_menu_set_renderer(nullptr);
         for (auto& policy : g_mod_controller_policy)
