@@ -234,6 +234,11 @@ void  gl_renderer_shadow_point(const float v[3]);
 /* 1 while a fire light (a steady glow the game draws) casts shadows. */
 int   gl_renderer_fire_casting(void);
 int   gl_renderer_shadow_sprites_wanted(void);   /* a chain reads `sprite` */
+/* The sun of the last shadow map built (render thread, read anywhere): its
+ * elevation in degrees (the area's own, the night's move included) and
+ * whether the scenery casts (0: the sprites' shadows alone, u_ss.y 0).
+ * 0 until a map was built. */
+int   gl_renderer_shadow_sun_info(float *elevation_deg, int *scenery);
 /* The scene's static geometry in world space (a game mod reads it from the
  * game's own map data): n triangles x 9 floats (x, y, z per corner, the
  * coordinates the game feeds the GTE). While set, and the picture's camera is

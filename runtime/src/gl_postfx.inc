@@ -1536,6 +1536,15 @@ static void pfx_sm_init(void) {
     for (GLuint k = 0; k < 4; k++) p_glEnableVertexAttribArray(k);
     p_glBindVertexArray(0);
 }
+/* The last shadow build's sun (gl_renderer_shadow_sun_info). */
+static _Atomic int      s_sun_el_x100 = -1, s_sun_scenery = 0;
+static _Atomic unsigned s_sun_info_at = 0;
+int gl_renderer_shadow_sun_info(float *elevation_deg, int *scenery) {
+    const int el = atomic_load_explicit(&s_sun_el_x100, memory_order_relaxed);
+    if (scenery) *scenery = atomic_load_explicit(&s_sun_scenery, memory_order_relaxed);
+    if (elevation_deg) *elevation_deg = el < 0 ? 0.0f : (float)el / 100.0f;
+    return el >= 0 && atomic_load_explicit(&s_sun_info_at, memory_order_relaxed) != 0;
+}
 static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     if (!s_sm_tex) pfx_sm_init();
     memset(s_sm_u, 0, sizeof s_sm_u);
@@ -1558,6 +1567,12 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     const float *sun = pfx_pass_uniform(ps, "u_sun");
     float area_sun[2];   /* [video.shadow] sun_areas: this area's own sun */
     if (sun && gpu_shadow_sun_area(&area_sun[0], &area_sun[1])) sun = area_sun;
+    {   /* published for the emulation thread (gl_renderer_shadow_sun_info):
+         * whether the scenery casts (u_ss.y), the sun's elevation (below,
+         * after the night's move toward the moon) */
+        const float *ss = pfx_pass_uniform(ps, "u_ss");
+        atomic_store_explicit(&s_sun_scenery, !(ss && ss[1] < 0.5f), memory_order_relaxed);
+    }
     float night_sun[2];  /* gl_renderer_set_night: that far toward the pass's moon (u_moon) */
     {
         const float *moon = pfx_pass_uniform(ps, "u_moon");
@@ -1567,6 +1582,8 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
             sun = night_sun;
         }
     }
+    atomic_store_explicit(&s_sun_el_x100, sun ? (int)(sun[1] * 100.0f) : -1, memory_order_relaxed);
+    atomic_store_explicit(&s_sun_info_at, (unsigned)s_pfx_presents, memory_order_relaxed);
     const float H = proj ? proj[0] : 0.0f;
     float L[3] = {dir ? dir[0] : 0.0f, dir ? dir[1] : 0.0f, dir ? dir[2] : 0.0f};
     float Ls[3] = {L[0], L[1], L[2]};   /* the sprites' light (u_sprsun) */
