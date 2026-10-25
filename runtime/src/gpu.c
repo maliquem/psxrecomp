@@ -3438,6 +3438,7 @@ static int ws_bg_phase_over(void) {
 }
 
 static int ws_tagged_world_primitive(void);
+static int bdi_gate(int marked);   /* backdrop images, with the linked-list pre-pass */
 int psx_ws_prim_in_backdrop(void) {
     /* Explicit title proof is independent of heuristic draw-order phases. */
     if (ws_nw_explicit_background()) return 1;
@@ -3463,11 +3464,32 @@ int psx_ws_prim_in_backdrop(void) {
                 ws_prim_pred_stamp = f;
                 return r == GPU_WS_WIDE_PRIM_STRETCH ? 4 : 3;
             }
+            if (r == GPU_WS_WIDE_PRIM_IMAGE) {
+                /* the backdrop-image rule (unmarked), else the stretch as before */
+                const int g = bdi_gate(0);
+                if (g >= 0) {
+                    if (g) ws_prim_pred_stamp = f;
+                    return g;
+                }
+                if (op > 0x3Fu) return 0;
+                ws_prim_pred_stamp = f;
+                return 4;
+            }
         }
     }
     /* Explicit title provenance outranks the legacy draw-order heuristic.
      * Early-sorted world sprites must not be stretched into the reveal. */
     if (ws_tagged_world_primitive()) return 0;
+    /* a backdrop image (gpu_ws_set_backdrop_images): as it is, or stretched by what
+     * it needs; marked as a painted backdrop while a 3D world is drawn */
+    {
+        const uint32_t f = (uint32_t)s_frame_count;
+        const int g = bdi_gate(f - ws_last_3d_stamp <= 2u);
+        if (g >= 0) {
+            if (g) ws_prim_pred_stamp = f;
+            return g;
+        }
+    }
     if (ws_nw_textured_edges) {
         uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
         if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
@@ -7255,7 +7277,10 @@ static int ws_ui_attached(const WsUiPrepassItem *a, const WsUiPrepassItem *b) {
     return gap <= WS_UI_GROUP_STACK_GAP;
 }
 
+static void bdi_prepass(uint32_t start_addr);   /* backdrop images, below */
+
 void gpu_ws_prepass_linked_list(uint32_t start_addr) {
+    bdi_prepass(start_addr);
     ws_ui_prepass_count = 0;
     ws_ui_prepass_nodes_reset();
     ws_ui_prepass_rank = 0xFFFFu;
@@ -7530,6 +7555,673 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
             }
         }
     }
+}
+
+/* ---- Backdrop images (native-wide; gpu_ws_set_backdrop_images) -------------
+ * What a frame draws before its first shaded polygon (the backdrop phase: a
+ * cutscene's painted sky, a 2D screen's background) is split into images:
+ * the textured primitives of one CLUT, or laid side by side over the same
+ * rows; untextured ones that follow each other and touch. An image's
+ * primitives whose rows overlap make a band (a sky's top drawn over its
+ * panorama in the same palette is another band). A picture whose bands all
+ * stop at the screen's edges (a menu's background in tiles) is decided as a
+ * whole; when one of its bands runs past the wide edge (a panorama), each
+ * band is decided on its own. Each image, or band, on each side where the
+ * wide view shows more than the picture:
+ *   - reaching past the wide edge: drawn as it is (a panorama's own pixels);
+ *   - ending inside the revealed band (at the picture's edge, or a panorama
+ *     at the end of its pan): an edge that is mostly one colour goes on into
+ *     the band, each row in the edge's colour on that row (the margin filled
+ *     at the image's place in the draw order, so what is drawn after it
+ *     stays on top); an edge with art
+ *     stretches the image about the picture's centre by just what it needs;
+ *   - short of the picture's edge: left alone.
+ * Decided by a pass over the linked list before any of it is drawn; render
+ * only (guest VRAM and the 4:3 picture untouched). */
+#define BDI_SLOTS   2048u                  /* primitive lookup (power of two) */
+#define BDI_PRIMS   512
+#define BDI_IMAGES  128
+#define BDI_SAMPLES 96
+typedef struct {
+    uint8_t op;
+    uint16_t tpage, clut;
+    int n;                                 /* vertices */
+    int32_t x[4], y[4];
+    int u[4], v[4];
+    uint32_t col[4];
+    int img;                               /* its band (after the split; before: its image) */
+    uint32_t key;
+} BdiPrim;
+typedef struct {
+    int32_t x0, x1, y0, y1;                /* raw drawing space */
+    uint32_t first_key;
+    uint8_t textured, semi;
+    uint16_t clut;
+    uint8_t q;                             /* stretch: 0 none, 1..255 of the full one */
+    uint8_t fill_sides, filled;
+    uint16_t fill_col[2];
+    int16_t parent;                        /* a band's image */
+    uint8_t wrap_sides;                    /* sides where tiles seen beyond its end are drawn */
+} BdiImage;
+static int s_bdi_env = -1;                 /* PSX_NW_BACKDROP_IMAGES: 0 / 1 wins, 2 none */
+static int s_bdi_on = 0;                   /* gpu_ws_set_backdrop_images */
+static int s_bdi_valid = 0;
+static uint32_t s_bdi_key[BDI_SLOTS];
+static int16_t s_bdi_slot_img[BDI_SLOTS];
+static BdiPrim s_bdi_prim[BDI_PRIMS];
+static BdiImage s_bdi_img[BDI_IMAGES];     /* bands (after the split) */
+static BdiImage s_bdi_par[BDI_IMAGES];     /* the images the bands come from */
+static int s_bdi_nprim, s_bdi_nimg, s_bdi_npar;
+#define BDI_RUNS 2048
+typedef struct {                           /* a filled side's rows of one colour */
+    int16_t img;
+    uint8_t right;
+    int32_t y0, y1;                        /* raw drawing space, end exclusive */
+    uint16_t col;
+} BdiRun;
+static BdiRun s_bdi_run[BDI_RUNS];
+static int s_bdi_nrun;
+/* A looping panorama of tiles (a sky the game lays out again every tile it
+ * scrolls) leaves, after each relayout, a gap at one end that 4:3 never
+ * shows: which tile was seen beside which is remembered, and the tile seen
+ * beyond the end is drawn in the gap at its own size. */
+typedef struct {
+    uint16_t tpage, clut;
+    int16_t u, v, w, h;
+} BdiTile;
+typedef struct {
+    BdiTile t, nb[2];                      /* the tile seen to its left, to its right */
+    uint8_t has[2];
+    uint32_t seen;
+} BdiTileMem;
+#define BDI_TILE_MEM 32
+static BdiTileMem s_bdi_tiles[BDI_TILE_MEM];
+typedef struct {                           /* a tile drawn in a band's gap */
+    int16_t img;
+    uint8_t op;
+    int32_t x, y;
+    BdiTile t;
+    uint32_t col;
+} BdiWrap;
+#define BDI_WRAPS 16
+static BdiWrap s_bdi_wrap[BDI_WRAPS];
+static int s_bdi_nwrap;
+static uint32_t s_bdi_stat[4];             /* images: as is, filled, stretched, prims looked up */
+
+void gpu_ws_set_backdrop_images(int on) { s_bdi_on = on ? 1 : 0; }
+
+static int bdi_enabled(void) {
+    if (s_bdi_env < 0) {
+        const char *e = getenv("PSX_NW_BACKDROP_IMAGES");
+        s_bdi_env = e && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : 2;
+    }
+    return s_bdi_env == 2 ? s_bdi_on : s_bdi_env;
+}
+
+static int bdi_find(uint32_t cmd_addr) {
+    if (!s_bdi_valid || cmd_addr == 0xFFFFFFFFu) return -1;
+    const uint32_t key = GPU_RAM_KEY(cmd_addr);
+    for (uint32_t i = 0, h = (key >> 2) * 2654435761u >> 21; i < 16; i++) {
+        const uint32_t s = (h + i) & (BDI_SLOTS - 1u);
+        if (s_bdi_slot_img[s] < 0) return -1;
+        if (s_bdi_key[s] == key) return s_bdi_slot_img[s];
+    }
+    return -1;
+}
+
+static void bdi_insert(uint32_t key, int img) {
+    for (uint32_t i = 0, h = (key >> 2) * 2654435761u >> 21; i < 16; i++) {
+        const uint32_t s = (h + i) & (BDI_SLOTS - 1u);
+        if (s_bdi_slot_img[s] < 0 || s_bdi_key[s] == key) {
+            s_bdi_key[s] = key;
+            s_bdi_slot_img[s] = (int16_t)img;
+            return;
+        }
+    }
+}
+
+/* One texel as BGR555 with its stp bit, 0 = transparent. */
+static uint16_t bdi_texel(uint16_t tpage, uint16_t clut, int u, int v) {
+    const int depth = (tpage >> 7) & 3, bx = (tpage & 15) * 64, by = ((tpage >> 4) & 1) * 256;
+    const int cx = (clut & 63) * 16, cy = (clut >> 6) & 511;
+    u &= 255; v &= 255;
+    if (depth == 0)
+        return vram[cy * 1024 + ((cx + ((vram[(by + v) * 1024 + ((bx + (u >> 2)) & 1023)] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+    if (depth == 1)
+        return vram[cy * 1024 + ((cx + ((vram[(by + v) * 1024 + ((bx + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+    return vram[(by + v) * 1024 + ((bx + u) & 1023)];
+}
+
+/* A sample's colour (BGR555, no stp) as drawn: the texel times the vertex
+ * colour (0x80 = 1.0) unless raw; untextured: the vertex colour. */
+static int bdi_colour(const BdiPrim *p, int u, int v, uint32_t col, uint16_t *out) {
+    int r, g, b;
+    if (p->op & 0x04u) {
+        const uint16_t t = bdi_texel(p->tpage, p->clut, u, v);
+        if (!t) return 0;                   /* transparent */
+        r = t & 31; g = (t >> 5) & 31; b = (t >> 10) & 31;
+        if (!(p->op & 0x01u)) {
+            r = r * (int)(col & 0xFF) / 128; g = g * (int)((col >> 8) & 0xFF) / 128;
+            b = b * (int)((col >> 16) & 0xFF) / 128;
+            if (r > 31) r = 31; if (g > 31) g = 31; if (b > 31) b = 31;
+        }
+    } else {
+        r = (int)(col & 0xFF) >> 3; g = (int)((col >> 8) & 0xFF) >> 3; b = (int)((col >> 16) & 0xFF) >> 3;
+    }
+    *out = (uint16_t)(r | g << 5 | b << 10);
+    return 1;
+}
+
+/* One side of a band (whole: of an image, all its bands): its edge (the
+ * primitives at that extreme, each by the two vertices furthest that way: a
+ * slanted edge, a perspective plane whose top row is narrower, counts by its
+ * innermost point) and the strip along it, the outermost texels and a few
+ * texels in. *edge: that innermost x of the edge (left: the largest, right:
+ * the smallest). */
+static int bdi_side_samples(int img, int whole, int right, uint16_t *smp, int32_t *edge) {
+    const BdiImage *im = whole ? &s_bdi_par[img] : &s_bdi_img[img];
+    int n = 0;
+    *edge = right ? im->x1 : im->x0;
+    for (int i = 0; i < s_bdi_nprim; i++) {
+        const BdiPrim *p = &s_bdi_prim[i];
+        if ((whole ? s_bdi_img[p->img].parent : p->img) != img || p->n < 2) continue;
+        /* a, b: the two vertices furthest to that side */
+        int a = 0;
+        for (int k = 1; k < p->n; k++) if (right ? p->x[k] > p->x[a] : p->x[k] < p->x[a]) a = k;
+        int b = a == 0 ? 1 : 0;
+        for (int k = 0; k < p->n; k++) if (k != a && (right ? p->x[k] > p->x[b] : p->x[k] < p->x[b])) b = k;
+        if (right ? p->x[a] < im->x1 - 2 : p->x[a] > im->x0 + 2) continue;   /* not at that extreme */
+        if (right ? p->x[b] < *edge : p->x[b] > *edge) *edge = p->x[b];
+        if (n >= BDI_SAMPLES - 16) continue;
+        int o = -1;   /* a vertex off the edge, for the texels in */
+        for (int k = 0; k < p->n; k++) if (k != a && k != b) { o = k; break; }
+        const int du = o >= 0 && p->u[o] != p->u[a] ? (p->u[o] > p->u[a] ? 4 : -4) : 0;
+        for (int s = 0; s < 8; s++) {
+            const float t = (s + 0.5f) / 8.0f;
+            const int u = p->u[a] + (int)((p->u[b] - p->u[a]) * t), v = p->v[a] + (int)((p->v[b] - p->v[a]) * t);
+            const uint32_t col = p->col[a];
+            if (bdi_colour(p, u, v, col, &smp[n])) n++;
+            if (du && bdi_colour(p, u + du, v, col, &smp[n])) n++;
+        }
+    }
+    return n;
+}
+
+/* Mostly one colour: the colour most samples sit within 1 level of, when at
+ * least 90% do (a dark edge with a faint pattern is art, not a flat colour). */
+static int bdi_flat(const uint16_t *smp, int n, uint16_t *mode) {
+    if (n < 6) return 0;
+    int best = -1, best_n = 0;
+    for (int i = 0; i < n; i++) {
+        const int r = smp[i] & 31, g = (smp[i] >> 5) & 31, b = (smp[i] >> 10) & 31;
+        int c = 0;
+        for (int j = 0; j < n; j++) {
+            const int dr = (smp[j] & 31) - r, dg = ((smp[j] >> 5) & 31) - g, db = ((smp[j] >> 10) & 31) - b;
+            if (dr <= 1 && dr >= -1 && dg <= 1 && dg >= -1 && db <= 1 && db >= -1) c++;
+        }
+        if (c > best_n) { best_n = c; best = i; }
+    }
+    if (best < 0 || best_n * 100 < n * 90) return 0;
+    *mode = smp[best];
+    return 1;
+}
+
+static void bdi_prim_parse(const uint32_t *w, uint8_t op, uint16_t tpage, BdiPrim *p) {
+    p->op = op; p->tpage = tpage; p->clut = 0; p->n = 0;
+    if (op >= 0x20u && op <= 0x3Fu) {
+        const int quad = (op & 0x08u) != 0, tex = (op & 0x04u) != 0, gour = (op & 0x10u) != 0;
+        int idx = 1;   /* w[0]: command and first colour; then per vertex [colour], xy, [uv] */
+        p->n = quad ? 4 : 3;
+        uint32_t col = w[0] & 0xFFFFFFu;
+        for (int i = 0; i < p->n; i++) {
+            if (i > 0 && gour) col = w[idx++] & 0xFFFFFFu;
+            p->col[i] = col;
+            p->x[i] = sign_extend(w[idx] & 0x7FFu, 11);
+            p->y[i] = sign_extend((w[idx] >> 16) & 0x7FFu, 11);
+            idx++;
+            if (tex) {
+                p->u[i] = (int)(w[idx] & 0xFF); p->v[i] = (int)((w[idx] >> 8) & 0xFF);
+                if (i == 0) p->clut = (uint16_t)(w[idx] >> 16);
+                if (i == 1) p->tpage = (uint16_t)(w[idx] >> 16);
+                idx++;
+            } else {
+                p->u[i] = p->v[i] = 0;
+            }
+        }
+        return;
+    }
+    /* rectangle: a quad with the texture laid flat */
+    const int tex = (op & 0x04u) != 0, sz = (op >> 3) & 3;
+    const int32_t x = sign_extend(w[1] & 0x7FFu, 11), y = sign_extend((w[1] >> 16) & 0x7FFu, 11);
+    int ww, hh;
+    if (sz == 0) { const uint32_t wh = w[tex ? 3 : 2]; ww = (int)(wh & 0x3FF); hh = (int)((wh >> 16) & 0x1FF); }
+    else ww = hh = sz == 1 ? 1 : sz == 2 ? 8 : 16;
+    const int u = tex ? (int)(w[2] & 0xFF) : 0, v = tex ? (int)((w[2] >> 8) & 0xFF) : 0;
+    if (tex) p->clut = (uint16_t)(w[2] >> 16);
+    p->n = 4;
+    for (int i = 0; i < 4; i++) {
+        p->x[i] = x + ((i & 1) ? ww - 1 : 0);
+        p->y[i] = y + ((i & 2) ? hh - 1 : 0);
+        p->u[i] = u + ((i & 1) ? ww - 1 : 0);
+        p->v[i] = v + ((i & 2) ? hh - 1 : 0);
+        p->col[i] = w[0] & 0xFFFFFFu;
+    }
+}
+
+static void bdi_prim_rows(const BdiPrim *p, int32_t *y0, int32_t *y1) {
+    *y0 = *y1 = p->y[0];
+    for (int k = 1; k < p->n; k++) {
+        if (p->y[k] < *y0) *y0 = p->y[k];
+        if (p->y[k] > *y1) *y1 = p->y[k];
+    }
+}
+
+/* Each image into bands: its primitives whose rows overlap (by more than a
+ * row: pieces stacked edge to edge are apart). The first band keeps the
+ * image's slot; the lookup then gives each primitive its band. */
+static void bdi_split_bands(void) {
+    memcpy(s_bdi_par, s_bdi_img, sizeof(BdiImage) * (size_t)s_bdi_nimg);
+    s_bdi_npar = s_bdi_nimg;
+    static int16_t order[BDI_PRIMS];
+    static int32_t py0[BDI_PRIMS], py1[BDI_PRIMS];
+    for (int i = 0; i < s_bdi_nprim; i++) bdi_prim_rows(&s_bdi_prim[i], &py0[i], &py1[i]);
+    for (int par = 0; par < s_bdi_npar; par++) {
+        int n = 0;
+        for (int i = 0; i < s_bdi_nprim; i++)
+            if (s_bdi_prim[i].img == par) {
+                int k = n++;   /* by first row */
+                while (k > 0 && py0[order[k - 1]] > py0[i]) { order[k] = order[k - 1]; k--; }
+                order[k] = (int16_t)i;
+            }
+        int band = -1;
+        int32_t band_y1 = 0;
+        for (int k = 0; k < n; k++) {
+            const int i = order[k];
+            if (band < 0 || py0[i] >= band_y1 - 1) {
+                if (band < 0) band = par;
+                else if (s_bdi_nimg < BDI_IMAGES) band = s_bdi_nimg++;
+                BdiImage *b = &s_bdi_img[band];
+                *b = s_bdi_par[par];
+                b->parent = (int16_t)par;
+                b->x0 = INT32_MAX; b->x1 = INT32_MIN; b->y0 = py0[i]; b->y1 = py1[i];
+                b->semi = 0;
+                band_y1 = py1[i];
+            }
+            BdiImage *b = &s_bdi_img[band];
+            const BdiPrim *p = &s_bdi_prim[i];
+            for (int v = 0; v < p->n; v++) {
+                if (p->x[v] < b->x0) b->x0 = p->x[v];
+                if (p->x[v] > b->x1) b->x1 = p->x[v];
+            }
+            if (py1[i] > b->y1) b->y1 = py1[i];
+            if (py1[i] > band_y1) band_y1 = py1[i];
+            b->semi |= (uint8_t)((p->op & 0x02u) != 0);
+            s_bdi_prim[i].img = band;
+        }
+    }
+    /* each band's first primitive in draw order; the lookup by band */
+    for (int i = s_bdi_nprim - 1; i >= 0; i--) s_bdi_img[s_bdi_prim[i].img].first_key = s_bdi_prim[i].key;
+    for (int i = 0; i < s_bdi_nprim; i++) bdi_insert(s_bdi_prim[i].key, s_bdi_prim[i].img);
+}
+
+static int bdi_tile_of(const BdiPrim *p, BdiTile *t) {
+    if (p->op < 0x64u || p->op > 0x7Fu || !(p->op & 0x04u)) return 0;   /* textured rectangles */
+    t->tpage = (uint16_t)(p->tpage & 0x1FFu); t->clut = p->clut;
+    t->u = (int16_t)p->u[0]; t->v = (int16_t)p->v[0];
+    t->w = (int16_t)(p->x[1] - p->x[0] + 1); t->h = (int16_t)(p->y[2] - p->y[0] + 1);
+    return 1;
+}
+
+static int bdi_tile_eq(const BdiTile *a, const BdiTile *b) {
+    return a->tpage == b->tpage && a->clut == b->clut && a->u == b->u && a->v == b->v &&
+           a->w == b->w && a->h == b->h;
+}
+
+/* The tile's memory (created: one fresh in the oldest's place); to look one
+ * up, only one seen in the last BDI_TILE_FRESH frames (another picture may
+ * later use the same texture place). */
+#define BDI_TILE_FRESH 240u
+static BdiTileMem *bdi_tile_mem(const BdiTile *t, int create) {
+    BdiTileMem *old = &s_bdi_tiles[0];
+    for (int i = 0; i < BDI_TILE_MEM; i++) {
+        BdiTileMem *mm = &s_bdi_tiles[i];
+        if (mm->seen && bdi_tile_eq(&mm->t, t)) {
+            if (!create && (uint32_t)s_frame_count + 1u - mm->seen > BDI_TILE_FRESH) return NULL;
+            return mm;
+        }
+        if (mm->seen < old->seen) old = mm;
+    }
+    if (!create) return NULL;
+    memset(old, 0, sizeof *old);
+    old->t = *t;
+    return old;
+}
+
+/* A band laid as one row of textured rectangles: their indices by x. */
+static int bdi_strip(int img, int16_t *order, int cap) {
+    int n = 0;
+    for (int i = 0; i < s_bdi_nprim; i++) {
+        const BdiPrim *p = &s_bdi_prim[i];
+        if (p->img != img) continue;
+        BdiTile t;
+        if (!bdi_tile_of(p, &t) || n >= cap) return 0;
+        if (n && (p->y[0] != s_bdi_prim[order[0]].y[0] || p->y[2] != s_bdi_prim[order[0]].y[2])) return 0;
+        int k = n++;
+        while (k > 0 && s_bdi_prim[order[k - 1]].x[0] > p->x[0]) { order[k] = order[k - 1]; k--; }
+        order[k] = (int16_t)i;
+    }
+    return n;
+}
+
+/* Each strip's neighbouring tiles, remembered. */
+static void bdi_tiles_learn(void) {
+    for (int b = 0; b < s_bdi_nimg; b++) {
+        int16_t order[16];
+        const int n = bdi_strip(b, order, 16);
+        for (int k = 0; k + 1 < n; k++) {
+            const BdiPrim *a = &s_bdi_prim[order[k]], *c = &s_bdi_prim[order[k + 1]];
+            BdiTile ta, tc;
+            bdi_tile_of(a, &ta); bdi_tile_of(c, &tc);
+            if (c->x[0] != a->x[0] + ta.w) continue;   /* not side by side */
+            BdiTileMem *ma = bdi_tile_mem(&ta, 1);
+            ma->nb[1] = tc; ma->has[1] = 1; ma->seen = (uint32_t)s_frame_count + 1u;
+            BdiTileMem *mc = bdi_tile_mem(&tc, 1);
+            mc->nb[0] = ta; mc->has[0] = 1; mc->seen = (uint32_t)s_frame_count + 1u;
+        }
+    }
+}
+
+/* A strip's side short of the wide edge: the tiles seen beyond its end
+ * (one after another, up to 3) planned there; 0 (nothing planned) when they
+ * are not remembered or do not reach the wide edge. */
+static int bdi_wrap_side(int img, int right, int32_t X, int32_t W, int32_t m) {
+    int16_t order[16];
+    const int n = bdi_strip(img, order, 16);
+    if (n < 1) return 0;
+    const BdiPrim *end = &s_bdi_prim[order[right ? n - 1 : 0]];
+    BdiTile t;
+    bdi_tile_of(end, &t);
+    int32_t x = end->x[0];
+    const int first = s_bdi_nwrap;
+    for (int k = 0; k < 3 && s_bdi_nwrap < BDI_WRAPS; k++) {
+        const BdiTileMem *mm = bdi_tile_mem(&t, 0);
+        if (!mm || !mm->has[right]) break;
+        const BdiTile nb = mm->nb[right];
+        x = right ? x + t.w : x - nb.w;
+        s_bdi_wrap[s_bdi_nwrap++] = (BdiWrap){ (int16_t)img, end->op, x, end->y[0], nb, end->col[0] };
+        if (right ? x + nb.w >= X + W + m : x <= X - m) return 1;
+        t = nb;
+    }
+    s_bdi_nwrap = first;
+    return 0;
+}
+
+static void bdi_drop_wraps(int img) {
+    int k = 0;
+    for (int i = 0; i < s_bdi_nwrap; i++)
+        if (s_bdi_wrap[i].img != img) s_bdi_wrap[k++] = s_bdi_wrap[i];
+    s_bdi_nwrap = k;
+    s_bdi_img[img].wrap_sides = 0;
+}
+
+/* One band (whole: an image, all its bands together): its stretch, filled
+ * sides and (a band) tiles drawn in its gaps into *im. Returns whether a
+ * side reaches past the wide edge (the picture's own pixels there: a
+ * panorama). */
+static int bdi_decide(int img, int whole, BdiImage *im) {
+    const BdiImage *src = whole ? &s_bdi_par[img] : &s_bdi_img[img];
+    const int32_t X = ws_disp_x(), W = ws_disp_w(), m = ws_nw_configured_offset();
+    const float c = (float)X + (float)W * 0.5f, half = (float)W * 0.5f + (float)m;
+    const float full = half / ((float)W * 0.5f);
+    float s = 1.0f;
+    int wide = 0;
+    im->q = 0;
+    im->fill_sides = 0;
+    im->wrap_sides = 0;
+    for (int right = 0; right < 2; right++) {
+        uint16_t smp[BDI_SAMPLES], mode;
+        int32_t edge;
+        const int n = bdi_side_samples(img, whole, right, smp, &edge);
+        const int reach = right ? edge >= X + W - 1 : edge <= X + 1;
+        const int32_t beyond = right ? edge - (X + W) : X - edge;
+        if (!reach) continue;
+        if (beyond >= m) { wide = 1; continue; }
+        if (!src->semi && bdi_flat(smp, n, &mode)) {
+            im->fill_sides |= (uint8_t)(1 << right);
+            im->fill_col[right] = mode;
+            continue;
+        }
+        if (!whole && bdi_wrap_side(img, right, X, W, m)) {
+            im->wrap_sides |= (uint8_t)(1 << right);
+            continue;
+        }
+        const float d = right ? (float)edge - c : c - (float)edge;
+        const float need = d > 1.0f ? half / d : full;
+        if (need > s) s = need;
+    }
+    if (s > 1.0005f && full > 1.0005f) {
+        const int q = (int)((s - 1.0f) / (full - 1.0f) * 255.0f + 0.5f);
+        im->q = (uint8_t)(q < 1 ? 1 : q > 255 ? 255 : q);
+        im->fill_sides = 0;   /* the stretch (about the centre) covers both sides */
+        if (!whole && im->wrap_sides) bdi_drop_wraps(img);
+    }
+    return wide;
+}
+
+/* A filled side, row by row: the colour at the edge on that row (a sky's
+ * gradient goes on into the margin with no seam), the side's main colour
+ * where no primitive is at the edge; kept as runs of one colour. */
+static void bdi_fill_runs(int img, int right) {
+    const BdiImage *im = &s_bdi_img[img];
+    static uint16_t row[1024];
+    const int32_t y0 = im->y0, h = im->y1 - im->y0 + 1;
+    if (h <= 0 || h > 1024) return;
+    for (int y = 0; y < h; y++) row[y] = im->fill_col[right];
+    for (int i = 0; i < s_bdi_nprim; i++) {   /* in draw order: the last one on top */
+        const BdiPrim *p = &s_bdi_prim[i];
+        if (p->img != img || p->n < 2) continue;
+        int a = 0;
+        for (int k = 1; k < p->n; k++) if (right ? p->x[k] > p->x[a] : p->x[k] < p->x[a]) a = k;
+        int b = a == 0 ? 1 : 0;
+        for (int k = 0; k < p->n; k++) if (k != a && (right ? p->x[k] > p->x[b] : p->x[k] < p->x[b])) b = k;
+        if (right ? p->x[a] < im->x1 - 2 : p->x[a] > im->x0 + 2) continue;   /* not at that extreme */
+        if (p->y[a] == p->y[b]) continue;
+        const int lo = p->y[a] < p->y[b] ? a : b, hi = lo == a ? b : a;
+        for (int32_t y = p->y[lo]; y <= p->y[hi]; y++) {
+            if (y < y0 || y >= y0 + h) continue;
+            const float t = ((float)(y - p->y[lo]) + 0.5f) / (float)(p->y[hi] - p->y[lo] + 1);
+            const int u = p->u[lo] + (int)((float)(p->u[hi] - p->u[lo]) * t);
+            const int v = p->v[lo] + (int)((float)(p->v[hi] - p->v[lo]) * t);
+            uint32_t col = 0;
+            for (int sh = 0; sh < 24; sh += 8) {
+                const float c0 = (float)((p->col[lo] >> sh) & 0xFF), c1 = (float)((p->col[hi] >> sh) & 0xFF);
+                col |= (uint32_t)(c0 + (c1 - c0) * t + 0.5f) << sh;
+            }
+            uint16_t c;
+            if (bdi_colour(p, u, v, col, &c)) row[y - y0] = c;
+        }
+    }
+    for (int y = 0; y < h && s_bdi_nrun < BDI_RUNS;) {
+        int e = y + 1;
+        while (e < h && row[e] == row[y]) e++;
+        s_bdi_run[s_bdi_nrun++] = (BdiRun){ (int16_t)img, (uint8_t)right, y0 + y, y0 + e, row[y] };
+        y = e;
+    }
+}
+
+static void bdi_prepass(uint32_t start_addr) {
+    s_bdi_valid = 0;
+    if (!bdi_enabled() || ws_mode != 2 || !ws_native_wide_configured()) return;
+    s_bdi_nprim = s_bdi_nimg = 0;
+    memset(s_bdi_slot_img, 0xFF, sizeof s_bdi_slot_img);
+    const int32_t X = ws_disp_x(), W = ws_disp_w();
+    uint16_t tpage = current_texpage();
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
+    for (uint32_t safety = 0; safety < 0x40000u; safety++) {
+        const uint32_t header = psx_read_word(addr);
+        const uint32_t num_words = (header >> 24) & 0xFFu;
+        const uint32_t word_addr = psx_mod_gpu_dma_resolve_address(addr + 4u);
+        uint32_t offset = 0;
+        int over = 0;
+        while (offset < num_words) {
+            const uint32_t cmd_addr = word_addr + offset * 4u;
+            const uint32_t first = psx_read_word(psx_mod_gpu_dma_resolve_address(cmd_addr));
+            const uint8_t op = (uint8_t)(first >> 24);
+            const int count = gp0_command_word_count(op);
+            if (count <= 0 || offset + (uint32_t)count > num_words) break;
+            if (op >= 0xA0u && op <= 0xBFu) break;
+            uint32_t w[12] = {0};
+            for (int i = 0; i < count && i < 12; i++)
+                w[i] = psx_read_word(psx_mod_gpu_dma_resolve_address(cmd_addr + (uint32_t)i * 4u));
+            offset += (uint32_t)count;
+            if (op == 0xE1u) { tpage = (uint16_t)(w[0] & 0x1FFu); continue; }
+            if (op < 0x20u || op > 0x7Fu || (op >= 0x40u && op <= 0x5Fu)) continue;
+            BdiPrim *p = &s_bdi_prim[s_bdi_nprim < BDI_PRIMS ? s_bdi_nprim : BDI_PRIMS - 1];
+            bdi_prim_parse(w, op, tpage, p);
+            if ((op & 0x24u) == 0x24u && op <= 0x3Fu) tpage = (uint16_t)(p->tpage & 0x1FFu);
+            int32_t x0 = p->x[0], x1 = p->x[0], y0 = p->y[0], y1 = p->y[0];
+            for (int k = 1; k < p->n; k++) {
+                if (p->x[k] < x0) x0 = p->x[k]; if (p->x[k] > x1) x1 = p->x[k];
+                if (p->y[k] < y0) y0 = p->y[k]; if (p->y[k] > y1) y1 = p->y[k];
+            }
+            /* the phase ends at the first shaded polygon, but the backdrop's own
+             * untextured gradient from one edge exactly to the other */
+            if (op >= 0x30u && op <= 0x3Fu &&
+                !(!(op & 0x04u) && x0 <= X && x0 >= X - 2 && x1 >= X + W && x1 <= X + W + 2)) {
+                over = 1;
+                break;
+            }
+            if (s_bdi_nprim >= BDI_PRIMS) continue;
+            const int tex = (op & 0x04u) != 0, semi = (op & 0x02u) != 0;
+            /* textured: the image of its CLUT (a backdrop's tiles come in any
+             * order, left and right in turn), else the image it continues as a
+             * tile beside it (same rows: a panorama's tiles each have their own
+             * CLUT); untextured: the last image, when untextured and touching */
+            int img = -1;
+            if (tex) {
+                const int direct = ((p->tpage >> 7) & 3) >= 2;
+                for (int k = 0; k < s_bdi_nimg && img < 0; k++)
+                    if (s_bdi_img[k].textured && !direct && s_bdi_img[k].clut == p->clut) img = k;
+                for (int k = 0; k < s_bdi_nimg && img < 0; k++) {
+                    const BdiImage *im = &s_bdi_img[k];
+                    if (im->textured && abs(y0 - im->y0) <= 1 && abs(y1 - im->y1) <= 1 &&
+                        x0 <= im->x1 + 2 && x1 >= im->x0 - 2)
+                        img = k;
+                }
+            } else if (s_bdi_nimg > 0) {
+                const BdiImage *im = &s_bdi_img[s_bdi_nimg - 1];
+                if (!im->textured && x0 <= im->x1 + 2 && x1 >= im->x0 - 2 && y0 <= im->y1 + 2 && y1 >= im->y0 - 2)
+                    img = s_bdi_nimg - 1;
+            }
+            if (img < 0) {
+                if (s_bdi_nimg >= BDI_IMAGES) continue;
+                img = s_bdi_nimg++;
+                BdiImage *im = &s_bdi_img[img];
+                memset(im, 0, sizeof *im);
+                im->x0 = x0; im->x1 = x1; im->y0 = y0; im->y1 = y1;
+                im->first_key = GPU_RAM_KEY(cmd_addr);
+                im->textured = (uint8_t)tex; im->clut = p->clut;
+            }
+            BdiImage *im = &s_bdi_img[img];
+            if (x0 < im->x0) im->x0 = x0; if (x1 > im->x1) im->x1 = x1;
+            if (y0 < im->y0) im->y0 = y0; if (y1 > im->y1) im->y1 = y1;
+            im->semi |= (uint8_t)semi;
+            p->img = img;
+            p->key = GPU_RAM_KEY(cmd_addr);
+            s_bdi_nprim++;
+        }
+        if (over || (header & 0x00FFFFFFu) == 0x00FFFFFFu) break;
+        addr = psx_mod_gpu_dma_resolve_address(header & 0x00FFFFFFu);
+    }
+    bdi_split_bands();
+    bdi_tiles_learn();
+    /* each band; a picture none of whose bands runs past the wide edge, as a whole */
+    s_bdi_nwrap = 0;
+    uint8_t wide[BDI_IMAGES] = {0};
+    for (int i = 0; i < s_bdi_nimg; i++)
+        wide[s_bdi_img[i].parent] |= (uint8_t)bdi_decide(i, 0, &s_bdi_img[i]);
+    for (int par = 0; par < s_bdi_npar; par++) {
+        if (wide[par]) continue;
+        BdiImage whole;
+        bdi_decide(par, 1, &whole);
+        for (int i = 0; i < s_bdi_nimg; i++) {
+            BdiImage *im = &s_bdi_img[i];
+            if (im->parent != par) continue;
+            if (im->wrap_sides) bdi_drop_wraps(i);
+            im->q = whole.q; im->fill_sides = whole.fill_sides;
+            im->fill_col[0] = whole.fill_col[0]; im->fill_col[1] = whole.fill_col[1];
+        }
+    }
+    s_bdi_nrun = 0;
+    for (int i = 0; i < s_bdi_nimg; i++) {
+        s_bdi_stat[s_bdi_img[i].q ? 2 : s_bdi_img[i].fill_sides ? 1 : 0]++;
+        for (int right = 0; right < 2; right++)
+            if (s_bdi_img[i].fill_sides & (1 << right)) bdi_fill_runs(i, right);
+    }
+    s_bdi_valid = s_bdi_nimg > 0;
+}
+
+/* The answer for the primitive being drawn: -1 none (not a backdrop image);
+ * 0 drawn as it is; else (marked ? 1 : 4) | q << 8. */
+static int bdi_gate(int marked) {
+    if (!ws_native_wide_active()) return -1;
+    const int img = bdi_find(gp0_cmd_source_addr);
+    if (img < 0) return -1;
+    s_bdi_stat[3]++;
+    const BdiImage *im = &s_bdi_img[img];
+    if (!im->q) return 0;
+    return (marked ? 1 : 4) | (int)im->q << 8;
+}
+
+/* At an image's first primitive: its filled margins, before any of it. */
+static void bdi_fill_note(uint8_t op) {
+    if (!s_bdi_valid || op < 0x20u || op > 0x7Fu || !ws_native_wide_active()) return;
+    const int img = bdi_find(gp0_cmd_source_addr);
+    if (img < 0) return;
+    BdiImage *im = &s_bdi_img[img];
+    if ((!im->fill_sides && !im->wrap_sides) || im->filled ||
+        GPU_RAM_KEY(gp0_cmd_source_addr) != im->first_key) return;
+    im->filled = 1;
+    for (int k = 0; k < s_bdi_nrun; k++) {
+        const BdiRun *r = &s_bdi_run[k];
+        if (r->img != img) continue;
+        int32_t y0 = r->y0 + draw_offset_y, y1 = r->y1 + draw_offset_y;
+        if (y0 < (int32_t)draw_area_top) y0 = (int32_t)draw_area_top;
+        if (y1 > (int32_t)draw_area_bottom + 1) y1 = (int32_t)draw_area_bottom + 1;
+        if (y1 > y0)
+            gr_wide_clear_margins((int)draw_area_left, (int)y0, (int)(y1 - y0), r->col, 1 << r->right);
+    }
+    /* the tiles beyond a strip's end, as the strip's own tile beside them is drawn */
+    for (int k = 0; k < s_bdi_nwrap; k++) {
+        const BdiWrap *wp = &s_bdi_wrap[k];
+        if (wp->img != img) continue;
+        const int32_t x = wp->x + draw_offset_x, y = wp->y + draw_offset_y;
+        if (draw_area_out_rect(x, y, wp->t.w, wp->t.h)) continue;
+        gr_set_color_modulation((int)(wp->col & 0xFF), (int)((wp->col >> 8) & 0xFF),
+                                (int)((wp->col >> 16) & 0xFF), wp->op & 1);
+        gr_set_semi_transparency((wp->op >> 1) & 1, (wp->t.tpage >> 5) & 3);
+        gr_draw_textured_rect(x, y, wp->t.w, wp->t.h, wp->t.u, wp->t.v,
+                              (uint16_t)((wp->t.clut & 0x3F) * 16), (uint16_t)((wp->t.clut >> 6) & 0x1FF),
+                              wp->t.tpage);
+    }
+}
+/* TCP ws_backdrop_images: the last linked list's images. */
+int gpu_ws_backdrop_images_json(char *out, size_t cap) {
+    size_t n = (size_t)snprintf(out, cap,
+        "\"enabled\":%d,\"valid\":%d,\"prims\":%d,\"totals\":[%u,%u,%u,%u],\"images\":[",
+        bdi_enabled(), s_bdi_valid, s_bdi_nprim, s_bdi_stat[0], s_bdi_stat[1], s_bdi_stat[2], s_bdi_stat[3]);
+    for (int i = 0; i < s_bdi_nimg && n < cap; i++) {
+        const BdiImage *im = &s_bdi_img[i];
+        int np = 0;
+        for (int k = 0; k < s_bdi_nprim; k++) np += s_bdi_prim[k].img == i;
+        n += (size_t)snprintf(out + n, cap - n,
+            "%s{\"x\":[%d,%d],\"y\":[%d,%d],\"prims\":%d,\"tex\":%d,\"semi\":%d,\"clut\":%u,\"q\":%u,"
+            "\"fill\":%u,\"fill_col\":[%u,%u],\"image\":%d}",
+            i ? "," : "", (int)im->x0, (int)im->x1, (int)im->y0, (int)im->y1, np, im->textured, im->semi,
+            im->clut, im->q, im->fill_sides, im->fill_col[0], im->fill_col[1], (int)im->parent);
+    }
+    if (n < cap) n += (size_t)snprintf(out + n, cap - n, "]");
+    return (int)n;
 }
 
 static int ws_ui_prepass_order_cmp(const void *x, const void *y) {
@@ -7918,6 +8610,7 @@ static void gp0_execute_command(void) {
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
     extern void ws_bg_phase_note(uint32_t op);
     ws_bg_phase_note(opcode);   /* native-wide 2D-backdrop stretch: background-phase latch */
+    bdi_fill_note(opcode);      /* a backdrop image's margins in its edge colour, before it */
     if (ws_view_camera_addr || g_bg2d_host_size) {
         WsViewAnchor v = ws_view_current();
         /* Draw env packets select the back-buffer band after linked-list

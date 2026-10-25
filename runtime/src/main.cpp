@@ -2116,6 +2116,7 @@ static void reset_mod_owned_presentation(void) {
     g_ws_adaptive_max_den = 9;
     gpu_ws_set_auto_ui_proportional(g_ws_auto_ui_proportional_cfg ? 1 : 0);
     psx_mod_set_world_scene_predicate(nullptr);
+    gpu_ws_set_backdrop_images(0);
     gpu_ws_set_native_scene_predicate(nullptr);
     /* Projection recovery and its clipping belong to this session's mod. */
     psx_mod_set_native_wide_projection_correction(0);

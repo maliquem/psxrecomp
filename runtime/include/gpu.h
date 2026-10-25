@@ -619,7 +619,11 @@ void gpu_ws_set_nw_phase_backdrop(int on);
  *     screen-covering effect covers the wide view while what lies inside the
  *     picture keeps its place (the software renderer stretches it whole);
  *   GPU_WS_WIDE_PRIM_KEEP: never stretched (a window drawn in the backdrop
- *     phase, which nw_phase_backdrop would stretch).
+ *     phase, which nw_phase_backdrop would stretch);
+ *   GPU_WS_WIDE_PRIM_IMAGE: the backdrop-image rule decides (drawn as it is,
+ *     its edge colour over the revealed band, or stretched by what it needs;
+ *     gpu_ws_set_backdrop_images), else as STRETCH for a polygon, KEEP for the
+ *     rest.
  * STRETCH and EDGES apply to polygons. Render-only: guest VRAM and the
  * canonical 4:3 picture are untouched, 4:3 never asks. The pure, cheap
  * predicate runs on the emulation thread: no GPU calls, allocation or guest
@@ -627,8 +631,17 @@ void gpu_ws_set_nw_phase_backdrop(int on);
 #define GPU_WS_WIDE_PRIM_BACKDROP 1u
 #define GPU_WS_WIDE_PRIM_WORLD3D  2u
 enum { GPU_WS_WIDE_PRIM_DEFAULT = 0, GPU_WS_WIDE_PRIM_STRETCH = 1, GPU_WS_WIDE_PRIM_EDGES = 2,
-       GPU_WS_WIDE_PRIM_KEEP = 3 };
+       GPU_WS_WIDE_PRIM_KEEP = 3, GPU_WS_WIDE_PRIM_IMAGE = 4 };
 void gpu_ws_set_wide_prim_predicate(int (*predicate)(uint32_t op, uint32_t ot_rank, uint32_t flags));
+/* The backdrop-image rule (native-wide): what a frame draws before its 3D
+ * world, as images (a picture's tiles together, a band each for pieces
+ * stacked in it), each decided on its own: past the wide edge (a panorama),
+ * drawn as it is, a looping panorama's gap taking the tile seen beyond it;
+ * ending inside the revealed band, an edge mostly of one colour goes on
+ * into it row by row, an edge with art stretches the image by just what it
+ * needs. Off by default; a mod session's start turns it off (a title's
+ * plugin sets it again). Env PSX_NW_BACKDROP_IMAGES=0/1 wins (tests). */
+void gpu_ws_set_backdrop_images(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the

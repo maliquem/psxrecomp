@@ -969,7 +969,7 @@ static void emit_tex_rgb(const int *us, const int *vs, int bx, int by, int depth
  * alone. Restarting a shown slot there took the next real frame's foot points
  * and left the real frame's picture without its sprites' shadows. */
 static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int *ys, const float *rgb,
-                        float share) {
+                        float share, float wsc, float wce) {
     if (!s_sc_on || s_fg_drawing) return;   /* needs the 3D triangles counted (sl->n) */
     s_emit_seen[!s_pz_valid ? 2 : s_pc_valid ? 0 : 1]++;
     const int area[4] = {x1, y1, x2, y2};
@@ -988,6 +988,7 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
     for (int i = 0; i < 3; i++) {
         px[i] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
         py[i] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+        if (wsc != 1.0f) px[i] = wce + (px[i] - wce) * wsc;   /* where the wide view draws it */
     }
     e[0] = (px[0] + px[1] + px[2]) / 3.0f;
     e[1] = (py[0] + py[1] + py[2]) / 3.0f;
@@ -4328,8 +4329,25 @@ static int mirror_geo_center_only(const int *xs, int n) {
 }
 /* mirror_batch_center_only (textured-batch variant) is defined after s_tb below. */
 
+static void wide_bd_scale_of(int gate, float *out_scale, float *out_center);
 /* The 2D-backdrop x-stretch for a wide-mirror draw under gate `gate`. */
 static void wide_bd_scale(int gate, float *out_scale, float *out_center) {
+    wide_bd_scale_of(gate, out_scale, out_center);
+    if (*out_scale != 1.0f) s_bdg_applied++;
+}
+
+/* A glowing piece's x stretch where the wide view draws it (sc_add_emit): a
+ * backdrop stretched as one picture (gate kinds 1 and 4) about the centre;
+ * 1 for the rest. The see-through cover mask3d takes off a dim grey piece
+ * over its triangles (gl_postfx.inc pfx_mask_uncover): at its 4:3 place, a
+ * stretched horizon haze lost the mark only in the middle. */
+static void emit_wide_scale(int gate, float *out_scale, float *out_center) {
+    wide_bd_scale_of(gate, out_scale, out_center);
+    const int kind = gate & 7;
+    if (kind != 1 && kind != 4) { *out_scale = 1.0f; *out_center = 0.0f; }
+}
+
+static void wide_bd_scale_of(int gate, float *out_scale, float *out_center) {
     extern int g_ws_tex_edge_pct;
     float scale = 1.0f, center = 0.0f;
     if (gate && g_ws_bd_stretch_on && g_wide_w > 0) {
@@ -4337,17 +4355,19 @@ static void wide_bd_scale(int gate, float *out_scale, float *out_center) {
         if (native_w > 0) {
             scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
                                              : (float)g_wide_w / (float)native_w;
-            if (gate == 2) {
+            const int kind = gate & 7, share = (gate >> 8) & 0xFF;
+            if (kind == 2) {
                 scale = g_ws_tex_edge_pct > 0
                       ? (float)g_ws_tex_edge_pct / 100.0f : scale;
                 scale = -scale; /* shader: expand only beyond canonical edges */
-            } else if (gate == 3) {
+            } else if (kind == 3) {
                 scale += 1000.0f; /* shader: vertices on or past the edges, about the centre */
+            } else if (share) {
+                scale = 1.0f + (scale - 1.0f) * (float)share / 255.0f;   /* a backdrop image: what it needs */
             }
             center = (float)g_wide_cur_base + (float)native_w / 2.0f;
         }
     }
-    if (scale != 1.0f) s_bdg_applied++;
     *out_scale = scale;
     *out_center = center;
 }
@@ -5652,13 +5672,14 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     const int dmode = n == 3 ? pgxp_tri_depth_mode(semi) : 0;
     if (dmode) { depth_before_tri(); sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, NULL); }
     if (n == 3 && (semi == 1 || semi == 3) && s_sc_on) {
-        float rgb[3];
+        float rgb[3], wsc, wce;
         emit_flat_rgb(cs, rgb);
-        sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f);
+        emit_wide_scale(gate, &wsc, &wce);
+        sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f, wsc, wce);
     }
     /* Bloom on: 3D sources and the rest never share a batch (BCLS_DRAW). */
     const int b3d = (s_bcls_on || s_b3d_on) && n == 3 && pgxp_tri_is_3d() ? 1
-                  : s_b3d_on && ctx_prim_in_backdrop() == 1 ? 2 : 0;
+                  : s_b3d_on && (ctx_prim_in_backdrop() & 7) == 1 ? 2 : 0;
     s_dbg_bdm[2]++; if (b3d == 2) s_dbg_bdm[0]++;
     if (s_fb_n > 0 && (s_fb_mode != GL_TRIANGLES || s_fb_semi != semi ||
                        s_fb_mask != (int)s_mask_set || s_fb_gate != gate ||
@@ -5808,12 +5829,13 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const int tdmode = pgxp_tri_depth_mode(semi);
         /* the batch's mark (bcls_passes / b3dm_passes): 3D, or a painted backdrop */
         const int tex_b3d = (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() ? 1
-                          : s_b3d_on && ctx_prim_in_backdrop() == 1 ? 2 : 0;
+                          : s_b3d_on && (ctx_prim_in_backdrop() & 7) == 1 ? 2 : 0;
         s_dbg_bdm[2]++; if (tex_b3d == 2) s_dbg_bdm[1]++;
         if ((semi == 1 || semi == 3) && s_sc_on) {
-            float rgb[3];
+            float rgb[3], wsc, wce;
             emit_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, rgb);
-            sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f);
+            emit_wide_scale(gate, &wsc, &wce);
+            sc_add_emit(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, rgb, semi == 3 ? 0.25f : 1.0f, wsc, wce);
         }
         if (tdmode) {
             depth_before_tri();
@@ -12146,6 +12168,14 @@ static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 #define RTHF_TAGGED    0x0002u
 #define RTHF_BD_SHIFT  2          /* bits 2-4: psx_ws_prim_in_backdrop() 0..4 */
 #define RTHF_BD_MASK   7u
+#define RTHF_BDQ_SHIFT 5          /* bits 5-12: its stretch share (backdrop images), 0 = the full one */
+static uint16_t rth_bd_flags(int bd) {
+    return (uint16_t)(((unsigned)bd & RTHF_BD_MASK) << RTHF_BD_SHIFT |
+                      (((unsigned)bd >> 8) & 0xFFu) << RTHF_BDQ_SHIFT);
+}
+static int rth_bd_value(uint16_t flags) {
+    return (int)((flags >> RTHF_BD_SHIFT) & RTHF_BD_MASK) | (int)((flags >> RTHF_BDQ_SHIFT) & 0xFFu) << 8;
+}
 
 static void rth_mirror_resync(void) {
     s_rthm_scale = s_out_scale;
@@ -12206,11 +12236,11 @@ static void rth_send_state(void) {
 static uint16_t rth_prim_flags(void) {
     if (s_rthm_wide_w <= 0 || !g_ws_bd_stretch_on) {
         if (!s_b3d_on) return 0;
-        return (uint16_t)(RTHF_PRIM | ((psx_ws_prim_in_backdrop() & RTHF_BD_MASK) << RTHF_BD_SHIFT));
+        return (uint16_t)(RTHF_PRIM | rth_bd_flags(psx_ws_prim_in_backdrop()));
     }
     uint16_t f = RTHF_PRIM;
     if (g_ws_bd_phase_mode != 0)
-        f |= (uint16_t)((psx_ws_prim_in_backdrop() & RTHF_BD_MASK) << RTHF_BD_SHIFT);
+        f |= rth_bd_flags(psx_ws_prim_in_backdrop());
     else if (psx_ws_prim_is_tagged())
         f |= RTHF_TAGGED;
     return f;
@@ -13446,7 +13476,7 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         const int32_t *v = (const int32_t *)pl;
         s_rthx_prim = (h.flags & RTHF_PRIM) != 0;
         s_rthx_tagged = (h.flags & RTHF_TAGGED) != 0;
-        s_rthx_backdrop = (h.flags >> RTHF_BD_SHIFT) & RTHF_BD_MASK;
+        s_rthx_backdrop = rth_bd_value(h.flags);
         const int area[4] = { s_area_x1, s_area_y1, s_area_x2, s_area_y2 };
         const int in = !s_fg_replay_objects_only && fg_area_meets(area, disp);
         switch (h.op) {
@@ -15644,7 +15674,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     const int32_t *v = (const int32_t *)payload;
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
-    s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & RTHF_BD_MASK;
+    s_rthx_backdrop = rth_bd_value(c->flags);
     if (c->op == RTH_FRAME) { rthf_end(); return; }
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();

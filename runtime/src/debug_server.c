@@ -5753,6 +5753,19 @@ static void handle_pgxp(int id, const char *json)
              (unsigned long long)dr[4]);
 }
 
+/* {"cmd":"ws_backdrop_images"}: the backdrop images of the last linked list
+ * (gpu.c, gpu_ws_set_backdrop_images): extent, primitives, stretch share q
+ * (0 = as it is, 255 = the full stretch), filled sides and their colours. */
+static void handle_ws_backdrop_images(int id, const char *json)
+{
+    (void)json;
+    extern int gpu_ws_backdrop_images_json(char *out, size_t cap);
+    static char body[16384], line[16512];
+    gpu_ws_backdrop_images_json(body, sizeof body);
+    snprintf(line, sizeof line, "{\"id\":%d,\"ok\":true,%s}", id, body);
+    debug_server_send_line(line);
+}
+
 static void handle_gpu_state(int id, const char *json)
 {
     (void)json;
@@ -16140,6 +16153,7 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
+    { "ws_backdrop_images", handle_ws_backdrop_images },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },
     { "pgxp_tri_ring",     handle_pgxp_tri_ring },
