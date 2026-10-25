@@ -5446,11 +5446,20 @@ static void handle_geom_correction(int id, const char *json)
  * "pass":1 (only samples inside render passes) / "pass":0 (outside), "top":K.
  * Addresses are executable-relative; tools/host_profile.py names them. Take
  * "seq" from one reply as "since" of the next to profile what ran between. */
+static int host_profile_cmp(const void *a, const void *b) {
+    const uint32_t x = ((const uint32_t *)a)[2], y = ((const uint32_t *)b)[2];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
 static void handle_host_profile(int id, const char *json)
 {
-    enum { MAXB = 4096 };
+    /* every distinct address (a hash table), so a long tail of small
+     * functions (recompiled game code) is binned too; "top" up to MAXB */
+    enum { MAXB = 65536, HMASK = 2 * MAXB - 1 };
     static uint64_t rvas[MAXB];
     static uint32_t counts[MAXB];
+    static int32_t  slot[2 * MAXB];
+    static uint32_t order[MAXB][3];
     const uint64_t seq = host_sampler_seq();
     const uint64_t oldest = seq > HOST_SAMPLER_CAP ? seq - HOST_SAMPLER_CAP : 0;
     int since = json_get_int(json, "since", -1);
@@ -5458,7 +5467,8 @@ static void handle_host_profile(int id, const char *json)
     const int pass = json_get_int(json, "pass", -1);
     int top = json_get_int(json, "top", 60);
     if (top < 1) top = 1;
-    if (top > 400) top = 400;
+    if (top > MAXB) top = MAXB;
+    for (int i = 0; i < 2 * MAXB; i++) slot[i] = -1;
     uint64_t from = since >= 0 ? (uint64_t)since : oldest;
     if (from < oldest) from = oldest;
     uint32_t frame_lo = 0;
@@ -5471,14 +5481,21 @@ static void handle_host_profile(int id, const char *json)
         if (frames > 0 && (int32_t)(smp.frame - frame_lo) < 0) continue;
         if (pass >= 0 && (int)smp.in_pass != pass) continue;
         total++;
-        int b = 0;
-        while (b < nb && rvas[b] != smp.rva) b++;
-        if (b == nb) {
+        uint32_t h = (uint32_t)((smp.rva * 0x9E3779B97F4A7C15ull) >> 40) & HMASK;
+        while (slot[h] >= 0 && rvas[slot[h]] != smp.rva) h = (h + 1) & HMASK;
+        int b = slot[h];
+        if (b < 0) {
             if (nb == MAXB) { dropped++; continue; }
-            rvas[nb] = smp.rva; counts[nb] = 0; nb++;
+            b = nb++;
+            slot[h] = b;
+            rvas[b] = smp.rva; counts[b] = 0;
         }
         counts[b]++;
     }
+    for (int b = 0; b < nb; b++) {
+        order[b][0] = (uint32_t)rvas[b]; order[b][1] = (uint32_t)(rvas[b] >> 32); order[b][2] = counts[b];
+    }
+    qsort(order, (size_t)nb, sizeof order[0], host_profile_cmp);
     size_t cap = 256 + (size_t)top * 48;
     char *buf = (char *)malloc(cap);
     if (!buf) { send_err(id, "oom"); return; }
@@ -5488,15 +5505,10 @@ static void handle_host_profile(int id, const char *json)
         id, host_sampler_supported(), (unsigned long long)seq,
         (unsigned long long)host_sampler_image_base(),
         (unsigned long long)total, (unsigned long long)dropped);
-    for (int k = 0; k < top; k++) {
-        int best = -1;
-        for (int b = 0; b < nb; b++)
-            if (counts[b] && (best < 0 || counts[b] > counts[best])) best = b;
-        if (best < 0) break;
+    for (int k = 0; k < top && k < nb; k++)
         n += (size_t)snprintf(buf + n, cap - n, "%s[\"0x%llX\",%u]", k ? "," : "",
-                              (unsigned long long)rvas[best], counts[best]);
-        counts[best] = 0;
-    }
+                              (unsigned long long)order[k][0] | ((unsigned long long)order[k][1] << 32),
+                              order[k][2]);
     snprintf(buf + n, cap - n, "]}");
     send_fmt("%s", buf);
     free(buf);
