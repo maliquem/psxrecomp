@@ -173,6 +173,35 @@ batalha sit at the turbo's 4x ceiling):
 - `cpu_timing = "block"` with calibrated constants: rejected for BoF4 (above).
   The per-block pipeline cost: see "Measured on Breath of Fire IV, cycle 4".
 
+## Measured on Breath of Fire IV, cycle 4 (2026-10-26)
+
+BoF4 now runs `cpu_timing = "block"` (the per-block pipeline cost) and
+`pgxp_mem = "words"`, with `overlay_precompile` and the exact host work above.
+
+- Block timing against the pipeline, 8 scenes with every effect on: the same
+  30 displayed frames per second, the same busy fraction per frame (within 0.2
+  of a point), PGXP coverage unchanged, pictures unchanged, sound correlated
+  0.999-1.000 (a few effects start a few samples apart), the cold boot through
+  the opening movie identical picture for picture. The codegen hash does not
+  move (the mode is in the overlay config hash): savestates load unchanged.
+- `pgxp_mem = "words"`: PGXP coverage unchanged (97.7-99.7% precise vertices).
+- Turbo, PGO + ThinLTO, the same compiled-overlay coverage on both sides:
+
+| Scene | pipeline + exact work | + block timing + PGXP words |
+|---|---|---|
+| dungeon | 2.55x | 3.15x (+23%) |
+| night field | 2.55x | 3.2x (+25%) |
+| magic | 3.55x | 4.3x (+21%) |
+| battle | 4.7x | 5.3-5.4x (+14%) |
+| field | 4.65x | 5.45x (+17%) |
+
+  Without the present skip, battle and field were held at the old 4x ceiling.
+  The exact host work alone, with PGO, is within noise in the heavy scenes (PGO
+  already optimized those paths); without PGO it measured 8-10%.
+- After a codegen-hash or overlay-config change the overlay cache starts again:
+  a region runs in the dirty-RAM interpreter until a capture of it is compiled
+  (`overlay_precompile` compiles the ones in the current capture list at boot).
+
 ## Checking a mode
 
 Against the same title built with the default path, from the same savestates:
