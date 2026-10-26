@@ -166,6 +166,7 @@ static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
 static volatile int s_fmv_quiet = 0;
+static void write_trace_live_refresh(void);
 
 void debug_server_set_fmv_quiet(int quiet)
 {
@@ -175,6 +176,7 @@ void debug_server_set_fmv_quiet(int quiet)
         enabled = (!env || env[0] != '0') ? 1 : 0;
     }
     s_fmv_quiet = enabled && quiet;
+    write_trace_live_refresh();
 }
 
 int debug_server_fmv_quiet(void)
@@ -455,6 +457,10 @@ static WriteTraceAllEntry *s_wtrace_all = NULL;
 /* Passive recorders (debug_server.h): the policy, and whether they record
  * now (the catch-all ring, the fingerprint, card traces, the sampler). */
 static int s_passive_policy = 1;
+int g_debug_write_trace_live = 1;   /* recomputed by write_trace_live_refresh */
+/* The built-in write-trace ranges, armed at init but held back (counts 0)
+ * while the passive recorders are off; passive_on_first_request arms them. */
+static int s_wtrace_held = 0, s_wtrace_held_n[3];
 static int s_passive = 1;
 static uint64_t s_wtrace_all_seq  = 0;
 static uint32_t s_wtrace_all_head = 0;
@@ -5448,7 +5454,10 @@ static void handle_geom_correction(int id, const char *json)
 /* host_profile — histogram of the always-on host CPU sampler (host_sampler.c)
  * over a window of the ring: {"cmd":"host_profile","since":SEQ} or
  * {"cmd":"host_profile","frames":N} (the last N guest frames), optional
- * "pass":1 (only samples inside render passes) / "pass":0 (outside), "top":K.
+ * "pass":1 (only samples inside render passes) / "pass":0 (outside), "top":K,
+ * "by_caller":1 (only the samples outside the executable, binned by the code
+ * that called out to the DLL: who waits, who calls the driver; Windows x64;
+ * 2: by the code that called that one).
  * Addresses are executable-relative; tools/host_profile.py names them. Take
  * "seq" from one reply as "since" of the next to profile what ran between. */
 static int host_profile_cmp(const void *a, const void *b) {
@@ -5470,6 +5479,7 @@ static void handle_host_profile(int id, const char *json)
     int since = json_get_int(json, "since", -1);
     const int frames = json_get_int(json, "frames", -1);
     const int pass = json_get_int(json, "pass", -1);
+    const int by_caller = json_get_int(json, "by_caller", 0);
     int top = json_get_int(json, "top", 60);
     if (top < 1) top = 1;
     if (top > MAXB) top = MAXB;
@@ -5485,6 +5495,10 @@ static void handle_host_profile(int id, const char *json)
         if (!host_sampler_get(i, &smp)) continue;
         if (frames > 0 && (int32_t)(smp.frame - frame_lo) < 0) continue;
         if (pass >= 0 && (int)smp.in_pass != pass) continue;
+        if (by_caller) {
+            if (!smp.outside) continue;   /* inside the executable */
+            smp.rva = by_caller == 2 ? smp.caller2 : smp.caller;   /* 0: none found */
+        }
         total++;
         uint32_t h = (uint32_t)((smp.rva * 0x9E3779B97F4A7C15ull) >> 40) & HMASK;
         while (slot[h] >= 0 && rvas[slot[h]] != smp.rva) h = (h + 1) & HMASK;
@@ -16897,7 +16911,7 @@ void debug_server_init(int port)
      * coverage at typical Tomba write rates. */
     {   /* the passive recorders' policy: env, else the title's */
         const char *e = getenv("PSX_DEBUG_PASSIVE");
-        if (e && e[0]) s_passive_policy = !strcmp(e, "connect") ? 2 : (e[0] != '0');
+        if (e && e[0]) s_passive_policy = !strcmp(e, "connect") ? 2 : !strcmp(e, "sampler") ? 3 : (e[0] != '0');
         s_passive = s_passive_policy == 1;
     }
     if (!s_wtrace_all && s_passive) {
@@ -17177,6 +17191,20 @@ void debug_server_init(int port)
      * whole or not at all: a malformed item or too many items refuses it, and
      * wtrace_boot_stats / wtrace_trans_stats report env_ranges and env_error. */
     wtrace_apply_env_ranges(getenv("PSX_WTRACE_BOOT_RANGES"));
+    /* The built-in ranges above are passive recorders too (traces kept for
+     * other titles' investigations, tested on every store): with the passive
+     * recorders off they wait, counts at 0, for the first request (policy 2)
+     * or for ever (0, 3). Ranges asked for by PSX_WTRACE_BOOT_RANGES stay. */
+    {
+        const char *er = getenv("PSX_WTRACE_BOOT_RANGES");
+        if (!s_passive && !(er && er[0])) {
+            s_wtrace_held = 1;
+            s_wtrace_held_n[0] = s_wtrace_range_count;
+            s_wtrace_held_n[1] = s_wtrace_boot_range_count;
+            s_wtrace_held_n[2] = s_wtrace_trans_range_count;
+            s_wtrace_range_count = s_wtrace_boot_range_count = s_wtrace_trans_range_count = 0;
+        }
+    }
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
@@ -17208,6 +17236,7 @@ void debug_server_init(int port)
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
     memset(s_snapshot_addrs, 0, sizeof(s_snapshot_addrs));
     memset(s_snapshot_active, 0, sizeof(s_snapshot_active));
+    write_trace_live_refresh();
 }
 
 /* Read one '\n'-terminated line from a blocking socket into buf. Returns the
@@ -17279,16 +17308,33 @@ void debug_server_get_status(int *listening, int *port, int *error)
 void debug_server_set_passive_policy(int policy) { s_passive_policy = policy; }
 int  debug_server_passive_active(void) { return s_passive; }
 
+/* Whether a store can be recorded (g_debug_write_trace_live): after init,
+ * after every command (they arm and disarm the recorders) and when the
+ * passive recorders or FMV quiet change. */
+static void write_trace_live_refresh(void) {
+    g_debug_write_trace_live = s_passive || s_fmv_quiet || s_rec_frame >= 0 || s_wtrace_all ||
+                               s_wtrace_range_count || s_wtrace_boot_range_count ||
+                               s_wtrace_trans_range_count;
+}
+
 /* Policy 2: the first request turns the passive recorders on (on the
  * emulation thread, which the sampler must start from). */
 static void passive_on_first_request(void) {
+    if (s_passive_policy == 3) { host_sampler_start(); return; }   /* the sampler alone */
     if (s_passive || s_passive_policy != 2) return;
     if (!s_wtrace_all)
         s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP, sizeof(WriteTraceAllEntry));
     s_wtrace_all_seq = 0;
     s_wtrace_all_head = 0;
     s_passive = 1;
+    if (s_wtrace_held) {   /* the built-in ranges, held back since init */
+        s_wtrace_held = 0;
+        if (!s_wtrace_range_count) s_wtrace_range_count = s_wtrace_held_n[0];
+        if (!s_wtrace_boot_range_count) s_wtrace_boot_range_count = s_wtrace_held_n[1];
+        if (!s_wtrace_trans_range_count) s_wtrace_trans_range_count = s_wtrace_held_n[2];
+    }
     host_sampler_start();
+    write_trace_live_refresh();
 }
 
 void debug_server_poll(void)
@@ -17315,6 +17361,7 @@ void debug_server_poll(void)
     s_in_command = 1;
     if (req[0]) process_command(req);
     s_in_command = 0;
+    write_trace_live_refresh();
 
     SDL_LockMutex(s_io_mutex);
     /* Only deliver if the I/O thread is still waiting (it may have timed out and

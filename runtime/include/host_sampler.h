@@ -12,8 +12,13 @@ extern "C" {
 
 typedef struct HostSample {
     uint64_t rva;      /* instruction pointer minus the executable's base */
+    uint64_t caller;   /* outside the executable (a system DLL, the driver): the
+                        * first return address back inside it, relative to
+                        * its base (Windows x64; 0 = none or unknown) */
+    uint64_t caller2;  /* the next one up (who called the caller) */
     uint32_t frame;    /* guest frame (s_frame_count) */
-    uint32_t in_pass;  /* 1 while a render pass ran */
+    uint16_t in_pass;  /* 1 while a render pass ran */
+    uint16_t outside;  /* 1: the instruction pointer was outside the executable */
 } HostSample;
 
 /* Start sampling the calling thread (the emulation thread). Idempotent. */
