@@ -70,13 +70,52 @@ outside its VSync wait, scene by scene). Titles whose logic depends on CPU
 timing inside a frame (busy-wait polling with tight windows, cycle-counted
 effects) should stay on `"pipeline"`.
 
+### Lesson from Breath of Fire IV: iteration-count timeouts
+
+PsyQ's `VSync(n)` waits in a loop with an iteration-count timeout
+(`(n-1) << 15` iterations: 32768 for `VSync(2)`). Under the pipeline model the
+loop costs ~32 cycles per iteration (three dependent main-RAM loads), so the
+timeout is ~1.85 VBlanks away. A block-mode load cost of 0..1 cycle makes the
+loop 14..17 cycles: the timeout fires before the VBlank arrives, VSync returns
+early and the game runs above its normal rate (BoF4: 40-45 displayed frames
+per second where the hardware shows 30). Too high a cost tips the heavy scenes
+(BoF4's night field at 93% of the frame) into 20 fps. No single pair of
+constants matched every scene of BoF4 closely enough, so BoF4 stays on
+`"pipeline"`. Any title using PsyQ VSync (most of them) needs the loop's cost
+per iteration near the pipeline's; check `display_flips` (TCP `perf_summary`)
+in every scene, not only the busy fraction.
+
+## Measured on Breath of Fire IV (2026-10-26)
+
+Turbo speed of the emulation thread (median of 2 alternated rounds; campo and
+batalha sit at the turbo's 4x ceiling):
+
+| Scene | default | ram_fast_path | + pgxp_alu "moves" | + cpu_timing "block" (1.0/3) |
+|---|---|---|---|---|
+| dungeon | 1.80x | +2.8% | +17.5% | +33% |
+| night field | 1.89x | -2.0% | +13.7% | +35% |
+| magic | 2.73x | +0.8% | +10.9% | +30% |
+
+- `ram_fast_path`: main RAM and scratchpad identical byte for byte at 34 points
+  in 6 scenes against the default build, with the fast path live (debug
+  recorders off); frame fingerprints identical in 8 scenes (recorders on).
+- `pgxp_alu = "moves"`: frame fingerprints identical (PGXP never touches guest
+  state), PGXP coverage identical in every scene (97.7-99.7% precise vertices),
+  pictures identical except where the shots caught a spinning cursor at
+  different angles.
+- `cpu_timing = "block"`: rejected for BoF4 (above).
+
 ## Checking a mode
 
 Against the same title built with the default path, from the same savestates:
 
 - exact modes: the debug server's frame fingerprints (cycles and hashes of
   every RAM/MMIO/scratchpad write per frame) identical for hundreds of frames
-  in several scenes, the same pictures and sound;
+  in several scenes, the same pictures and sound. The fingerprints need the
+  debug recorders, which turn `ram_fast_path`'s store path off; so also
+  compare main RAM and the scratchpad with the recorders off
+  (`PSX_DEBUG_PASSIVE=0`), each exe paused (`host_pause`) at the same values of
+  the game's VBlank counter;
 - `pgxp_alu`: the PGXP coverage counters (`geom_correction`) and pictures at
   the same game moment;
 - `cpu_timing`: the busy fraction per frame, the game's displayed frames per
