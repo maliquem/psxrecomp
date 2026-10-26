@@ -112,7 +112,16 @@ typedef struct PSXPgxpSessionConfig {
     int preserve_projection;
     int mod_only;
     int netplay;   /* this session is a netplay match: precise culling off */
+    /* [video] pgxp_alu (docs/PERFORMANCE_MODES.md): 0 "full" (every ALU hook
+     * class), 1 "moves" (the light mode). PSX_PGXP_ALU overrides: full, moves
+     * or a class mask (pgxp_hooks.h PGXP_ALU_K_*). */
+    int alu_light;
 } PSXPgxpSessionConfig;
+
+/* The ALU hook class mask in force (pgxp_hooks.h g_pgxp_alu_mask): the
+ * configured one, or every class while CPU mode is on. Call with the CPU mode
+ * whenever it changes. */
+void psx_pgxp_alu_cpu_mode(int cpu_mode);
 
 /* Session start, before plugin activation: forget any mod request. */
 void psx_pgxp_session_reset(void);

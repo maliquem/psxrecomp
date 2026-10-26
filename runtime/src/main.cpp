@@ -48,6 +48,7 @@
 extern "C" void psx_event_step_conservative_env_init(void);
 /* memory.c's last-word-store record for the idle-loop detector. */
 extern "C" int g_psx_track_last_store;
+extern "C" uint32_t g_psx_blk_insn16, g_psx_blk_ram_load;   /* psx_cycles.c: cpu_timing = "block" */
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
 #include "gpu.h"
@@ -743,6 +744,7 @@ extern "C" int psx_perf_summary_json(char *out, int cap) {
     const PerfSummary &p = s_perf;
     return std::snprintf(out, (size_t)cap,
         "\"valid\":%d,\"window_s\":%.2f,\"game_fps\":%.2f,\"speed\":%.3f,"
+        "\"display_flips\":%llu,"   /* every GP1(05h) that moved the display: the game's own frames */
         "\"display\":{\"fps\":%.1f,\"presents\":%d,\"generated\":%d,\"interval_avg_ms\":%.2f,"
         "\"interval_p99_ms\":%.2f,\"interval_max_ms\":%.2f,\"low1_fps\":%.1f},"
         "\"cpu\":{\"emu_thread_pct\":%.1f,\"render_thread_pct\":%.1f,\"render_thread\":%d,"
@@ -752,6 +754,7 @@ extern "C" int psx_perf_summary_json(char *out, int cap) {
         "\"ok\":%d,\"name\":\"%s\",\"util_pct\":%u,\"mem_util_pct\":%u,\"clock_mhz\":%u,\"pstate\":%d,"
         "\"vram_used_mb\":%u,\"vram_total_mb\":%u,\"proc_ok\":%d,\"proc_vram_mb\":%u,\"proc_budget_mb\":%u}",
         p.valid, p.window_s, p.game_fps, p.speed,
+        (unsigned long long)gpu_display_flips(),
         p.pace.fps, p.pace.presents, p.pace.generated, p.pace.avg_ms, p.pace.p99_ms, p.pace.max_ms, p.pace.low1_fps,
         p.emu_cpu_pct, p.render_cpu_pct, p.render_thread, p.process_cpu_pct, p.cores,
         p.gpu_timed, p.real_timed, p.real_gpu_ms, p.gen_timed, p.gen_gpu_ms,
@@ -1441,6 +1444,7 @@ extern "C" void psx_mod_set_texture_filter(int mode) {
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
+static int           g_video_pgxp_alu_light        = 0;   /* [video] pgxp_alu = "moves" */
 static float         g_video_pgxp_tolerance        = 0.5f;
 /* game.toml [video] tuning. Session arming selects dataflow-only/no-clamp
  * defaults in hook builds unless the title supplied an explicit value. */
@@ -11005,6 +11009,7 @@ static int debug_toggle_key(int key, char *out, int cap) {
     case SDLK_F12: {
         const int on = !pgxp_cpu_mode();
         pgxp_set_cpu_mode(on);
+        psx_pgxp_alu_cpu_mode(on);
         std::snprintf(msg, sizeof msg, "PGXP CPU mode: %s", on ? "on" : "off");
         break; }
     case SDLK_0:
@@ -18426,6 +18431,16 @@ int main(int argc, char** argv) {
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
+            g_video_pgxp_alu_light = gc.runtime.video_pgxp_alu_light ? 1 : 0;
+            {   /* [recompiler] cpu_timing = "block" costs (psx_cycles.c);
+                 * PSX_BLK_INSN / PSX_BLK_RAM_LOAD override them for calibration. */
+                g_psx_blk_insn16 = gc.cpu_timing_insn16;
+                g_psx_blk_ram_load = gc.cpu_timing_ram_load;
+                if (const char* e = std::getenv("PSX_BLK_INSN"))
+                    if (std::atof(e) > 0.0) g_psx_blk_insn16 = (uint32_t)(std::atof(e) * 16.0 + 0.5);
+                if (const char* e = std::getenv("PSX_BLK_RAM_LOAD"))
+                    g_psx_blk_ram_load = (uint32_t)std::atoi(e);
+            }
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_pgxp_tolerance_set = gc.runtime.video_pgxp_tolerance_set;
             g_video_pgxp_position_fallback_set =
@@ -20930,6 +20945,7 @@ session_reboot:
     pgxp_cfg.video_geometry = g_video_geometry_correction;
     pgxp_cfg.video_texture = g_video_perspective_texturing;
     pgxp_cfg.video_cpu_mode = g_video_pgxp_cpu_mode;
+    pgxp_cfg.alu_light = g_video_pgxp_alu_light;
     pgxp_cfg.tolerance = g_video_pgxp_tolerance;
     pgxp_cfg.position_fallback = g_video_pgxp_position_fallback;
     pgxp_cfg.tolerance_set = g_video_pgxp_tolerance_set;

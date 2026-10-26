@@ -383,6 +383,102 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
 
 extern uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
+/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): the costs
+ * the main program charges (psx_cycles.c; game.toml cpu_timing_insn and
+ * cpu_timing_ram_load, PSX_BLK_INSN / PSX_BLK_RAM_LOAD override them for
+ * calibration). A block charges n instructions x the per-instruction cost
+ * (x16 fixed point, the remainder carried to the next block); overlay DLLs
+ * charge the game.toml cost the emitter wrote. */
+#if !defined(PSX_OVERLAY_DLL_BUILD)
+extern uint32_t g_psx_blk_insn16, g_psx_blk_ram_load, g_psx_blk_frac;
+#endif
+static inline void psx_blk_charge(uint32_t n, uint32_t insn16) {
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    psx_cyc_charge((n * insn16 + 8u) >> 4);
+#else
+    (void)insn16;
+    const uint32_t f = g_psx_blk_frac + n * g_psx_blk_insn16;
+    g_psx_blk_frac = f & 15u;
+    psx_cyc_charge(f >> 4);
+#endif
+}
+
+/* The game emitter's loads in this mode. A main-RAM load reads straight from
+ * RAM and charges the main-RAM load cost (no load-delay interlock: the block
+ * already charged the instruction itself); scratchpad, device and the other
+ * modes take the exact load (its interlock bookkeeping is harmless here).
+ * Overlay DLLs always take the exact load. */
+#if defined(PSX_OVERLAY_DLL_BUILD) || !defined(PSX_ENABLE_BLOCK_CYCLES)
+#define PSX_BLK_LOAD_FN(T, name, exact)                                          \
+    static inline T name(uint32_t cost, CPUState* cpu, uint32_t addr,           \
+                         uint32_t rt, uint32_t reg_mask) {                      \
+        (void)cost;                                                             \
+        return (T)exact(cpu, addr, rt, reg_mask);                               \
+    }
+#else
+#define PSX_BLK_LOAD_FN(T, name, exact)                                          \
+    static inline T name(uint32_t cost, CPUState* cpu, uint32_t addr,           \
+                         uint32_t rt, uint32_t reg_mask) {                      \
+        uint32_t phys = addr & 0x1FFFFFFFu;                                     \
+        (void)cost;                                                             \
+        if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u &&          \
+            addr < 0xC0000000u) {                                               \
+            T v;                                                                \
+            psx_cyc_charge(g_psx_blk_ram_load);                                 \
+            memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));         \
+            return v;                                                           \
+        }                                                                       \
+        return (T)exact(cpu, addr, rt, reg_mask);                               \
+    }
+#endif
+PSX_BLK_LOAD_FN(uint32_t, psx_blk_load_word, psx_cyc_load_word)
+PSX_BLK_LOAD_FN(uint16_t, psx_blk_load_half, psx_cyc_load_half)
+PSX_BLK_LOAD_FN(uint8_t,  psx_blk_load_byte, psx_cyc_load_byte)
+#undef PSX_BLK_LOAD_FN
+
+/* [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): the entries the game
+ * emitter uses in place of cpu->write_* and psx_cyc_load_byte. Main RAM takes
+ * the short path (the byte load: the same Beetle sequence the word and half
+ * loads above inline; the stores: memory.c, only when psx_write_* would do
+ * nothing more than write); anything else takes the usual path. Overlay DLLs
+ * keep the usual path. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
+static inline uint8_t psx_cyc_load_byte_fast(CPUState* cpu, uint32_t addr,
+                                             uint32_t rt, uint32_t reg_mask) {
+    return psx_cyc_load_byte(cpu, addr, rt, reg_mask);
+}
+static inline void psx_store_word(CPUState* cpu, uint32_t addr, uint32_t val) { cpu->write_word(addr, val); }
+static inline void psx_store_half(CPUState* cpu, uint32_t addr, uint16_t val) { cpu->write_half(addr, val); }
+static inline void psx_store_byte(CPUState* cpu, uint32_t addr, uint8_t val) { cpu->write_byte(addr, val); }
+#else
+void psx_store_word(CPUState* cpu, uint32_t addr, uint32_t val);
+void psx_store_half(CPUState* cpu, uint32_t addr, uint16_t val);
+void psx_store_byte(CPUState* cpu, uint32_t addr, uint8_t val);
+static inline uint8_t psx_cyc_load_byte_fast(CPUState* cpu, uint32_t addr,
+                                             uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u && addr < 0xC0000000u) {
+        if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+        if (g_psx_load_delay) {
+            psx_cyc_base(cpu);
+            psx_cyc_deps(cpu, reg_mask);
+            if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+            psx_cyc_lds(cpu);
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
+            cpu->ld_absorb = 5u; /* main-RAM wait 3 + completion 2 */
+            psx_cyc_charge(fudge + 5u);
+            cpu->ld_which_t = (uint8_t)rt;
+        }
+        return g_psx_ram[phys & g_psx_ram_mask];
+    }
+#endif
+    return psx_cyc_load_byte(cpu, addr, rt, reg_mask);
+}
+#endif
+
 /* Charge the exact timing/pipeline effects of a 32-bit CPU load without
  * invoking the memory handler.  Enhancement HLE may use this only when static
  * analysis proves the loaded value and read side effects are unobservable. */

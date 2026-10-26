@@ -12,6 +12,21 @@ inline uint32_t get_rs(uint32_t i) { return (i >> 21) & 0x1F; }
 inline uint32_t get_rt(uint32_t i) { return (i >> 16) & 0x1F; }
 inline uint32_t get_rd(uint32_t i) { return (i >> 11) & 0x1F; }
 inline int16_t get_imm16(uint32_t i) { return (int16_t)(i & 0xFFFF); }
+
+/* ALU hook classes (pgxp_hooks.h PGXP_ALU_K_*): the runtime mask picks which
+ * reach the engine ([video] pgxp_alu). A move is what pgxp.cpp copies whole:
+ * ADD(U)/OR with $zero, SUB(U) of $zero, ADDI(U) of 0. */
+constexpr int k_move = 0, k_lui = 1, k_ori = 2, k_shift = 3, k_add = 4,
+              k_logic = 5, k_slt = 6, k_hilo = 7, k_cop0 = 8;
+inline int alu3_kind(uint32_t funct, uint32_t rs, uint32_t rt) {
+    switch (funct) {
+    case 0x20: case 0x21: return (rs == 0 || rt == 0) ? k_move : k_add;   /* ADD/ADDU */
+    case 0x22: case 0x23: return rt == 0 ? k_move : k_add;                /* SUB/SUBU */
+    case 0x25:            return (rs == 0 || rt == 0) ? k_move : k_logic; /* OR       */
+    case 0x2A: case 0x2B: return k_slt;
+    default:              return k_logic;                                 /* AND/XOR/NOR */
+    }
+}
 }
 
 /* PGXP dataflow-shadowing hook emission (docs/ENHANCEMENTS.md G1.10; pgxp_hooks.h).
@@ -65,25 +80,25 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         case 0x00: case 0x02: case 0x03:       /* SLL / SRL / SRA             */
             if (rd == 0 || instr == 0) return; /* skip plain nop              */
             code = fmt::format(
-                "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, {}u); }}",
-                reg_name(rt), code, instr, reg_name(rd), (instr >> 6) & 31u);
+                "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, _pgx1, {}u); }}",
+                reg_name(rt), code, k_shift, instr, reg_name(rd), (instr >> 6) & 31u);
             return;
         case 0x04: case 0x06: case 0x07:       /* SLLV / SRLV / SRAV          */
             if (rd == 0) return;
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
-                "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
-                reg_name(rt), reg_name(rs), code, instr, reg_name(rd));
+                "PGXP_ALU_K({}, 0x{:08X}u, {}, _pgx1, _pgx2); }}",
+                reg_name(rt), reg_name(rs), code, k_shift, instr, reg_name(rd));
             return;
         case 0x10: case 0x12:                  /* MFHI / MFLO                 */
             if (rd == 0) return;
-            code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
-                               code, instr, reg_name(rd),
+            code = fmt::format("{}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, {}, 0u);",
+                               code, k_hilo, instr, reg_name(rd),
                                funct == 0x10 ? "cpu->hi" : "cpu->lo");
             return;
         case 0x11: case 0x13:                  /* MTHI / MTLO                 */
-            code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
-                               code, instr,
+            code = fmt::format("{}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, {}, 0u);",
+                               code, k_hilo, instr,
                                funct == 0x11 ? "cpu->hi" : "cpu->lo",
                                funct == 0x11 ? "cpu->hi" : "cpu->lo");
             return;
@@ -98,8 +113,8 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
             if (rd == 0) return;
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
-                "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
-                reg_name(rs), reg_name(rt), code, instr, reg_name(rd));
+                "PGXP_ALU_K({}, 0x{:08X}u, {}, _pgx1, _pgx2); }}",
+                reg_name(rs), reg_name(rt), code, alu3_kind(funct, rs, rt), instr, reg_name(rd));
             return;
         default:
             return;
@@ -108,22 +123,23 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
     case 0x08: case 0x09:                      /* ADDI / ADDIU                */
         if (rt == 0) return;
         code = fmt::format(
-            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
-            reg_name(rs), code, instr, reg_name(rt),
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
+            reg_name(rs), code, offset == 0 ? k_move : k_add, instr, reg_name(rt),
             (uint32_t)(int32_t)offset);
         return;
     case 0x0A: case 0x0B:                      /* SLTI / SLTIU                */
     case 0x0C: case 0x0D: case 0x0E:           /* ANDI / ORI / XORI           */
         if (rt == 0) return;
         code = fmt::format(
-            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
-            reg_name(rs), code, instr, reg_name(rt),
-            (uint32_t)(uint16_t)offset);
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
+            reg_name(rs), code,
+            opcode <= 0x0B ? k_slt : opcode == 0x0D ? k_ori : k_logic,
+            instr, reg_name(rt), (uint32_t)(uint16_t)offset);
         return;
     case 0x0F:                                 /* LUI                         */
         if (rt == 0) return;
-        code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
-                           code, instr, reg_name(rt));
+        code = fmt::format("{}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, 0u, 0u);",
+                           code, k_lui, instr, reg_name(rt));
         return;
     case 0x10: {                               /* COP0 register reads         */
         /* MFC0 writes a GPR like any ALU op: reset its shadow so a status or
@@ -131,8 +147,8 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
          * translated by either emitter.) */
         const uint32_t cop_op = (instr >> 21) & 0x1F;
         if (cop_op == 0x00 && rt != 0)
-            code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
-                               code, instr, reg_name(rt));
+            code = fmt::format("{}\n    PGXP_ALU_K({}, 0x{:08X}u, {}, 0u, 0u);",
+                               code, k_cop0, instr, reg_name(rt));
         return;
     }
     case 0x12: {                               /* COP2 register transfers     */

@@ -60,7 +60,8 @@ void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
     s_rseq = 0;
 }
 
-void parity_trace_arm(int on)        { s_armed = on ? 1u : 0u; }
+int g_parity_trace_armed = 0;   /* s_armed for memory.c psx_store_fast_off */
+void parity_trace_arm(int on)        { s_armed = on ? 1u : 0u; g_parity_trace_armed = (int)s_armed; }
 void parity_trace_reset(void)        {
     s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring));
     s_rseq = 0; memset(s_rring, 0, sizeof(s_rring));

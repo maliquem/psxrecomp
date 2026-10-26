@@ -73,18 +73,48 @@ typedef struct PGXPHooks {
     void (*cop2)  (struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr);
 } PGXPHooks;
 
+/* ALU hook classes (pgxp_hook_emitter.cpp tags every PGXP_ALU_K with one).
+ * [video] pgxp_alu (docs/PERFORMANCE_MODES.md, pgxp_session.cpp) picks the
+ * classes that reach the engine: all of them by default ("full": the exact
+ * shadowing, every written GPR's shadow updated or reset), or only the moves,
+ * LUI and ORI ("moves", the light mode: a destination the skipped classes
+ * wrote keeps its old shadow, which the value check on later use drops unless
+ * the new word equals the old one). CPU mode always takes every class. */
+enum {
+    PGXP_ALU_K_MOVE  = 0,   /* ADDU/OR with $zero, ADDIU imm 0: shadow copies */
+    PGXP_ALU_K_LUI   = 1,
+    PGXP_ALU_K_ORI   = 2,
+    PGXP_ALU_K_SHIFT = 3,   /* SLL/SRL/SRA and the variable shifts */
+    PGXP_ALU_K_ADD   = 4,   /* ADD(U)/SUB(U)/ADDI(U) with real operands */
+    PGXP_ALU_K_LOGIC = 5,   /* AND/OR/XOR/NOR, ANDI/XORI */
+    PGXP_ALU_K_SLT   = 6,   /* SLT(U), SLTI(U) */
+    PGXP_ALU_K_HILO  = 7,   /* MFHI/MFLO/MTHI/MTLO */
+    PGXP_ALU_K_COP0  = 8    /* MFC0 */
+};
+#define PGXP_ALU_MASK_FULL  0xFFFFFFFFu
+#define PGXP_ALU_MASK_MOVES ((1u << PGXP_ALU_K_MOVE) | (1u << PGXP_ALU_K_LUI) | (1u << PGXP_ALU_K_ORI))
+extern uint32_t g_pgxp_alu_mask;   /* pgxp_session.cpp */
+
 #if defined(PSX_PGXP) && PSX_PGXP
 #define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
 #define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
 #define PGXP_ALU(instr, res, s1, s2)             psx_pgxp_alu(cpu, (instr), (res), (s1), (s2))
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
+#if defined(PSX_OVERLAY_DLL_BUILD)
+/* Overlay DLLs cannot see the mask: every class, the exact shadowing. */
+#define PGXP_ALU_K(k, instr, res, s1, s2)        PGXP_ALU(instr, res, s1, s2)
+#else
+#define PGXP_ALU_K(k, instr, res, s1, s2) \
+    do { if (g_pgxp_alu_mask & (1u << (k))) PGXP_ALU(instr, res, s1, s2); } while (0)
+#endif
 #else
 #define PGXP_LOAD(instr, addr, val)              ((void)0)
 #define PGXP_STORE(instr, addr, val)             ((void)0)
 #define PGXP_ALU(instr, res, s1, s2)             ((void)0)
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       ((void)0)
 #define PGXP_COP2(instr, val, addr)              ((void)0)
+#define PGXP_ALU_K(k, instr, res, s1, s2)        ((void)0)
 #endif
 
 #ifdef __cplusplus

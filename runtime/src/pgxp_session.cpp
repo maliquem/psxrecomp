@@ -4,14 +4,35 @@
  * this code against the real mod runtime and builtin plugin. */
 #include "pgxp_session.h"
 #include "pgxp.h"
+#include "pgxp_hooks.h"
 
 #include <cstdlib>
+#include <cstring>
 
 extern "C" void gte_geometry_correction_set(int enabled);
 extern "C" void gpu_texture_correction_set(int enabled);
 
 extern "C" void psx_pgxp_session_reset(void) {
     pgxp_mod_request(0, 0, 0);
+}
+
+/* [video] pgxp_alu: the ALU hook classes that reach the engine (pgxp_hooks.h).
+ * Every class by default: the generated code calls the engine exactly as
+ * before the classes existed. */
+extern "C" uint32_t g_pgxp_alu_mask = PGXP_ALU_MASK_FULL;
+static uint32_t s_pgxp_alu_configured = PGXP_ALU_MASK_FULL;
+
+extern "C" void psx_pgxp_alu_cpu_mode(int cpu_mode) {
+    g_pgxp_alu_mask = cpu_mode ? PGXP_ALU_MASK_FULL : s_pgxp_alu_configured;
+}
+
+static uint32_t pgxp_alu_mask_from(const char* e, int alu_light) {
+    if (e && *e) {
+        if (std::strcmp(e, "full") == 0) return PGXP_ALU_MASK_FULL;
+        if (std::strcmp(e, "moves") == 0) return PGXP_ALU_MASK_MOVES;
+        return (uint32_t)std::strtoul(e, nullptr, 0);
+    }
+    return alu_light ? PGXP_ALU_MASK_MOVES : PGXP_ALU_MASK_FULL;
 }
 
 extern "C" PSXPgxpSessionArm psx_pgxp_session_arm(
@@ -54,6 +75,8 @@ extern "C" PSXPgxpSessionArm psx_pgxp_session_arm(
     gte_geometry_correction_set(arm.geometry);
     gpu_texture_correction_set(arm.texture);
     pgxp_set_cpu_mode(arm.cpu_mode);
+    s_pgxp_alu_configured = pgxp_alu_mask_from(std::getenv("PSX_PGXP_ALU"), config->alu_light);
+    psx_pgxp_alu_cpu_mode(arm.cpu_mode);
     if (used) *used = in;
     return arm;
 }

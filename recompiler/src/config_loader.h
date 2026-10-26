@@ -579,6 +579,9 @@ struct RuntimeConfig {
     // validation keeps it SAFE either way, this only trades coverage.
     // Meaningful only in a pgxp-flavour build; live-tunable over TCP.
     bool                  video_pgxp_cpu_mode = false;
+    // [video] pgxp_alu = "full" (default) | "moves": the ALU hook classes that
+    // reach the PGXP engine (docs/PERFORMANCE_MODES.md, pgxp_hooks.h).
+    bool                  video_pgxp_alu_light = false;
 
     // pgxp_tolerance: reject a corrected vertex whose sub-pixel offset from
     // the native integer position exceeds this many pixels (the truncation-
@@ -1548,6 +1551,17 @@ struct GameConfig {
     // [[draw_distance.clamp]] -- opt-in "keep far geometry" clamps. Empty by
     // default; inert until a mod switches them on; regen required.
     std::vector<DrawDistanceClampSite> draw_distance_clamp_sites;
+    // [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): guest stores and
+    // byte loads that only touch plain main RAM skip the full memory path. Exact
+    // (the same observers decide); off by default; regen required.
+    bool ram_fast_path = false;
+    // [recompiler] cpu_timing = "pipeline" (default, the R3000A model per
+    // instruction) | "block" (one calibrated charge per block: NOT exact, an
+    // option for speed), with cpu_timing_insn (cycles per instruction, default
+    // 1.0) and cpu_timing_ram_load (extra cycles per main-RAM load, default 4).
+    bool cpu_timing_block = false;
+    uint32_t cpu_timing_insn16 = 16;
+    uint32_t cpu_timing_ram_load = 4;
     // [quality.low/medium/high/ultra] -- graphics presets, lowest first. Empty:
     // the title has no presets and [video] alone applies (unchanged).
     std::vector<QualityPreset> quality_presets;

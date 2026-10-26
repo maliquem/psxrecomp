@@ -163,7 +163,7 @@ uint32_t CodeGenerator::partial_block_cycle_count(uint32_t addr,
 std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
                                                        const ControlFlowGraph& cfg,
                                                        const std::string& indent) const {
-    if (codegen_cycle_per_insn()) {
+    if (!config_.cpu_timing_block && codegen_cycle_per_insn()) {
         return "";
     }
 
@@ -174,9 +174,16 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
 
     std::stringstream ss;
     ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    // The CPU charge (psx_cycles.h): the same call in native and overlay
-    // DLL code; [timing] guest_cycle_scale is applied inside it.
-    ss << indent << fmt::format("psx_cpu_charge({}u);\n", cycles);
+    if (config_.cpu_timing_block) {
+        // [recompiler] cpu_timing = "block": the calibrated cost of the
+        // instructions from here to the block's end, batched like the
+        // per-instruction charges.
+        ss << indent << fmt::format("psx_blk_charge({}u, {}u);\n", cycles, config_.cpu_timing_insn16);
+    } else {
+        // The CPU charge (psx_cycles.h): the same call in native and overlay
+        // DLL code; [timing] guest_cycle_scale is applied inside it.
+        ss << indent << fmt::format("psx_cpu_charge({}u);\n", cycles);
+    }
     ss << "#endif\n";
     return ss.str();
 }
@@ -971,12 +978,58 @@ std::string CodeGenerator::draw_distance_clamp_prefix(uint32_t addr,
     return {};
 }
 
+/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): a block of n
+ * instructions charges psx_blk_charge(n) once at its head (n x the per-
+ * instruction cost, psx_cyc.h) instead of the R3000A pipeline model per
+ * instruction (load-delay interlock, I-cache fetches), and a main-RAM load
+ * adds its own cost (psx_blk_load_*). Mult/div and GTE stalls, scratchpad and
+ * device accesses keep their own timing. Not exact: an option for speed. The
+ * literals emitted are the game.toml costs, which overlay DLLs use; the main
+ * program takes the runtime's (the same, unless overridden for calibration). */
+static std::string block_timing_rewrite(std::string s, const CodeGenConfig& c) {
+    const std::string cost = fmt::format("{}u, ", c.cpu_timing_ram_load);
+    const std::pair<std::string, std::string> swaps[] = {
+        {"psx_cyc_load_word(", "psx_blk_load_word(" + cost},
+        {"psx_cyc_load_half(", "psx_blk_load_half(" + cost},
+        {"psx_cyc_load_byte(", "psx_blk_load_byte(" + cost},
+        {"psx_cyc_load_byte_fast(", "psx_blk_load_byte(" + cost},
+    };
+    for (const auto& [from, to] : swaps) {
+        for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size()))
+            s.replace(p, from.size(), to);
+    }
+    return s;
+}
+
+/* [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): the plain-RAM entries
+ * (psx_store_* in memory.c, psx_cyc_load_byte_fast in psx_cyc.h) in place of
+ * the CPUState store pointers and the out-of-line byte load. They take the
+ * access straight to RAM only when the usual path would do nothing more, and
+ * hand everything else to it, so the generated program behaves the same. */
+static std::string ram_fast_rewrite(std::string s) {
+    static const std::pair<std::string, std::string> k_swaps[] = {
+        {"cpu->write_word(", "psx_store_word(cpu, "},
+        {"cpu->write_half(", "psx_store_half(cpu, "},
+        {"cpu->write_byte(", "psx_store_byte(cpu, "},
+        {"psx_cyc_load_byte(", "psx_cyc_load_byte_fast("},
+    };
+    for (const auto& [from, to] : k_swaps) {
+        for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size()))
+            s.replace(p, from.size(), to);
+    }
+    return s;
+}
+
 std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
     std::string clamp = draw_distance_clamp_prefix(addr, instr);
     const std::string hook = mod_instruction_call(addr, instr);
-    if (clamp.empty()) return hook + translate_instruction_core(addr, instr);
-    // The core translation carries its own indent; give the clamp the same.
-    return hook + config_.indent + clamp + "\n" + translate_instruction_core(addr, instr);
+    std::string out = clamp.empty()
+        ? hook + translate_instruction_core(addr, instr)
+        // The core translation carries its own indent; give the clamp the same.
+        : hook + config_.indent + clamp + "\n" + translate_instruction_core(addr, instr);
+    if (config_.ram_fast_path) out = ram_fast_rewrite(std::move(out));
+    if (config_.cpu_timing_block) out = block_timing_rewrite(std::move(out), config_);
+    return out;
 }
 
 std::string CodeGenerator::translate_instruction_core(uint32_t addr, uint32_t instr) {
@@ -1978,9 +2031,14 @@ std::string CodeGenerator::translate_basic_block(
     // Beetle's before-instruction sample and the cycle_compare.py anchor
     // semantics, so ANY block-leader PC is anchorable on both backends (not just
     // function entries). Debug-only: prod (PSX_NO_DEBUG_TOOLS) emits nothing.
+    // The call only while the observer has something to do (debug_server.c
+    // g_debug_block_observe_live: a recorder, an armed probe or window); the
+    // last-block breadcrumb it kept is written either way.
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
     ss << config_.indent
-       << fmt::format("debug_server_cyc_observe(0x{:08X}u);\n", block.start_addr);
+       << fmt::format("g_psx_last_block = 0x{0:08X}u; "
+                      "if (g_debug_block_observe_live) debug_server_cyc_observe(0x{0:08X}u);\n",
+                      block.start_addr);
     ss << "#endif\n";
     // First-divergence co-sim oracle (COSIM_ORACLE.md): lean per-block-leader hook,
     // present only in the clean PSX_COSIM build (independent of the debug tools).
@@ -2061,7 +2119,7 @@ std::string CodeGenerator::translate_basic_block(
         ss << "#endif\n";
     }
 
-    const bool cycle_per_insn = codegen_cycle_per_insn();
+    const bool cycle_per_insn = !config_.cpu_timing_block && codegen_cycle_per_insn();
     // Per-instruction R3000A load-delay interlock (cycle_per_insn mode): §1 base +
     // GPR_DEPRES + DO_LDS, emitted BEFORE the instruction body so §1 precedes any
     // muldiv/GTE deadline stall the body applies (Beetle order). CPU loads (op
@@ -2152,8 +2210,12 @@ std::string CodeGenerator::translate_basic_block(
     };
     if (!cycle_per_insn && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << config_.indent << fmt::format("psx_cpu_charge({}u);\n",
-                                            block_exec_cycles);
+        if (config_.cpu_timing_block)   // [recompiler] cpu_timing = "block"
+            ss << config_.indent << fmt::format("psx_blk_charge({}u, {}u);\n",
+                                                block_exec_cycles, config_.cpu_timing_insn16);
+        else
+            ss << config_.indent << fmt::format("psx_cpu_charge({}u);\n",
+                                                block_exec_cycles);
         ss << "#endif\n";
     }
 
@@ -3739,6 +3801,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
+    ss << "extern int g_debug_block_observe_live;\n";
+    ss << "extern volatile uint32_t g_psx_last_block;\n";
     ss << "#endif\n";
     ss << "#ifdef PSX_COSIM\n";
     ss << "extern void cosim_block(uint32_t block_leader_phys);\n";
@@ -3799,6 +3863,13 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
 
 void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) const {
     const char* kw = as_inline ? "static inline " : "static ";
+    const std::string lwlr_load_line = config_.cpu_timing_block   // see block_timing_rewrite
+        ? fmt::format("    uint32_t word = psx_blk_load_word({}u, cpu, addr & ~3u, rt, reg_mask);\n",
+                      config_.cpu_timing_ram_load)
+        : std::string("    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n");
+    const char* store_word_line = config_.ram_fast_path   // see ram_fast_rewrite
+        ? "    psx_store_word(cpu, aligned_addr, word);\n"
+        : "    cpu->write_word(aligned_addr, word);\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.
@@ -3816,7 +3887,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
     ss << kw << "uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
-    ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
+    ss << lwlr_load_line;
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);\n";
     ss << "        case 1: return (rt_value & 0x0000FFFFu) | (word << 16);\n";
@@ -3830,7 +3901,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
     ss << kw << "uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
-    ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
+    ss << lwlr_load_line;
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return word;\n";
     ss << "        case 1: return (rt_value & 0xFF000000u) | (word >> 8);\n";
@@ -3853,7 +3924,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << "        case 2: word = (word & 0xFF000000u) | (rt_value >> 8); break;\n";
     ss << "        default: word = rt_value; break;\n";
     ss << "    }\n";
-    ss << "    cpu->write_word(aligned_addr, word);\n";
+    ss << store_word_line;
     ss << "}\n";
     ss << "\n";
     ss << "/* SWR: Store Word Right - stores the low bytes of rt_value into memory.\n";
@@ -3870,7 +3941,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << "        case 2: word = (word & 0x0000FFFFu) | (rt_value << 16); break;\n";
     ss << "        default: word = (word & 0x00FFFFFFu) | (rt_value << 24); break;\n";
     ss << "    }\n";
-    ss << "    cpu->write_word(aligned_addr, word);\n";
+    ss << store_word_line;
     ss << "}\n";
     ss << "\n";
 }

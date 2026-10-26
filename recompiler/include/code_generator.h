@@ -186,6 +186,19 @@ struct CodeGenConfig {
     // max before the instruction runs; overlay code keeps its own code.
     std::vector<PSXRecompV4::DrawDistanceClampSite> draw_distance_clamp_sites;
 
+    // [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): stores go to
+    // psx_store_* and byte loads to psx_cyc_load_byte_fast, which take plain
+    // main-RAM accesses straight to RAM and hand the rest to the usual path.
+    bool ram_fast_path = false;
+
+    // [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): one
+    // calibrated charge per block instead of the per-instruction R3000A
+    // pipeline model. cpu_timing_insn16 = cycles per instruction x16;
+    // cpu_timing_ram_load = extra cycles per main-RAM load.
+    bool cpu_timing_block = false;
+    uint32_t cpu_timing_insn16 = 16;
+    uint32_t cpu_timing_ram_load = 4;
+
     // Exact model-participation cosine compares that gain a camera-horizontal
     // aspect envelope while preserving the vanilla vertical cone.
     PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;

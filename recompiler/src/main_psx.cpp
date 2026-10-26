@@ -247,6 +247,9 @@ static int psxrecomp_game_main(int argc, char** argv) {
     std::vector<PSXRecompV4::WidescreenCullScaleSite> ws_cull_scale;
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
     std::vector<PSXRecompV4::DrawDistanceClampSite> draw_distance_clamps; // [[draw_distance.clamp]]
+    bool ram_fast_path = false;   // [recompiler] ram_fast_path
+    bool cpu_timing_block = false;   // [recompiler] cpu_timing = "block"
+    uint32_t cpu_timing_insn16 = 16, cpu_timing_ram_load = 4;
     PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
     int                   ws_cull_activation_guard_pixels = 0;
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
@@ -326,6 +329,10 @@ static int psxrecomp_game_main(int argc, char** argv) {
         ws_cull_scale = cfg.ws_cull_scale_sites;
         ws_cull_angle = cfg.ws_cull_angle_sites;
         draw_distance_clamps = cfg.draw_distance_clamp_sites;
+        ram_fast_path = cfg.ram_fast_path;
+        cpu_timing_block = cfg.cpu_timing_block;
+        cpu_timing_insn16 = cfg.cpu_timing_insn16;
+        cpu_timing_ram_load = cfg.cpu_timing_ram_load;
         ws_aspect_cone = cfg.ws_aspect_cone;
         ws_cull_activation_guard_pixels =
             cfg.ws_cull_activation_guard_pixels;
@@ -1507,6 +1514,10 @@ static int psxrecomp_game_main(int argc, char** argv) {
     codegen_config.ws_cull_scale_sites = ws_cull_scale;
     codegen_config.ws_cull_angle_sites = ws_cull_angle;
     codegen_config.draw_distance_clamp_sites = draw_distance_clamps;
+    codegen_config.ram_fast_path = ram_fast_path;
+    codegen_config.cpu_timing_block = cpu_timing_block;
+    codegen_config.cpu_timing_insn16 = cpu_timing_insn16;
+    codegen_config.cpu_timing_ram_load = cpu_timing_ram_load;
     codegen_config.ws_aspect_cone = ws_aspect_cone;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;

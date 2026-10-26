@@ -129,6 +129,12 @@ uint32_t psx_guest_cycle_scale(void) { return s_psx_gcs_live; }
 uint32_t psx_guest_cycle_scale_config(void) { return s_psx_gcs_cfg; }
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
+/* [recompiler] cpu_timing = "block" costs (psx_cyc.h psx_blk_charge /
+ * psx_blk_load_*): cycles per instruction x16, the carried 1/16 remainder,
+ * cycles per main-RAM load. Set at boot from game.toml (main.cpp). */
+uint32_t g_psx_blk_insn16 = 16u;
+uint32_t g_psx_blk_frac = 0u;
+uint32_t g_psx_blk_ram_load = 4u;
 int      g_psx_cyc_bb_defer = 0;
 uint32_t *g_psx_cyc_local_acc = NULL;
 static int      s_cycle_replay_active = 0;

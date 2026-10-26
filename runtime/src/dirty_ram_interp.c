@@ -3280,7 +3280,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * cyc_watch (parity with the compiled emitter's block-leader observe).
          * Early-returns when cyc_watch is disarmed → ~free in normal runs. */
         g_ls_dirty_observe = 1;
-        debug_server_cyc_observe(pc & 0x1FFFFFFFu);
+        { extern int g_debug_block_observe_live; extern volatile uint32_t g_psx_last_block;
+          g_psx_last_block = pc & 0x1FFFFFFFu;
+          if (g_debug_block_observe_live) debug_server_cyc_observe(pc & 0x1FFFFFFFu); }
         g_ls_dirty_observe = 0;
 #endif
 #ifdef PSX_COSIM
@@ -4159,6 +4161,9 @@ void ls_func_exit(uint32_t entry_pc, CPUState *cpu, int handled) {
     }
     lsf_replay_and_compare(cpu, s_lsf_frame, s_lsf_entry);
 }
+
+/* Whether ls_at_leader can act (debug_server.c: the block observer's gate). */
+int ls_leader_armed(void) { return s_lsf_active || s_ls_frame_hi != 0; }
 
 void ls_at_leader(uint32_t leader_phys, CPUState *cpu) {
     if (s_lsf_active) {

@@ -2628,3 +2628,79 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     }
     unmapped_fatal(addr, phys, "WRITE");
 }
+
+/* [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): the game emitter's
+ * store entries. A store goes straight to RAM only when psx_write_* would do
+ * nothing but write the bytes, count the store and note it for the idle-skip
+ * detector: the CPU's own store pointer (a mod's guest view drops stores),
+ * aligned main RAM above the kernel window, no overlay cycles to publish
+ * first, no render pass, lockstep, data-shard recording, DMA or host store,
+ * cache isolation or armed recorder, and a page no code watcher acts on
+ * (executed code whose evidence a write clears, a watched overlay page, game
+ * text not yet seen modified). Everything else takes cpu->write_*. */
+extern int g_parity_trace_armed;               /* parity_trace.c */
+extern volatile int g_card_data_writes_armed;  /* card_data_writes.c */
+
+static inline int psx_store_fast_off(uint32_t addr, uint32_t size, uint32_t *off_out) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (addr >= 0xC0000000u || (addr & (size - 1u))) return 0;
+    const uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= PSX_MAIN_RAM_WINDOW_BYTES) return 0;
+    if (g_overlay_flush_pending_cycles || g_psx_render_pass_active || g_ls_mode != 0 ||
+        g_ds_recording || g_dma_exec_depth > 0 || g_host_store_depth > 0 ||
+        g_parity_trace_armed || g_card_data_writes_armed ||
+        (sr_ptr && (*sr_ptr & 0x10000u)))
+        return 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_debug_write_trace_live) return 0;
+#endif
+#ifdef PSX_COSIM
+    return 0;
+#endif
+    const uint32_t off = phys & g_psx_ram_mask;
+    if (off < DIRTY_RAM_KERNEL_TRACK_BYTES) return 0;
+    const uint32_t pg = off >> DIRTY_RAM_PAGE_SHIFT, bit = 1u << (pg & 31u);
+    if ((g_dirty_ram_exec_page_bitmap[pg >> 5] | overlay_watch_bitmap[pg >> 5]) & bit) return 0;
+    if (text_ref_image && off + size > text_ref_lo && off < text_ref_hi &&
+        !(text_modified_bitmap[pg >> 5] & bit))
+        return 0;
+    *off_out = off;
+    return 1;
+}
+
+void psx_store_word(CPUState *cpu, uint32_t addr, uint32_t val) {
+    uint32_t off;
+    if (cpu->write_word == psx_write_word && psx_store_fast_off(addr, 4u, &off) &&
+        off != D44_PHYS) {
+        g_guest_store_count++;
+        if (g_psx_track_last_store) {
+            g_guest_last_store_addr = addr;
+            g_guest_last_store_val = val;
+        }
+        memcpy(&ram[off], &val, 4u);
+        return;
+    }
+    cpu->write_word(addr, val);
+}
+
+void psx_store_half(CPUState *cpu, uint32_t addr, uint16_t val) {
+    uint32_t off;
+    if (cpu->write_half == psx_write_half && psx_store_fast_off(addr, 2u, &off)) {
+        g_guest_store_count++;
+        if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
+        memcpy(&ram[off], &val, 2u);
+        return;
+    }
+    cpu->write_half(addr, val);
+}
+
+void psx_store_byte(CPUState *cpu, uint32_t addr, uint8_t val) {
+    uint32_t off;
+    if (cpu->write_byte == psx_write_byte && psx_store_fast_off(addr, 1u, &off)) {
+        g_guest_store_count++;
+        if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
+        ram[off] = val;
+        return;
+    }
+    cpu->write_byte(addr, val);
+}

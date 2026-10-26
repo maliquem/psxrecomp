@@ -232,6 +232,14 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
         h.u32((uint32_t)lcb.size());
         for (uint32_t pc : lcb) h.u32(pc);
     }
+    // Performance modes (docs/PERFORMANCE_MODES.md): appended only when on, so
+    // a title on the default path keeps the hash and its overlay cache.
+    if (c.ram_fast_path) h.tag("ram_fast_path");
+    if (c.cpu_timing_block) {
+        h.tag("cpu_timing_block");
+        h.u32(c.cpu_timing_insn16);
+        h.u32(c.cpu_timing_ram_load);
+    }
     return h.value;
 }
 
@@ -938,6 +946,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("pgxp_cpu_mode")) {
             rt.video_pgxp_cpu_mode = toml::find<bool>(video, "pgxp_cpu_mode");
+        }
+        if (video.contains("pgxp_alu")) {
+            const std::string m = toml::find<std::string>(video, "pgxp_alu");
+            if (m != "full" && m != "moves")
+                throw std::runtime_error(fmt::format(
+                    "[video] pgxp_alu must be 'full' or 'moves', got '{}'", m));
+            rt.video_pgxp_alu_light = (m == "moves");
         }
         if (video.contains("pgxp_tolerance")) {
             rt.video_pgxp_tolerance =
@@ -2986,6 +3001,25 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     loaded.ws_cull_masked_reject_sites = std::move(ws_cull_masked_reject_sites);
     loaded.draw_distance_clamp_sites =
         parse_draw_distance_clamps(cfg, config_path);
+    loaded.ram_fast_path = recomp.contains("ram_fast_path") &&
+                           toml::find<bool>(recomp, "ram_fast_path");
+    if (recomp.contains("cpu_timing")) {
+        const std::string t = toml::find<std::string>(recomp, "cpu_timing");
+        if (t != "pipeline" && t != "block")
+            throw std::runtime_error(fmt::format(
+                "{}: [recompiler].cpu_timing must be 'pipeline' or 'block'", config_path.string()));
+        loaded.cpu_timing_block = (t == "block");
+    }
+    if (recomp.contains("cpu_timing_insn")) {
+        const toml::value& tv = toml::find(recomp, "cpu_timing_insn");
+        const double v = tv.is_integer() ? (double)tv.as_integer() : tv.as_floating();
+        if (!(v > 0.0 && v <= 16.0))
+            throw std::runtime_error(fmt::format(
+                "{}: [recompiler].cpu_timing_insn must be in (0, 16]", config_path.string()));
+        loaded.cpu_timing_insn16 = (uint32_t)(v * 16.0 + 0.5);
+    }
+    if (recomp.contains("cpu_timing_ram_load"))
+        loaded.cpu_timing_ram_load = (uint32_t)toml::find<int64_t>(recomp, "cpu_timing_ram_load");
     loaded.quality_presets = parse_quality_presets(cfg, root, config_path);
     return loaded;
 }

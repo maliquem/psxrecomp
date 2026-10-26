@@ -458,6 +458,10 @@ static WriteTraceAllEntry *s_wtrace_all = NULL;
  * now (the catch-all ring, the fingerprint, card traces, the sampler). */
 static int s_passive_policy = 1;
 int g_debug_write_trace_live = 1;   /* recomputed by write_trace_live_refresh */
+/* Whether the per-block-leader observer (debug_server_cyc_observe) has anything
+ * to do: the generated code skips the call while it is 0. Recomputed with
+ * g_debug_write_trace_live. */
+int g_debug_block_observe_live = 1;
 /* The built-in write-trace ranges, armed at init but held back (counts 0)
  * while the passive recorders are off; passive_on_first_request arms them. */
 static int s_wtrace_held = 0, s_wtrace_held_n[3];
@@ -5740,8 +5744,11 @@ static void handle_pgxp(int id, const char *json)
         gpu_texture_correction_set(gpu_texture_correction_enabled());
     }
     int cm = json_get_int(json, "cpu_mode", -1);
-    if (cm >= 0)
+    if (cm >= 0) {
+        extern void psx_pgxp_alu_cpu_mode(int cpu_mode);   /* pgxp_session.cpp */
         pgxp_set_cpu_mode(cm != 0);
+        psx_pgxp_alu_cpu_mode(cm != 0);
+    }
     int pf = json_get_int(json, "position_fallback", -1);
     if (pf >= 0)
         pgxp_set_position_fallback(pf != 0);
@@ -17315,6 +17322,16 @@ static void write_trace_live_refresh(void) {
     g_debug_write_trace_live = s_passive || s_fmv_quiet || s_rec_frame >= 0 || s_wtrace_all ||
                                s_wtrace_range_count || s_wtrace_boot_range_count ||
                                s_wtrace_trans_range_count;
+    /* The block observer: the passive recorders, an armed cyc_watch, pc_probe or
+     * lockstep window, or a title debug knob read from the environment there. */
+    static int s_observe_env = -1;
+    if (s_observe_env < 0) {
+        const char *a = getenv("PSX_ND_WOOD_CLEAR80"), *b = getenv("PSX_ND_SIB_OT_LIFT");
+        s_observe_env = (a && *a) || (b && *b);
+    }
+    extern int ls_leader_armed(void);
+    g_debug_block_observe_live = s_passive || s_cyc_watch_armed || s_pc_probe_armed ||
+                                 ls_leader_armed() || s_observe_env;
 }
 
 /* Policy 2: the first request turns the passive recorders on (on the
