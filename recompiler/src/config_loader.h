@@ -1682,6 +1682,10 @@ struct UserSettings {
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
     bool has_skip_launcher  = false; bool skip_launcher  = false;
+    // [debug] toggle_keys — the debug-tools builds' live rendering A/B keys
+    // (0-9, F10-F12) answer only when true (off by default: the number and
+    // function keys are a title's). PSX_DEBUG_TOGGLES=0/1 wins for a run.
+    bool has_debug_toggle_keys = false; bool debug_toggle_keys = false;
     // [netplay] — display name for lobby browser / room. Prompted once on first
     // Netplay Lobbies visit; Change Player Name updates it.
     bool has_netplay_player_name = false; std::string netplay_player_name;

@@ -3345,6 +3345,12 @@ UserSettings load_user_settings(const fs::path& path) {
             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
         });
     }
+    if (doc.contains("debug")) {
+        const toml::value& d = toml::find(doc, "debug");
+        if (d.contains("toggle_keys")) try_get([&]{
+            s.debug_toggle_keys = toml::find<bool>(d, "toggle_keys"); s.has_debug_toggle_keys = true;
+        });
+    }
     if (doc.contains("netplay")) {
         const toml::value& n = toml::find(doc, "netplay");
         if (n.contains("player_name")) try_get([&]{
@@ -3654,6 +3660,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     }
     if (s.has_skip_launcher)
         f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
+    if (s.has_debug_toggle_keys)
+        f << "\n[debug]\ntoggle_keys = " << (s.debug_toggle_keys ? "true" : "false") << "\n";
     if ((s.has_netplay_player_name && !s.netplay_player_name.empty()) ||
         (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())) {
         f << "\n[netplay]\n";

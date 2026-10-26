@@ -589,6 +589,7 @@ static uint64_t s_fps_last_flips = 0;   /* gpu_display_flips() at the window's s
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static PSXModPerfHandler s_perf_handler = nullptr;   /* a title shows the readout (psx_mod_set_perf_handler) */
+static int      g_debug_toggle_keys = 0;      /* settings.toml [debug] toggle_keys (the A/B keys below) */
 static FramePacer s_frame_pacer = { 0 };
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
@@ -11001,7 +11002,9 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
 
 #ifndef PSX_NO_DEBUG_TOOLS
 /* ---- Live rendering A/B keys (debug-tools builds) --------------------------
- * PSX_DEBUG_TOGGLES=0 turns them off. Each key flips one rendering feature
+ * Off unless settings.toml [debug] toggle_keys = true (the number and function
+ * keys are a title's: shortcuts, menus); PSX_DEBUG_TOGGLES=1/0 wins for a run.
+ * The TCP debug_key command reaches them either way. Each key flips one rendering feature
  * while the game runs and shows the new state on the OSD:
  *   1 internal scale 1x -> 2x -> 4x -> Match display (ceiling) -> 1x
  *   2 dynamic resolution controller   3 widescreen 16:9 native-wide / 4:3
@@ -11020,9 +11023,9 @@ extern "C" void gpu_texture_correction_set(int enabled);
 extern "C" int  gpu_texture_correction_enabled(void);
 extern "C" int  gl_renderer_get_wide_fast(void);
 static int debug_toggles_on(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = std::getenv("PSX_DEBUG_TOGGLES"); on = !(e && e[0] == '0'); }
-    return on;
+    const char *e = std::getenv("PSX_DEBUG_TOGGLES");
+    if (e && e[0]) return e[0] != '0';
+    return g_debug_toggle_keys;
 }
 static int s_dbg_scale_target = 0;
 static const char *dbg_texfilter_name(int f) {
@@ -19033,6 +19036,7 @@ int main(int argc, char** argv) {
                 "again from the launcher (a fresh settings.toml will be written).");
         }
         if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
+        if (us.has_debug_toggle_keys) g_debug_toggle_keys = us.debug_toggle_keys ? 1 : 0;
         if (us.has_renderer) {
             if (us.renderer == 2 && !vulkan_offered) {
                 g_video_renderer = 1;

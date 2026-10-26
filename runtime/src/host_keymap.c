@@ -297,6 +297,18 @@ void host_keymap_set(HostKeymapAction action, int scancode, int mods) {
     s_actions[action].explicit_unbound = s_actions[action].count == 0;
 }
 
+void host_keymap_add(HostKeymapAction action, int scancode, int mods) {
+    if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return;
+    if (scancode <= 0 || scancode >= SDL_NUM_SCANCODES) return;
+#if defined(PSX_SDL3)
+    const int key = (int)SDL_GetKeyFromScancode((SDL_Scancode)scancode, SDL_KMOD_NONE, false);
+#else
+    const int key = (int)SDL_GetKeyFromScancode((SDL_Scancode)scancode);
+#endif
+    add_bind(action, key, scancode, mods & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT));
+    if (s_actions[action].count) s_actions[action].explicit_unbound = 0;
+}
+
 void host_keymap_reset_defaults(void) {
     clear_all();
     apply_defaults();

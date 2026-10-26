@@ -54,6 +54,9 @@ const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap);
 int host_keymap_get(HostKeymapAction action, int *mods);
 /* Bind `action` to one key (scancode, mods); scancode 0 = unbound. */
 void host_keymap_set(HostKeymapAction action, int scancode, int mods);
+/* One more key for `action` (a title's defaults: F11 and Alt+Enter); the
+ * first stays the one host_keymap_get gives. */
+void host_keymap_add(HostKeymapAction action, int scancode, int mods);
 /* Every action back to its built-in default. */
 void host_keymap_reset_defaults(void);
 /* Write [KeyMap] (every action) into config_ini_path, keeping the file's
