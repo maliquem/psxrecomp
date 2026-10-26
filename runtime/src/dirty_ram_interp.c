@@ -2371,7 +2371,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2380,7 +2380,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = ws_clip_edge_load(pc,
             (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs));
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2388,7 +2388,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwl_merge(addr, word, cpu->gpr[rt]);
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2407,14 +2407,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         else
             cpu->gpr[rt] = ws_clip_edge_load(pc,
                 psx_cyc_load_word(cpu, addr, rt, 1u << rs));
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x24: { /* LBU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2423,7 +2423,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = ws_clip_edge_load(pc,
             (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs));
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2431,7 +2431,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwr_merge(addr, word, cpu->gpr[rt]);
-        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2439,7 +2439,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         cpu->write_byte(addr, (uint8_t)cpu->gpr[rt]);
-        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt] & 0xFFu);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt] & 0xFFu);
         return 0;
     }
     case 0x29: { /* SH */
@@ -2455,14 +2455,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             val = (uint16_t)psx_ws_backdrop_x((int16_t)val);
         g_debug_last_store_pc = pc;
         cpu->write_half(addr, val);
-        psx_pgxp_store(cpu, insn, addr, val);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_store(cpu, insn, addr, val);
         return 0;
     }
     case 0x2A: { /* SWL */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swl(cpu, addr, cpu->gpr[rt]);
-        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2B: { /* SW */
@@ -2470,14 +2470,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (addr & 3) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         g_debug_last_store_pc = pc;
         cpu->write_word(addr, cpu->gpr[rt]);
-        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2E: { /* SWR */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swr(cpu, addr, cpu->gpr[rt]);
-        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
+        if (PGXP_MEM_ON(insn)) psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x32: { /* LWC2 — §1+DO_LDS charged by exec_one's top step (mask 0) */

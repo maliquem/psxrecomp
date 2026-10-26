@@ -116,6 +116,10 @@ typedef struct PSXPgxpSessionConfig {
      * class), 1 "moves" (the light mode). PSX_PGXP_ALU overrides: full, moves
      * or a class mask (pgxp_hooks.h PGXP_ALU_K_*). */
     int alu_light;
+    /* [video] pgxp_mem: 0 "all" (every load/store hook), 1 "words" (no byte
+     * or halfword hooks). PSX_PGXP_MEM overrides: all, words or a skip mask
+     * (pgxp_hooks.h g_pgxp_mem_skip). */
+    int mem_words;
 } PSXPgxpSessionConfig;
 
 /* The ALU hook class mask in force (pgxp_hooks.h g_pgxp_alu_mask): the

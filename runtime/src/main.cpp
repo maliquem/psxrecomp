@@ -46,9 +46,10 @@
 #include "autocompile.h"
 #include "code_provider.h"
 extern "C" void psx_event_step_conservative_env_init(void);
+/* [runtime] overlay_precompile: 1 = request pending, 2 = requested. */
+static int g_overlay_precompile = 0;
 /* memory.c's last-word-store record for the idle-loop detector. */
 extern "C" int g_psx_track_last_store;
-extern "C" uint32_t g_psx_blk_insn16, g_psx_blk_ram_load;   /* psx_cycles.c: cpu_timing = "block" */
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
 #include "gpu.h"
@@ -1445,6 +1446,7 @@ static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
 static int           g_video_pgxp_alu_light        = 0;   /* [video] pgxp_alu = "moves" */
+static int           g_video_pgxp_mem_words        = 0;   /* [video] pgxp_mem = "words" */
 static float         g_video_pgxp_tolerance        = 0.5f;
 /* game.toml [video] tuning. Session arming selects dataflow-only/no-clamp
  * defaults in hook builds unless the title supplied an explicit value. */
@@ -9586,6 +9588,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         uint64_t perf_start = runtime_perf_section_begin();
         const CodeProvider *cp = code_provider_active();
         if (cp->poll_main) cp->poll_main();
+        /* [runtime] overlay_precompile: one request for every captured overlay
+         * still missing from the cache, once boot is past (retried while the
+         * provider is busy or not ready). */
+        if (g_overlay_precompile == 1 && s_frame_count >= 120u && cp->request &&
+            !(cp->busy && cp->busy()) && cp->request())
+            g_overlay_precompile = 2;
         runtime_perf_section_end(perf_start,
                                  &g_runtime_perf.provider_poll_ticks);
     }
@@ -9897,6 +9905,20 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     snprintf(msg, sizeof(msg), "Fast forward: %dx", mult);
                 host_osd_push(msg, 900);
             }
+            /* Present skip: the turbo never waits for the screen. A frame is
+             * shown only when the render thread has finished every frame
+             * before it and one host refresh has passed since the last one
+             * shown; the others are still drawn (VRAM stays right), just not
+             * shown, and the swap runs without vsync while the turbo lasts.
+             * PSX_TURBO_PRESENT_SKIP=0: the fixed 1-in-2 / 1-in-4 cadence,
+             * every shown frame waiting for the screen. */
+            static int s_present_skip = -1;
+            if (s_present_skip < 0) {
+                const char *e = std::getenv("PSX_TURBO_PRESENT_SKIP");
+                s_present_skip = (e && e[0] == '0') ? 0 : 1;
+            }
+            if (s_present_skip && !turbo_was_down && g_gl_active)
+                gl_renderer_set_swap_interval(0);
             turbo_was_down = 1;
             if (mult >= 2 && g_frame_period_ms > 0.0) {
                 uint64_t perf_start = runtime_perf_section_begin();
@@ -9906,13 +9928,27 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                          &g_runtime_perf.pacer_ticks);
                 latency_ring_mark(LAT_PACED);
             }
-            turbo_skip = (turbo_skip + 1) % present_every;
-            if (turbo_skip != 0) {
-                ep.skip_pace = 1;
-                return ep;  /* skip render this frame */
+            if (s_present_skip) {
+                static uint64_t s_turbo_last_present = 0;
+                const uint64_t now = SDL_GetPerformanceCounter();
+                const double hz = g_host_refresh_hz > 0.0 ? g_host_refresh_hz : 60.0;
+                const uint64_t gap = (uint64_t)((double)SDL_GetPerformanceFrequency() / hz);
+                if (now - s_turbo_last_present < gap || rt_frames_in_flight() > 0) {
+                    ep.skip_pace = 1;
+                    return ep;  /* drawn, not shown */
+                }
+                s_turbo_last_present = now;
+            } else {
+                turbo_skip = (turbo_skip + 1) % present_every;
+                if (turbo_skip != 0) {
+                    ep.skip_pace = 1;
+                    return ep;  /* skip render this frame */
+                }
             }
         } else {
             turbo_skip = 0;
+            if (turbo_was_down)
+                apply_present_cadence();   /* the screen's own swap interval again */
             turbo_was_down = 0;
         }
     }
@@ -18372,6 +18408,11 @@ int main(int argc, char** argv) {
                                                     &g_guest_last_store_addr,
                                                     &g_guest_last_store_val);
                 }
+                {   /* [runtime] overlay_precompile (the request in the frame tick) */
+                    const char *pe = std::getenv("PSX_OVERLAY_PRECOMPILE");
+                    g_overlay_precompile = pe && pe[0] ? (pe[0] == '1')
+                                                       : (gc.runtime.overlay_precompile ? 1 : 0);
+                }
                 const char *ext_env = std::getenv("PSX_IDLE_SKIP_EXT");
                 g_idle_skip_ext = ext_env ? (ext_env[0] == '1' ? 1 : 0)
                                           : (gc.runtime.idle_skip_store_counters ? 1 : 0);
@@ -18432,15 +18473,7 @@ int main(int argc, char** argv) {
                 gc.runtime.video_perspective_texturing ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_alu_light = gc.runtime.video_pgxp_alu_light ? 1 : 0;
-            {   /* [recompiler] cpu_timing = "block" costs (psx_cycles.c);
-                 * PSX_BLK_INSN / PSX_BLK_RAM_LOAD override them for calibration. */
-                g_psx_blk_insn16 = gc.cpu_timing_insn16;
-                g_psx_blk_ram_load = gc.cpu_timing_ram_load;
-                if (const char* e = std::getenv("PSX_BLK_INSN"))
-                    if (std::atof(e) > 0.0) g_psx_blk_insn16 = (uint32_t)(std::atof(e) * 16.0 + 0.5);
-                if (const char* e = std::getenv("PSX_BLK_RAM_LOAD"))
-                    g_psx_blk_ram_load = (uint32_t)std::atoi(e);
-            }
+            g_video_pgxp_mem_words = gc.runtime.video_pgxp_mem_words ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_pgxp_tolerance_set = gc.runtime.video_pgxp_tolerance_set;
             g_video_pgxp_position_fallback_set =
@@ -20946,6 +20979,7 @@ session_reboot:
     pgxp_cfg.video_texture = g_video_perspective_texturing;
     pgxp_cfg.video_cpu_mode = g_video_pgxp_cpu_mode;
     pgxp_cfg.alu_light = g_video_pgxp_alu_light;
+    pgxp_cfg.mem_words = g_video_pgxp_mem_words;
     pgxp_cfg.tolerance = g_video_pgxp_tolerance;
     pgxp_cfg.position_fallback = g_video_pgxp_position_fallback;
     pgxp_cfg.tolerance_set = g_video_pgxp_tolerance_set;

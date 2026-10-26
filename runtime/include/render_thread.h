@@ -93,6 +93,9 @@ void rt_frame_end(void);
 /* Render-thread query while executing: how many complete frames are queued
  * after the frame whose record is being executed (0 = it is the newest). */
 int  rt_frames_ahead(void);
+/* Producer query: closed frames the render thread has not finished yet
+ * (0 = it has caught up with every frame end). The turbo's present skip. */
+int  rt_frames_in_flight(void);
 /* Render-thread query: the consumer's running idle total (waiting for
  * records, or parked while the emulation thread holds the context). */
 uint64_t rt_render_idle_ns(void);

@@ -5187,7 +5187,31 @@ int gpu_display_is_depth24(void) {
     return (int)(display_depth & 1u);
 }
 
+static void gpu_compute_display_info(GpuDisplayInfo* out);
+
+/* The display info is a pure function of these GP1 registers; the widescreen
+ * code asks for it per primitive. Each thread keeps the last answer and its
+ * inputs (the render thread asks too). */
 void gpu_get_display_info(GpuDisplayInfo* out) {
+    static _Thread_local GpuDisplayInfo s_memo;
+    static _Thread_local uint32_t s_key[12];
+    static _Thread_local int s_have;
+    const uint32_t key[12] = {
+        display_area_x, display_area_y, display_depth, display_disabled,
+        hres1, hres2, h_display_x1, h_display_x2,
+        video_mode, v_display_y1, v_display_y2, vres,
+    };
+    if (s_have && memcmp(key, s_key, sizeof(key)) == 0) {
+        *out = s_memo;
+        return;
+    }
+    gpu_compute_display_info(out);
+    memcpy(s_key, key, sizeof(key));
+    s_memo = *out;
+    s_have = 1;
+}
+
+static void gpu_compute_display_info(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
     out->depth24   = (int)(display_depth & 1u);

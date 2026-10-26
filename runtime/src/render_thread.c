@@ -10,6 +10,7 @@
  * can never fall between a check and a wait. */
 
 #include "render_thread.h"
+#include "host_sampler.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -119,6 +120,11 @@ static struct {
     uint32_t pend_payload;
     int      pending;
     uint64_t unwoken_bytes, unwoken_records;
+    /* The consumer's position as last read: it only grows, so space it shows
+     * is really there. Reloaded only when it shows too little (and for the
+     * high-water statistic), so a record does not read the consumer's cache
+     * line. */
+    uint64_t rpos_seen;
     uint32_t seq;
     int      held;
 
@@ -204,6 +210,7 @@ static void *render_main(void *arg)
 {
     (void)arg;
     t_render = 1;
+    host_sampler_register_render_thread();   /* PSX_HOST_SAMPLER_THREAD=render */
     R.ctx(R.user, 1);
     uint64_t r = atomic_load(&R.rpos);
     int have_ctx = 1;
@@ -269,6 +276,10 @@ static void wake_render(int force) {
     if (!force && R.unwoken_bytes < WAKE_BYTES && R.unwoken_records < WAKE_RECORDS)
         return;
     R.unwoken_bytes = R.unwoken_records = 0;
+    /* wpos is published with a release store (rt_cmd_commit): order it before
+     * the sleeping-flag load, as the consumer orders its flag store before its
+     * wpos load, so one of the two always sees the other. */
+    atomic_thread_fence(memory_order_seq_cst);
     if (atomic_load(&R.render_sleeping)) {
         mtx_lock(&R.mtx);
         cnd_bcast(&R.cv_work);
@@ -296,6 +307,11 @@ static int pred_space(uint64_t need_end) {   /* need_end: wpos after the write *
     return need_end - atomic_load(&R.rpos) <= R.cap;
 }
 static int pred_drained(uint64_t w) { return atomic_load(&R.rpos) == w; }
+static int space_seen(uint64_t need_end) {   /* pred_space through rpos_seen */
+    if (need_end - R.rpos_seen <= R.cap) return 1;
+    R.rpos_seen = atomic_load_explicit(&R.rpos, memory_order_acquire);
+    return need_end - R.rpos_seen <= R.cap;
+}
 static int pred_frames(uint64_t limit) {
     return atomic_load(&R.frames_produced) - atomic_load(&R.frames_consumed) <= limit;
 }
@@ -308,7 +324,7 @@ void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
     uint64_t w = atomic_load_explicit(&R.wpos, memory_order_relaxed);
     uint64_t off = w & R.mask;
     uint64_t pad = (off + size > R.cap) ? R.cap - off : 0;
-    if (!pred_space(w + pad + size)) {
+    if (!space_seen(w + pad + size)) {
         uint64_t t0 = now_ns();
         R.full_waits++;
         emu_wait(pred_space, w + pad + size);
@@ -337,11 +353,14 @@ void rt_cmd_commit(void) {
     if (!R.pending) return;
     R.pending = 0;
     uint64_t end = R.pend_start + R.pend_size;
-    atomic_store(&R.wpos, end);
+    atomic_store_explicit(&R.wpos, end, memory_order_release);
     R.records++;
     R.bytes += R.pend_size;
-    uint64_t depth = end - atomic_load(&R.rpos);
-    if (depth > R.high_water) R.high_water = depth;
+    if (end - R.rpos_seen > R.high_water) {   /* a new high only if the real depth says so */
+        R.rpos_seen = atomic_load_explicit(&R.rpos, memory_order_acquire);
+        uint64_t depth = end - R.rpos_seen;
+        if (depth > R.high_water) R.high_water = depth;
+    }
     R.unwoken_bytes += R.pend_size;
     R.unwoken_records++;
     wake_render(0);
@@ -376,6 +395,11 @@ void rt_frame_end(void) {
         R.bp_ns += now_ns() - t0;
         atomic_fetch_add(&R.bp_events, 1);
     }
+}
+
+int rt_frames_in_flight(void) {
+    if (!rt_running()) return 0;
+    return (int)(atomic_load(&R.frames_produced) - atomic_load(&R.frames_consumed));
 }
 
 int rt_frames_ahead(void) {

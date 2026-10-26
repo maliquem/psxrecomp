@@ -23,6 +23,9 @@ typedef struct HostSample {
 
 /* Start sampling the calling thread (the emulation thread). Idempotent. */
 void host_sampler_start(void);
+/* Called by the render thread when it starts: with PSX_HOST_SAMPLER_THREAD=render
+ * (Windows) the sampler samples that thread instead, into the same ring. */
+void host_sampler_register_render_thread(void);
 int host_sampler_supported(void);
 /* Total samples recorded; the ring holds the newest HOST_SAMPLER_CAP. */
 uint64_t host_sampler_seq(void);

@@ -163,8 +163,8 @@ uint32_t CodeGenerator::partial_block_cycle_count(uint32_t addr,
 std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
                                                        const ControlFlowGraph& cfg,
                                                        const std::string& indent) const {
-    if (!config_.cpu_timing_block && codegen_cycle_per_insn()) {
-        return "";
+    if (config_.cpu_timing_block || codegen_cycle_per_insn()) {
+        return "";   // block mode charges each run before its label (generate_block)
     }
 
     uint32_t cycles = partial_block_cycle_count(addr, cfg);
@@ -174,16 +174,9 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
 
     std::stringstream ss;
     ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    if (config_.cpu_timing_block) {
-        // [recompiler] cpu_timing = "block": the calibrated cost of the
-        // instructions from here to the block's end, batched like the
-        // per-instruction charges.
-        ss << indent << fmt::format("psx_blk_charge({}u, {}u);\n", cycles, config_.cpu_timing_insn16);
-    } else {
-        // The CPU charge (psx_cycles.h): the same call in native and overlay
-        // DLL code; [timing] guest_cycle_scale is applied inside it.
-        ss << indent << fmt::format("psx_cpu_charge({}u);\n", cycles);
-    }
+    // The CPU charge (psx_cycles.h): the same call in native and overlay
+    // DLL code; [timing] guest_cycle_scale is applied inside it.
+    ss << indent << fmt::format("psx_cpu_charge({}u);\n", cycles);
     ss << "#endif\n";
     return ss.str();
 }
@@ -978,27 +971,80 @@ std::string CodeGenerator::draw_distance_clamp_prefix(uint32_t addr,
     return {};
 }
 
-/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): a block of n
- * instructions charges psx_blk_charge(n) once at its head (n x the per-
- * instruction cost, psx_cyc.h) instead of the R3000A pipeline model per
- * instruction (load-delay interlock, I-cache fetches), and a main-RAM load
- * adds its own cost (psx_blk_load_*). Mult/div and GTE stalls, scratchpad and
- * device accesses keep their own timing. Not exact: an option for speed. The
- * literals emitted are the game.toml costs, which overlay DLLs use; the main
- * program takes the runtime's (the same, unless overridden for calibration). */
-static std::string block_timing_rewrite(std::string s, const CodeGenConfig& c) {
-    const std::string cost = fmt::format("{}u, ", c.cpu_timing_ram_load);
+/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): the loads
+ * take the block helpers (psx_cyc.h psx_blk_*), which charge only the access,
+ * from the emitter's packed cost of this load (blk_pipe_run below). */
+static std::string block_timing_rewrite(std::string s, uint32_t packed) {
+    const std::string p = fmt::format("0x{:X}u, ", packed);
     const std::pair<std::string, std::string> swaps[] = {
-        {"psx_cyc_load_word(", "psx_blk_load_word(" + cost},
-        {"psx_cyc_load_half(", "psx_blk_load_half(" + cost},
-        {"psx_cyc_load_byte(", "psx_blk_load_byte(" + cost},
-        {"psx_cyc_load_byte_fast(", "psx_blk_load_byte(" + cost},
+        {"psx_cyc_load_word(", "psx_blk_load_word(" + p},
+        {"psx_cyc_load_half(", "psx_blk_load_half(" + p},
+        {"psx_cyc_load_byte(", "psx_blk_load_byte(" + p},
+        {"psx_cyc_load_byte_fast(", "psx_blk_load_byte(" + p},
+        {"psx_cyc_lwc2_read(", "psx_blk_lwc2_read(" + p},
+        {"psx_lwl(", "psx_lwl(" + p},
+        {"psx_lwr(", "psx_lwr(" + p},
     };
     for (const auto& [from, to] : swaps) {
-        for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size()))
-            s.replace(p, from.size(), to);
+        for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size()))
+            s.replace(at, from.size(), to);
     }
     return s;
+}
+
+/* The R3000A load-delay pipeline of psx_cyc.h (Beetle's ReadAbsorb / ReadFudge
+ * / LDAbsorb / LDWhich: psx_cyc_step, psx_cyc_load_*, psx_cyc_lwc2_read) run
+ * over a block's instructions in execution order, from a clean pipeline (no
+ * load pending, no give-back), every load in main RAM. Returns the base cycles
+ * (the +1 of each instruction not absorbed by a give-back); base[i] gets each
+ * one's, fudge[i] the +2 fudge a load pays. With `ov` < size the load there
+ * arms a give-back of ov_absorb instead of its main-RAM one. */
+static uint32_t blk_pipe_run(const std::vector<uint32_t>& w, size_t ov, uint32_t ov_absorb,
+                             std::vector<uint8_t>* base, std::vector<uint8_t>* fudge) {
+    uint32_t absorb[33] = {};
+    uint32_t which = 0, read_fudge = 0x20, ld_which = 0x20, ld_absorb = 0, total = 0;
+    for (size_t i = 0; i < w.size(); i++) {
+        const uint32_t op = w[i] >> 26, rt = (w[i] >> 16) & 31u;
+        const bool cpu_load = op >= 0x20u && op <= 0x26u, lwc2 = op == 0x32u;
+        uint32_t c = 1;                                               /* §1 base */
+        if (absorb[which]) { absorb[which]--; c = 0; }
+        const uint32_t mask = psx_cyc_dep_res_mask(w[i]) & 0xFFFFFFFEu; /* GPR_DEPRES */
+        for (uint32_t r = 1; r < 32; r++)
+            if (mask & (1u << r)) absorb[r] = 0;
+        if (cpu_load && ld_which == rt) ld_which = 0;                 /* cancel */
+        absorb[ld_which] = ld_absorb;                                 /* DO_LDS */
+        read_fudge = ld_which;
+        which |= ld_which & 0x1Fu;
+        ld_which = 0x20;
+        uint32_t f = 0;
+        if (cpu_load || lwc2) {                                       /* ReadMemory */
+            absorb[which] = 0;
+            which = 0;
+            f = (read_fudge >> 4) & 2u;
+            ld_absorb = i == ov ? ov_absorb : (cpu_load ? 5u : 4u);
+            ld_which = cpu_load ? rt : 0x20u;
+        }
+        total += c;
+        if (base) (*base)[i] = (uint8_t)c;
+        if (fudge) (*fudge)[i] = (uint8_t)f;
+    }
+    return total;
+}
+
+/* A body that can see the guest clock (or hand it to the runtime): memory,
+ * GTE and mult/div timing, COP0, exceptions, calls, hooks. The block mode
+ * charges the cycles up to and including the instruction before it runs. */
+static bool blk_body_observes(const std::string& body) {
+    static const char* const k[] = {
+        "psx_cyc_", "psx_blk_", "psx_check_interrupts", "psx_advance", "psx_slice",
+        "psx_mod_", "psx_read_", "psx_write_", "psx_store_", "psx_muldiv", "psx_mult",
+        "psx_gte", "gte_", "psx_icache", "psx_cpu_charge", "cop0", "exception",
+        "longjmp", "psx_sw", "psx_lw", "cpu->write", "cpu->read", "call_by_address",
+        "psx_dispatch", "func_",
+    };
+    for (const char* f : k)
+        if (body.find(f) != std::string::npos) return true;
+    return false;
 }
 
 /* [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): the plain-RAM entries
@@ -1028,7 +1074,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         // The core translation carries its own indent; give the clamp the same.
         : hook + config_.indent + clamp + "\n" + translate_instruction_core(addr, instr);
     if (config_.ram_fast_path) out = ram_fast_rewrite(std::move(out));
-    if (config_.cpu_timing_block) out = block_timing_rewrite(std::move(out), config_);
+    if (config_.cpu_timing_block) {
+        const auto pk = blk_load_packed_.find(addr);
+        out = block_timing_rewrite(std::move(out), pk != blk_load_packed_.end() ? pk->second : 2u);
+    }
     return out;
 }
 
@@ -2208,16 +2257,53 @@ std::string CodeGenerator::translate_basic_block(
         ss << indent << fmt::format("cosim_instr(0x{:08X}u);\n", runtime_pc(insn_addr));
         ss << "#endif\n";
     };
-    if (!cycle_per_insn && block_exec_cycles > 0) {
+    if (!cycle_per_insn && !config_.cpu_timing_block && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        if (config_.cpu_timing_block)   // [recompiler] cpu_timing = "block"
-            ss << config_.indent << fmt::format("psx_blk_charge({}u, {}u);\n",
-                                                block_exec_cycles, config_.cpu_timing_insn16);
-        else
-            ss << config_.indent << fmt::format("psx_cpu_charge({}u);\n",
-                                                block_exec_cycles);
+        ss << config_.indent << fmt::format("psx_cpu_charge({}u);\n", block_exec_cycles);
         ss << "#endif\n";
     }
+
+    /* [recompiler] cpu_timing = "block": the pipeline run over this block at
+     * generation time (blk_pipe_run); each instruction's base cycle joins
+     * blk_acc, charged in one psx_cyc_charge before a body that can see the
+     * clock, before a mid-block label and at the block's exit. A load's packed
+     * access cost (psx_cyc.h) goes to its helper. I-cache fetches stay. */
+    const bool blk_mode = config_.cpu_timing_block;
+    std::map<uint32_t, uint8_t> blk_base;
+    uint32_t blk_acc = 0;
+    if (blk_mode) {
+        std::vector<uint32_t> words, addrs;
+        for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4) {
+            auto w = exe_.read_word(a);
+            if (!w.has_value()) break;
+            words.push_back(*w);
+            addrs.push_back(a);
+        }
+        if (exit_delay_slot_outside) {
+            auto dw = exe_.read_word(block.end_addr + 4u);
+            if (dw.has_value()) { words.push_back(*dw); addrs.push_back(block.end_addr + 4u); }
+        }
+        std::vector<uint8_t> base(words.size()), fudge(words.size());
+        const size_t none = words.size();
+        const uint32_t all = blk_pipe_run(words, none, 0, &base, &fudge);
+        for (size_t i = 0; i < words.size(); i++) {
+            blk_base[addrs[i]] = base[i];
+            const uint32_t op = words[i] >> 26;
+            if (op == 0x32u) { blk_load_packed_[addrs[i]] = fudge[i]; continue; }
+            if (op < 0x20u || op > 0x26u) continue;
+            const uint32_t no_back = blk_pipe_run(words, i, 0, nullptr, nullptr);
+            const uint32_t unbounded = blk_pipe_run(words, i, 255, nullptr, nullptr);
+            const uint32_t g = no_back - all, k = std::min<uint32_t>(no_back - unbounded, 255u);
+            blk_load_packed_[addrs[i]] = fudge[i] | (g << 8) | (k << 16);
+        }
+    }
+    auto blk_flush = [&](const std::string& indent) {
+        if (!blk_mode || blk_acc == 0) return;
+        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << indent << fmt::format("psx_cyc_charge({}u);\n", blk_acc);
+        ss << "#endif\n";
+        blk_acc = 0;
+    };
 
     // Translate each instruction in the block
     uint32_t addr = block.start_addr;
@@ -2398,6 +2484,7 @@ std::string CodeGenerator::translate_basic_block(
 
         // Emit inline label for mid-block jump table targets
         if (addr != block.start_addr && extra_labels_.count(addr)) {
+            blk_flush(config_.indent);
             ss << fmt::format("block_{:08X}:;\n", addr);
         }
 
@@ -2409,7 +2496,7 @@ std::string CodeGenerator::translate_basic_block(
         }
 
         if (!is_cf) {
-            if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
+            if (cycle_per_insn || blk_mode) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(addr, instr, config_.indent);
             // If this is the successor half of a deferred load pair AND it is an
             // LWL/LWR merging into that same register, hardware forwards the
@@ -2427,6 +2514,10 @@ std::string CodeGenerator::translate_basic_block(
             }
             std::string emitted = translate_instruction(addr, instr);
             cyc_fold_check(addr, emitted);
+            if (blk_mode) {
+                blk_acc += blk_base[addr];
+                if (blk_body_observes(emitted)) blk_flush(config_.indent);
+            }
             if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
@@ -2489,7 +2580,11 @@ std::string CodeGenerator::translate_basic_block(
                 // Jumps (j/jal/jr/jalr) and reserved words never reach
                 // generate_branch_condition; check them here.
                 check_explicit_branch_site(addr, block.exit_instr.instruction);
-                ss << config_.indent << mod_instruction_call(addr, instr);
+                {
+                    const std::string hook = mod_instruction_call(addr, instr);
+                    if (!hook.empty()) blk_flush(config_.indent);
+                    ss << config_.indent << hook;
+                }
                 std::string delay_saved_cond;    // branch condition captured before delay
                 std::string delay_saved_target;  // JR/JALR target captured before delay
 
@@ -2535,10 +2630,11 @@ std::string CodeGenerator::translate_basic_block(
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
                 // safe before the branch-condition capture below).
-                if (cycle_per_insn)
+                if (cycle_per_insn || blk_mode)
                     emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
                     emit_pre_timing(exit_branch_addr, block.exit_instr.instruction, config_.indent);
+                if (blk_mode) blk_acc += blk_base[exit_branch_addr];
 
                 // Register-indirect targets are resolved at the jump instruction.
                 // The delay slot may overwrite the source register, so all JR/JALR
@@ -2619,11 +2715,15 @@ std::string CodeGenerator::translate_basic_block(
                             }
                             ss << config_.indent << "/* delay slot (always executes) */\n";
                             // Delay slot's own fetch + §1+deps+DO_LDS, before its body (skipped if a load).
-                            if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
+                            if (cycle_per_insn || blk_mode) emit_pre_icache(delay_slot_addr, config_.indent);
                             if (cycle_per_insn) emit_pre_timing(delay_slot_addr, delay_instr, config_.indent);
                             {
                                 const std::string ds_body = translate_instruction(delay_slot_addr, delay_instr);
                                 cyc_fold_check(delay_slot_addr, ds_body);
+                                if (blk_mode) {
+                                    blk_acc += blk_base[delay_slot_addr];
+                                    if (blk_body_observes(ds_body)) blk_flush(config_.indent);
+                                }
                                 ss << ds_body << "\n";
                             }
                             emit_cosim_instr(delay_slot_addr, config_.indent);
@@ -2632,6 +2732,7 @@ std::string CodeGenerator::translate_basic_block(
                 }
 
                 // Now emit the branch/jump
+                blk_flush(config_.indent);   // block mode: the block's cycles before it leaves
                 if (block.exit_instr.type == ControlFlowType::Branch) {
                     // Conditional branch - use pre-captured condition if available
                     std::string condition = delay_saved_cond.empty()
@@ -2997,6 +3098,7 @@ std::string CodeGenerator::translate_basic_block(
 
         addr += 4;
     }
+    blk_flush(config_.indent);   // block mode: a block that falls through
 
     // If no explicit control flow, fall through to the next block. When a
     // CFG split or mid-function seed split placed the next instruction behind
@@ -3864,9 +3966,9 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
 void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) const {
     const char* kw = as_inline ? "static inline " : "static ";
     const std::string lwlr_load_line = config_.cpu_timing_block   // see block_timing_rewrite
-        ? fmt::format("    uint32_t word = psx_blk_load_word({}u, cpu, addr & ~3u, rt, reg_mask);\n",
-                      config_.cpu_timing_ram_load)
+        ? std::string("    uint32_t word = psx_blk_load_word(packed, cpu, addr & ~3u, rt, reg_mask);\n")
         : std::string("    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n");
+    const char* lwlr_packed = config_.cpu_timing_block ? "uint32_t packed, " : "";
     const char* store_word_line = config_.ram_fast_path   // see ram_fast_rewrite
         ? "    psx_store_word(cpu, aligned_addr, word);\n"
         : "    cpu->write_word(aligned_addr, word);\n";
@@ -3886,7 +3988,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << kw << "uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << kw << "uint32_t psx_lwl(" << lwlr_packed << "CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
     ss << lwlr_load_line;
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);\n";
@@ -3900,7 +4002,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << kw << "uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << kw << "uint32_t psx_lwr(" << lwlr_packed << "CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
     ss << lwlr_load_line;
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return word;\n";

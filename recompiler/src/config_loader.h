@@ -359,6 +359,13 @@ struct RuntimeConfig {
     // PsyQ libetc's v_wait, the VSync(0) spin. Bit-exact (psx_cycles.c);
     // PSX_IDLE_SKIP_EXT=0/1 overrides it for one run.
     bool                  idle_skip_store_counters = false;
+    // overlay_precompile (docs/PERFORMANCE_MODES.md): shortly after boot, ask
+    // the code provider once for every captured overlay not yet in the cache
+    // (the same request the autocapture makes after a new capture), so an area
+    // runs native from its first visit after an update instead of interpreted
+    // until its compile lands. The same DLLs; only when they are built changes.
+    // PSX_OVERLAY_PRECOMPILE=0/1 overrides it for one run.
+    bool                  overlay_precompile = false;
     // idle_skip_store_counter_sites: the audited loop sites (block-edge PCs
     // the detector anchors on) where the store-counter extension may skip.
     // Unlisted sites are never skipped; an empty list disables the extension.
@@ -582,6 +589,9 @@ struct RuntimeConfig {
     // [video] pgxp_alu = "full" (default) | "moves": the ALU hook classes that
     // reach the PGXP engine (docs/PERFORMANCE_MODES.md, pgxp_hooks.h).
     bool                  video_pgxp_alu_light = false;
+    // [video] pgxp_mem = "all" (default) | "words": the byte and halfword
+    // load/store hooks left out (docs/PERFORMANCE_MODES.md, pgxp_hooks.h).
+    bool                  video_pgxp_mem_words = false;
 
     // pgxp_tolerance: reject a corrected vertex whose sub-pixel offset from
     // the native integer position exceeds this many pixels (the truncation-
@@ -1556,12 +1566,10 @@ struct GameConfig {
     // (the same observers decide); off by default; regen required.
     bool ram_fast_path = false;
     // [recompiler] cpu_timing = "pipeline" (default, the R3000A model per
-    // instruction) | "block" (one calibrated charge per block: NOT exact, an
-    // option for speed), with cpu_timing_insn (cycles per instruction, default
-    // 1.0) and cpu_timing_ram_load (extra cycles per main-RAM load, default 4).
+    // instruction) | "block" (the same model run over each block at generation
+    // time and charged where the clock can be seen: NOT exact at block edges,
+    // an option for speed).
     bool cpu_timing_block = false;
-    uint32_t cpu_timing_insn16 = 16;
-    uint32_t cpu_timing_ram_load = 4;
     // [quality.low/medium/high/ultra] -- graphics presets, lowest first. Empty:
     // the title has no presets and [video] alone applies (unchanged).
     std::vector<QualityPreset> quality_presets;

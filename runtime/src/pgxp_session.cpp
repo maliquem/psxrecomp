@@ -22,8 +22,32 @@ extern "C" void psx_pgxp_session_reset(void) {
 extern "C" uint32_t g_pgxp_alu_mask = PGXP_ALU_MASK_FULL;
 static uint32_t s_pgxp_alu_configured = PGXP_ALU_MASK_FULL;
 
+/* [video] pgxp_mem: the load/store hooks left out (pgxp_hooks.h). None by
+ * default; none while CPU mode is on. */
+extern "C" uint32_t g_pgxp_mem_skip = 0;
+static uint32_t s_pgxp_mem_configured = 0;
+
 extern "C" void psx_pgxp_alu_cpu_mode(int cpu_mode) {
     g_pgxp_alu_mask = cpu_mode ? PGXP_ALU_MASK_FULL : s_pgxp_alu_configured;
+    g_pgxp_mem_skip = cpu_mode ? 0u : s_pgxp_mem_configured;
+}
+
+/* The overlay DLLs' load/store hooks (overlay_loader.c hook table): the same
+ * mask as the generated code's PGXP_LOAD / PGXP_STORE. */
+extern "C" void psx_pgxp_load_masked(struct CPUState* cpu, uint32_t instr, uint32_t addr, uint32_t value) {
+    if (PGXP_MEM_ON(instr)) psx_pgxp_load(cpu, instr, addr, value);
+}
+extern "C" void psx_pgxp_store_masked(struct CPUState* cpu, uint32_t instr, uint32_t addr, uint32_t value) {
+    if (PGXP_MEM_ON(instr)) psx_pgxp_store(cpu, instr, addr, value);
+}
+
+static uint32_t pgxp_mem_skip_from(const char* e, int mem_words) {
+    if (e && *e) {
+        if (std::strcmp(e, "all") == 0) return 0u;
+        if (std::strcmp(e, "words") == 0) return PGXP_MEM_SKIP_WORDS;
+        return (uint32_t)std::strtoul(e, nullptr, 0);
+    }
+    return mem_words ? PGXP_MEM_SKIP_WORDS : 0u;
 }
 
 static uint32_t pgxp_alu_mask_from(const char* e, int alu_light) {
@@ -76,6 +100,7 @@ extern "C" PSXPgxpSessionArm psx_pgxp_session_arm(
     gpu_texture_correction_set(arm.texture);
     pgxp_set_cpu_mode(arm.cpu_mode);
     s_pgxp_alu_configured = pgxp_alu_mask_from(std::getenv("PSX_PGXP_ALU"), config->alu_light);
+    s_pgxp_mem_configured = pgxp_mem_skip_from(std::getenv("PSX_PGXP_MEM"), config->mem_words);
     psx_pgxp_alu_cpu_mode(arm.cpu_mode);
     if (used) *used = in;
     return arm;

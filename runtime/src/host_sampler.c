@@ -20,6 +20,7 @@
 #include "host_sampler.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern int g_psx_render_pass_active;
@@ -47,6 +48,7 @@ static void record(uintptr_t pc, uintptr_t caller, uintptr_t caller2, int outsid
 #if defined(PSX_NO_DEBUG_TOOLS)
 /* Production builds carry no sampler: it reports unsupported. */
 void host_sampler_start(void) {}
+void host_sampler_register_render_thread(void) {}
 
 #elif defined(_WIN32)
 #include <windows.h>
@@ -57,7 +59,31 @@ static HANDLE s_target;
 WINBASEAPI VOID WINAPI GetCurrentThreadStackLimits(PULONG_PTR LowLimit, PULONG_PTR HighLimit);
 #endif
 static uintptr_t s_image_end;              /* the executable's last byte + 1 */
-static ULONG_PTR s_stack_lo, s_stack_hi;   /* the emulation thread's stack */
+static ULONG_PTR s_stack_lo, s_stack_hi;   /* the sampled thread's stack */
+/* The render thread, registered when it starts (host_sampler_register_render_thread).
+ * PSX_HOST_SAMPLER_THREAD=render samples it instead of the emulation thread. */
+static HANDLE s_render_target;
+static ULONG_PTR s_render_stack_lo, s_render_stack_hi;
+
+void host_sampler_register_render_thread(void) {
+    HANDLE h;
+    if (s_render_target) return;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                         FALSE, 0))
+        return;
+    GetCurrentThreadStackLimits(&s_render_stack_lo, &s_render_stack_hi);
+    s_render_target = h;
+}
+
+static int sample_render_thread(void) {
+    static int s_want = -1;
+    if (s_want < 0) {
+        const char *e = getenv("PSX_HOST_SAMPLER_THREAD");
+        s_want = (e && strcmp(e, "render") == 0) ? 1 : 0;
+    }
+    return s_want;
+}
 
 #if defined(_M_X64) || defined(__x86_64__)
 /* The modules whose unwind tables (.pdata) the walk below reads itself: the
@@ -171,11 +197,18 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
     for (;;) {
         if (timer) WaitForSingleObject(timer, INFINITE);
         else Sleep(1);
-        if (SuspendThread(s_target) == (DWORD)-1) continue;
+        HANDLE target = s_target;
+        if (sample_render_thread()) {
+            if (!s_render_target) continue;   /* not started yet */
+            target = s_render_target;
+            s_stack_lo = s_render_stack_lo;
+            s_stack_hi = s_render_stack_hi;
+        }
+        if (SuspendThread(target) == (DWORD)-1) continue;
         CONTEXT ctx;
         memset(&ctx, 0, sizeof ctx);
         ctx.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(s_target, &ctx)) {
+        if (GetThreadContext(target, &ctx)) {
 #if defined(_M_X64) || defined(__x86_64__)
             const uintptr_t pc = (uintptr_t)ctx.Rip;
             const int out = pc < s_image_base || pc >= s_image_end;
@@ -186,7 +219,7 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
             record((uintptr_t)ctx.Pc, 0, 0, 0);
 #endif
         }
-        ResumeThread(s_target);
+        ResumeThread(target);
     }
     return 0;
 }
@@ -287,9 +320,12 @@ void host_sampler_start(void) {
     if (setitimer(ITIMER_PROF, &it, NULL) != 0) return;
     s_supported = 1;
 }
+/* The emulation thread only here (the SIGPROF handler keys on it). */
+void host_sampler_register_render_thread(void) {}
 
 #else
 void host_sampler_start(void) {}
+void host_sampler_register_render_thread(void) {}
 #endif
 
 int host_sampler_supported(void) { return s_supported; }

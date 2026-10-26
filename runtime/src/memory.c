@@ -166,6 +166,8 @@ uint32_t psx_gpu_packet_key(uint32_t address) {
 
 /* Exposed for inlined main-RAM load helpers in psx_cyc.h (VLC/decode hot path). */
 uint8_t *g_psx_ram = ram;
+/* The scratchpad, for the inlined scratchpad loads in psx_cyc.h. */
+uint8_t *g_psx_scratch = scratchpad;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
@@ -1970,9 +1972,15 @@ static void render_pass_store(uint32_t addr, uint32_t val, uint32_t width) {
 }
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
+/* The plain main-RAM store (psx_store_fast_ok, below): taken after the overlay
+ * cycles are published, when nothing else here would do more than write. */
+static inline int psx_store_try_word(uint32_t addr, uint32_t val);
+static inline int psx_store_try_half(uint32_t addr, uint16_t val);
+static inline int psx_store_try_byte(uint32_t addr, uint8_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+    if (psx_store_try_word(addr, val)) return;
     if (g_psx_render_pass_active) { render_pass_store(addr, val, 4); return; }
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
     if (g_ds_recording) {
@@ -2188,6 +2196,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+    if (psx_store_try_half(addr, val)) return;
     if (g_psx_render_pass_active) { render_pass_store(addr, val, 2); return; }
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
     if (g_ds_recording) {
@@ -2360,34 +2369,16 @@ static inline void psx_load_charge_cycles(uint32_t cycles) {
  * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
  * Reads only; writes are posted (~free) in MemRW. phys is the masked physical address. */
 static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
-    /* Main RAM, mirrored across phys 0..0x7FFFFF (libretro.cpp:874 `A < 0x00800000`). */
-    if (phys < 0x00800000u) return 3u;
-    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait. */
-    if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) return 0u;
-    if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
-    /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
+    /* The table is psx_cyc_region_wait (psx_cyc.h, shared with the block
+     * timing). Bisect gate (PSX_MMIO_WAIT=0): disable the device-region read
+     * waits (the 9ae534d feature) to test whether they move the MMX6 cutscene
+     * ordering. Read once. */
     if (phys >= 0x1F801000u && phys <= 0x1F802FFFu) {
-        /* Bisect gate (PSX_MMIO_WAIT=0): disable the device-region read waits
-         * (the 9ae534d feature) to test whether they move the MMX6 cutscene
-         * ordering. Read once. */
         static int s_mw = -1;
         if (s_mw < 0) { const char* e = getenv("PSX_MMIO_WAIT"); s_mw = (e && e[0] == '0') ? 0 : 1; }
         if (!s_mw) return 0u;
-        if (phys >= 0x1F801C00u && phys <= 0x1F801FFFu)            /* SPU (929) */
-            return (size == 4u) ? 36u : 16u;
-        if (phys >= 0x1F801800u && phys <= 0x1F80180Fu)            /* CDC (979) */
-            return 6u * size;
-        if (phys >= 0x1F801810u && phys <= 0x1F801817u) return 1u; /* GPU (994) */
-        if (phys >= 0x1F801820u && phys <= 0x1F801827u) return 1u; /* MDEC (1007) */
-        if (phys >= 0x1F801000u && phys <= 0x1F801023u) return 1u; /* SysControl (1020) */
-        if (phys >= 0x1F801040u && phys <= 0x1F80104Fu) return 1u; /* FrontIO/pad (1043) */
-        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO (1055) */
-        if (phys >= 0x1F801070u && phys <= 0x1F801077u) return 1u; /* IRQ (1094) */
-        if (phys >= 0x1F801080u && phys <= 0x1F8010FFu) return 1u; /* DMA (1106) */
-        if (phys >= 0x1F801100u && phys <= 0x1F80113Fu) return 1u; /* Timers (1119) */
-        return 0u;   /* unmatched MMIO: Beetle adds no device wait */
     }
-    return 0u;       /* unknown / open-bus region */
+    return psx_cyc_region_wait(phys, size);
 }
 
 /* Beetle ReadMemory data-access timing (cpu.cpp:369-448), after §1/deps/DO_LDS.
@@ -2514,8 +2505,8 @@ uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t re
 
 /* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by
  * psx_gte_stall — both emitted before this call. 32-bit access, completion +1, no
- * LDWhich arm. */
-uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
+ * LDWhich arm. Main RAM and scratchpad are inlined (psx_cyc.h psx_cyc_lwc2_read). */
+uint32_t psx_cyc_lwc2_read_slow(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
 #else
@@ -2539,10 +2530,39 @@ uint32_t psx_guest_read_word(uint32_t addr) { return psx_read_word(addr); }
 uint16_t psx_guest_read_half(uint32_t addr) { return psx_read_half(addr); }
 uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 
+/* The overlay DLLs' timed loads (overlay_loader.c callbacks): the same entries
+ * the main program inlines (psx_cyc.h), main RAM and scratchpad on the short
+ * path, everything else on the slow one. The DLL shim publishes its pending
+ * cycles before calling, as before. */
+uint32_t psx_cyc_load_word_host(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return psx_cyc_load_word(cpu, addr, rt, reg_mask);
+}
+uint16_t psx_cyc_load_half_host(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return psx_cyc_load_half(cpu, addr, rt, reg_mask);
+}
+uint8_t psx_cyc_load_byte_host(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return psx_cyc_load_byte_fast(cpu, addr, rt, reg_mask);
+}
+uint32_t psx_cyc_lwc2_read_host(CPUState* cpu, uint32_t addr) {
+    return psx_cyc_lwc2_read(cpu, addr);
+}
+
+/* [recompiler] cpu_timing = "block": a load outside main RAM and the
+ * scratchpad (psx_cyc.h psx_blk_load_*): its access cost, then the read. */
+uint32_t psx_blk_load_slow(uint32_t packed, CPUState* cpu, uint32_t addr,
+                           uint32_t size, uint32_t compl_cost) {
+    (void)cpu;
+    psx_cpu_charge(psx_blk_access_cost(packed, addr & 0x1FFFFFFFu, size, compl_cost));
+    if (size == 1u) return psx_read_byte(addr);
+    if (size == 2u) return psx_read_half(addr);
+    return psx_read_word(addr);
+}
+
 static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+    if (psx_store_try_byte(addr, val)) return;
     if (g_psx_render_pass_active) { render_pass_store(addr, val, 1); return; }
     if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_byte_raw(addr, val); return; }
@@ -2633,20 +2653,19 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
  * store entries. A store goes straight to RAM only when psx_write_* would do
  * nothing but write the bytes, count the store and note it for the idle-skip
  * detector: the CPU's own store pointer (a mod's guest view drops stores),
- * aligned main RAM above the kernel window, no overlay cycles to publish
- * first, no render pass, lockstep, data-shard recording, DMA or host store,
+ * aligned main RAM above the kernel window (overlay cycles published first,
+ * as psx_write_* does), no render pass, lockstep, data-shard recording, DMA or host store,
  * cache isolation or armed recorder, and a page no code watcher acts on
  * (executed code whose evidence a write clears, a watched overlay page, game
  * text not yet seen modified). Everything else takes cpu->write_*. */
 extern int g_parity_trace_armed;               /* parity_trace.c */
 extern volatile int g_card_data_writes_armed;  /* card_data_writes.c */
 
-static inline int psx_store_fast_off(uint32_t addr, uint32_t size, uint32_t *off_out) {
-    extern void (*g_overlay_flush_pending_cycles)(void);
+static inline int psx_store_fast_ok(uint32_t addr, uint32_t size, uint32_t *off_out) {
     if (addr >= 0xC0000000u || (addr & (size - 1u))) return 0;
     const uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys >= PSX_MAIN_RAM_WINDOW_BYTES) return 0;
-    if (g_overlay_flush_pending_cycles || g_psx_render_pass_active || g_ls_mode != 0 ||
+    if (g_psx_render_pass_active || g_ls_mode != 0 ||
         g_ds_recording || g_dma_exec_depth > 0 || g_host_store_depth > 0 ||
         g_parity_trace_armed || g_card_data_writes_armed ||
         (sr_ptr && (*sr_ptr & 0x10000u)))
@@ -2668,39 +2687,61 @@ static inline int psx_store_fast_off(uint32_t addr, uint32_t size, uint32_t *off
     return 1;
 }
 
-void psx_store_word(CPUState *cpu, uint32_t addr, uint32_t val) {
+static inline int psx_store_try_word(uint32_t addr, uint32_t val) {
     uint32_t off;
-    if (cpu->write_word == psx_write_word && psx_store_fast_off(addr, 4u, &off) &&
-        off != D44_PHYS) {
-        g_guest_store_count++;
-        if (g_psx_track_last_store) {
-            g_guest_last_store_addr = addr;
-            g_guest_last_store_val = val;
-        }
-        memcpy(&ram[off], &val, 4u);
-        return;
+    if (!psx_store_fast_ok(addr, 4u, &off) || off == D44_PHYS) return 0;
+    g_guest_store_count++;
+    if (g_psx_track_last_store) {
+        g_guest_last_store_addr = addr;
+        g_guest_last_store_val = val;
+    }
+    memcpy(&ram[off], &val, 4u);
+    return 1;
+}
+
+static inline int psx_store_try_half(uint32_t addr, uint16_t val) {
+    uint32_t off;
+    if (!psx_store_fast_ok(addr, 2u, &off)) return 0;
+    g_guest_store_count++;
+    if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
+    memcpy(&ram[off], &val, 2u);
+    return 1;
+}
+
+static inline int psx_store_try_byte(uint32_t addr, uint8_t val) {
+    uint32_t off;
+    if (!psx_store_fast_ok(addr, 1u, &off)) return 0;
+    g_guest_store_count++;
+    if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
+    ram[off] = val;
+    return 1;
+}
+
+/* The generated code's stores: the CPU's own store pointer takes the short
+ * path above without the call through it (overlay cycles published first). */
+void psx_store_word(CPUState *cpu, uint32_t addr, uint32_t val) {
+    if (cpu->write_word == psx_write_word) {
+        extern void (*g_overlay_flush_pending_cycles)(void);
+        if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+        if (psx_store_try_word(addr, val)) return;
     }
     cpu->write_word(addr, val);
 }
 
 void psx_store_half(CPUState *cpu, uint32_t addr, uint16_t val) {
-    uint32_t off;
-    if (cpu->write_half == psx_write_half && psx_store_fast_off(addr, 2u, &off)) {
-        g_guest_store_count++;
-        if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
-        memcpy(&ram[off], &val, 2u);
-        return;
+    if (cpu->write_half == psx_write_half) {
+        extern void (*g_overlay_flush_pending_cycles)(void);
+        if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+        if (psx_store_try_half(addr, val)) return;
     }
     cpu->write_half(addr, val);
 }
 
 void psx_store_byte(CPUState *cpu, uint32_t addr, uint8_t val) {
-    uint32_t off;
-    if (cpu->write_byte == psx_write_byte && psx_store_fast_off(addr, 1u, &off)) {
-        g_guest_store_count++;
-        if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
-        ram[off] = val;
-        return;
+    if (cpu->write_byte == psx_write_byte) {
+        extern void (*g_overlay_flush_pending_cycles)(void);
+        if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+        if (psx_store_try_byte(addr, val)) return;
     }
     cpu->write_byte(addr, val);
 }

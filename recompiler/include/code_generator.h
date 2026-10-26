@@ -191,13 +191,10 @@ struct CodeGenConfig {
     // main-RAM accesses straight to RAM and hand the rest to the usual path.
     bool ram_fast_path = false;
 
-    // [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): one
-    // calibrated charge per block instead of the per-instruction R3000A
-    // pipeline model. cpu_timing_insn16 = cycles per instruction x16;
-    // cpu_timing_ram_load = extra cycles per main-RAM load.
+    // [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): the
+    // per-instruction R3000A pipeline model run over each block at generation
+    // time, charged at the points that can see the clock.
     bool cpu_timing_block = false;
-    uint32_t cpu_timing_insn16 = 16;
-    uint32_t cpu_timing_ram_load = 4;
 
     // Exact model-participation cosine compares that gain a camera-horizontal
     // aspect envelope while preserving the vanilla vertical cone.
@@ -493,6 +490,11 @@ private:
     // (gated on config_.ws_auto_backdrop_preload) and consulted by
     // translate_instruction; cleared every function so it never leaks.
     std::map<uint32_t, std::pair<int,int>> ws_backdrop_sites_;
+
+    // [recompiler] cpu_timing = "block": each load's packed access cost
+    // (psx_cyc.h psx_blk_*) by address, from the block's pipeline run in
+    // generate_block; translate_instruction hands it to the load helper.
+    std::map<uint32_t, uint32_t> blk_load_packed_;
 
     // Populate ws_backdrop_sites_ from the shared psx_ws_find_backdrop_windows()
     // detector over this function's instruction words; returns the window count.

@@ -336,7 +336,7 @@ def main():
         if guard not in ram_fast:
             raise AssertionError(f"main-RAM value fast path lost guard: {guard}")
     for fn in ("psx_cyc_load_word", "psx_cyc_load_half", "psx_cyc_load_byte",
-               "psx_cyc_lwc2_read"):
+               "psx_cyc_lwc2_read_slow"):
         load_body = body(memory, fn)
         timing = load_body.find("psx_cyc_")
         fast = load_body.find("psx_cyc_main_ram_fast_addr")

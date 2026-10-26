@@ -10296,7 +10296,10 @@ static void disp_ring_capture(void)
         const char *e = getenv("PSX_DISPLAY_RING");
         enabled = (!e || !*e || *e != '0') ? 1 : 0;
     }
-    if (!enabled || s_capture_frozen) return;
+    /* A recorder like the others: only while the passive recorders run (a
+     * tool connected, or PSX_DEBUG_PASSIVE=1). Each capture reads the whole
+     * VRAM back from the GPU, which stalls the render thread every frame. */
+    if (!enabled || s_capture_frozen || !s_passive) return;
     if (!s_disp_ring_px) {
         size_t vram = (size_t)1024 * 512;
         s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * vram * sizeof(uint16_t));

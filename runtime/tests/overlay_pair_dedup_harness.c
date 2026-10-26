@@ -110,6 +110,21 @@ uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt,
 uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
     (void)cpu; (void)addr; return 0;
 }
+uint32_t psx_cyc_load_word_host(CPUState *cpu, uint32_t addr, uint32_t rt,
+                                uint32_t mask) {
+    return psx_cyc_load_word(cpu, addr, rt, mask);
+}
+uint16_t psx_cyc_load_half_host(CPUState *cpu, uint32_t addr, uint32_t rt,
+                                uint32_t mask) {
+    return psx_cyc_load_half(cpu, addr, rt, mask);
+}
+uint8_t psx_cyc_load_byte_host(CPUState *cpu, uint32_t addr, uint32_t rt,
+                               uint32_t mask) {
+    return psx_cyc_load_byte(cpu, addr, rt, mask);
+}
+uint32_t psx_cyc_lwc2_read_host(CPUState *cpu, uint32_t addr) {
+    return psx_cyc_lwc2_read(cpu, addr);
+}
 int psx_icache_shadow_record_begin(void) { return 1; }
 int psx_icache_shadow_replay_begin(void) { return 1; }
 void psx_icache_shadow_replay_end(void) {}
@@ -222,6 +237,12 @@ void psx_pgxp_load(CPUState *cpu, uint32_t i, uint32_t a, uint32_t v) {
     (void)cpu; (void)i; (void)a; (void)v;
 }
 void psx_pgxp_store(CPUState *cpu, uint32_t i, uint32_t a, uint32_t v) {
+    (void)cpu; (void)i; (void)a; (void)v;
+}
+void psx_pgxp_load_masked(CPUState *cpu, uint32_t i, uint32_t a, uint32_t v) {
+    (void)cpu; (void)i; (void)a; (void)v;
+}
+void psx_pgxp_store_masked(CPUState *cpu, uint32_t i, uint32_t a, uint32_t v) {
     (void)cpu; (void)i; (void)a; (void)v;
 }
 void psx_pgxp_alu(CPUState *cpu, uint32_t i, uint32_t r, uint32_t s, uint32_t t) {

@@ -70,7 +70,7 @@ uint32_t psx_read_word(uint32_t a) {
 uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t a, uint32_t rt, uint32_t m) {
     (void)cpu; (void)rt; (void)m; return psx_read_byte(a);
 }
-uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t a) { (void)cpu; return psx_read_word(a); }
+uint32_t psx_cyc_lwc2_read_slow(CPUState *cpu, uint32_t a) { (void)cpu; return psx_read_word(a); }
 int dirty_ram_is_dirty(uint32_t phys) { (void)phys; return 1; }
 int mdec_recently_active(uint32_t f) { (void)f; return 0; }
 void gte_execute(CPUState *cpu, uint32_t cmd) { (void)cpu; (void)cmd; }
@@ -99,6 +99,7 @@ void psx_pgxp_alu(struct CPUState *c, uint32_t i, uint32_t r, uint32_t a, uint32
 void psx_pgxp_cop2(struct CPUState *c, uint32_t i, uint32_t v, uint32_t a) {
     (void)c; (void)i; (void)v; (void)a;
 }
+uint32_t g_pgxp_mem_skip;   /* pgxp_hooks.h PGXP_MEM_ON (pgxp_session.cpp) */
 void psx_pgxp_load(struct CPUState *c, uint32_t i, uint32_t a, uint32_t v) {
     (void)c; (void)i; (void)a; (void)v;
 }

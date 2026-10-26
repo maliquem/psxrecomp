@@ -90,7 +90,14 @@ static inline void psx_cyc_local_cleanup(uint32_t **guard) {
 }
 #endif
 
-static inline void psx_cyc_charge(uint32_t cycles) {
+/* The whole charge: every mode. psx_cyc_charge below takes its common case
+ * inline and hands the rest here; out of line, as the whole thing was too big
+ * to be inlined into the generated code and every charge paid a call. */
+#if defined(__GNUC__) || defined(__clang__)
+static inline __attribute__((noinline)) void psx_cyc_charge_full(uint32_t cycles) {
+#else
+static inline void psx_cyc_charge_full(uint32_t cycles) {
+#endif
     if (cycles == 0u) return;
 #if defined(PSX_OVERLAY_DLL_BUILD)
     psx_cpu_charge(cycles);
@@ -199,6 +206,28 @@ static inline void psx_cyc_charge(uint32_t cycles) {
     psx_advance_cycles(cycles); /* publishes any pending batch first */
 #endif
 }
+
+#if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+/* psx_cyc_charge_full's common case, the same steps: no guest cycle scale,
+ * replay, conservative stepping, device service or local sink, and the sum
+ * joins the batch (deferred block, or a running batch still under its
+ * limit). Anything else, including a batch's first charge (its limit is
+ * computed there), goes to psx_cyc_charge_full. */
+static inline void psx_cyc_charge(uint32_t cycles) {
+    if (!(PSX_GCS_ACTIVE() | g_ls_replay_active | g_event_step_conservative |
+          psx_in_device_service) && !g_psx_cyc_local_acc) {
+        const uint32_t prior = g_psx_cyc_batch, sum = prior + cycles;
+        if (sum >= prior &&
+            (g_psx_cyc_bb_defer > 0 || (prior != 0u && sum < g_psx_cyc_batch_limit))) {
+            g_psx_cyc_batch = sum;
+            return;
+        }
+    }
+    psx_cyc_charge_full(cycles);
+}
+#else
+static inline void psx_cyc_charge(uint32_t cycles) { psx_cyc_charge_full(cycles); }
+#endif
 
 /* §1 base (Beetle cpu.cpp:795-798). */
 static inline void psx_cyc_base(CPUState* cpu) {
@@ -309,6 +338,68 @@ int psx_load_delay_enabled(void);
 uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
+enum { PSX_SCRATCH_PHYS = 0x1F800000u, PSX_SCRATCH_BYTES = 0x400u };
+
+/* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-
+ * dependent part of a load's access cost (added before the +completion). size =
+ * access width in bytes (the SPU and CDC waits depend on it). phys = masked
+ * physical address. memory.c adds its PSX_MMIO_WAIT bisect gate on top. */
+static inline uint32_t psx_cyc_region_wait(uint32_t phys, uint32_t size) {
+    /* Main RAM, mirrored across phys 0..0x7FFFFF (libretro.cpp:874 `A < 0x00800000`). */
+    if (phys < 0x00800000u) return 3u;
+    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait. */
+    if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) return 0u;
+    if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
+    /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
+    if (phys >= 0x1F801000u && phys <= 0x1F802FFFu) {
+        if (phys >= 0x1F801C00u && phys <= 0x1F801FFFu)            /* SPU (929) */
+            return (size == 4u) ? 36u : 16u;
+        if (phys >= 0x1F801800u && phys <= 0x1F80180Fu)            /* CDC (979) */
+            return 6u * size;
+        if (phys >= 0x1F801810u && phys <= 0x1F801817u) return 1u; /* GPU (994) */
+        if (phys >= 0x1F801820u && phys <= 0x1F801827u) return 1u; /* MDEC (1007) */
+        if (phys >= 0x1F801000u && phys <= 0x1F801023u) return 1u; /* SysControl (1020) */
+        if (phys >= 0x1F801040u && phys <= 0x1F80104Fu) return 1u; /* FrontIO/pad (1043) */
+        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO (1055) */
+        if (phys >= 0x1F801070u && phys <= 0x1F801077u) return 1u; /* IRQ (1094) */
+        if (phys >= 0x1F801080u && phys <= 0x1F8010FFu) return 1u; /* DMA (1106) */
+        if (phys >= 0x1F801100u && phys <= 0x1F80113Fu) return 1u; /* Timers (1119) */
+        return 0u;   /* unmatched MMIO: Beetle adds no device wait */
+    }
+    return 0u;       /* unknown / open-bus region */
+}
+
+#if !defined(PSX_OVERLAY_DLL_BUILD)
+/* The 1 KiB scratchpad (D-cache, memory.c). A CPU load from it is Beetle
+ * ReadMemory's scratchpad case (cpu.cpp 414-422): after §1/deps/DO_LDS, no
+ * wait, no fudge, no give-back. The same sequence the slow path runs
+ * (psx_cyc_load_timing + psx_cyc_readmem), inlined: the game's work buffers
+ * and GTE scratch live there. */
+extern uint8_t *g_psx_scratch;
+static inline int psx_cyc_scratch_off(uint32_t addr, uint32_t width, uint32_t *off) {
+    const uint32_t o = (addr & 0x1FFFFFFFu) - (uint32_t)PSX_SCRATCH_PHYS;
+    if (addr >= 0xC0000000u || o > (uint32_t)PSX_SCRATCH_BYTES - width) return 0;
+    *off = o;
+    return 1;
+}
+static inline void psx_cyc_scratch_timing(CPUState* cpu, uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+    if (!g_psx_load_delay) return;
+    psx_cyc_base(cpu);
+    psx_cyc_deps(cpu, reg_mask);
+    if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+    psx_cyc_lds(cpu);
+    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb_which = 0u;
+    cpu->ld_absorb = 0u;
+    cpu->ld_which_t = (uint8_t)rt;
+#else
+    (void)cpu; (void)rt; (void)reg_mask;
+#endif
+}
+#endif
+
 /* Overlay DLLs route timed loads through the host callback shim so they share
  * runtime timing and memory state. Normal generated code keeps the main-RAM
  * fast path inline. */
@@ -342,6 +433,15 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
         memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
         return value;
     }
+    if (g_ls_mode == 0 && !g_ds_recording) {
+        uint32_t off;
+        if (psx_cyc_scratch_off(addr, 4u, &off)) {
+            uint32_t value;
+            psx_cyc_scratch_timing(cpu, rt, reg_mask);
+            memcpy(&value, g_psx_scratch + off, sizeof(value));
+            return value;
+        }
+    }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
 #else
     (void)cpu; (void)rt; (void)reg_mask;
@@ -372,6 +472,15 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
         memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
         return value;
     }
+    if (g_ls_mode == 0 && !g_ds_recording) {
+        uint32_t off;
+        if (psx_cyc_scratch_off(addr, 2u, &off)) {
+            uint16_t value;
+            psx_cyc_scratch_timing(cpu, rt, reg_mask);
+            memcpy(&value, g_psx_scratch + off, sizeof(value));
+            return value;
+        }
+    }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
 #else
     (void)cpu; (void)rt; (void)reg_mask;
@@ -383,58 +492,98 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
 
 extern uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
-/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md): the costs
- * the main program charges (psx_cycles.c; game.toml cpu_timing_insn and
- * cpu_timing_ram_load, PSX_BLK_INSN / PSX_BLK_RAM_LOAD override them for
- * calibration). A block charges n instructions x the per-instruction cost
- * (x16 fixed point, the remainder carried to the next block); overlay DLLs
- * charge the game.toml cost the emitter wrote. */
-#if !defined(PSX_OVERLAY_DLL_BUILD)
-extern uint32_t g_psx_blk_insn16, g_psx_blk_ram_load, g_psx_blk_frac;
-#endif
-static inline void psx_blk_charge(uint32_t n, uint32_t insn16) {
-#if defined(PSX_OVERLAY_DLL_BUILD)
-    psx_cyc_charge((n * insn16 + 8u) >> 4);
-#else
-    (void)insn16;
-    const uint32_t f = g_psx_blk_frac + n * g_psx_blk_insn16;
-    g_psx_blk_frac = f & 15u;
-    psx_cyc_charge(f >> 4);
-#endif
+/* [recompiler] cpu_timing = "block" (docs/PERFORMANCE_MODES.md). The game
+ * emitter runs the pipeline above over each block at generation time (a clean
+ * pipeline at the block's entry, every load in main RAM) and charges the
+ * instructions in one psx_cyc_charge before anything that can see the clock;
+ * no pipeline state is kept at run time. A load charges its own access here,
+ * from the emitter's `packed`:
+ *   bits 0-1   fudge: 2 when the previous instruction committed no load
+ *   bits 8-15  g: the cycles a main-RAM load's give-back saves the block's next
+ *              instructions (already left out of their charge)
+ *   bits 16-23 k: what they would save with an unbounded give-back
+ * Main RAM: fudge + wait 3 + completion 2. Scratchpad: no fudge, wait or give-
+ * back, so it pays the g cycles the block left out. Other regions: fudge + G
+ * (region wait + completion) + g - min(G, k). LWC2: completion 1 and no give-
+ * back (g = k = 0). Not exact at block edges (a load pending across one, an
+ * I-cache miss cutting a give-back): an option for speed. */
+static inline uint32_t psx_blk_access_cost(uint32_t packed, uint32_t phys,
+                                           uint32_t size, uint32_t compl_cost) {
+    const uint32_t g = (packed >> 8) & 0xFFu, k = (packed >> 16) & 0xFFu;
+    if (phys - (uint32_t)PSX_SCRATCH_PHYS < (uint32_t)PSX_SCRATCH_BYTES) return g;
+    {
+        const uint32_t big = psx_cyc_region_wait(phys, size) + compl_cost;
+        return (packed & 3u) + big + g - (big < k ? big : k);
+    }
 }
 
-/* The game emitter's loads in this mode. A main-RAM load reads straight from
- * RAM and charges the main-RAM load cost (no load-delay interlock: the block
- * already charged the instruction itself); scratchpad, device and the other
- * modes take the exact load (its interlock bookkeeping is harmless here).
- * Overlay DLLs always take the exact load. */
-#if defined(PSX_OVERLAY_DLL_BUILD) || !defined(PSX_ENABLE_BLOCK_CYCLES)
-#define PSX_BLK_LOAD_FN(T, name, exact)                                          \
-    static inline T name(uint32_t cost, CPUState* cpu, uint32_t addr,           \
-                         uint32_t rt, uint32_t reg_mask) {                      \
-        (void)cost;                                                             \
-        return (T)exact(cpu, addr, rt, reg_mask);                               \
+#if defined(PSX_OVERLAY_DLL_BUILD)
+/* Overlay DLLs: the access cost joins the DLL's pending cycles, which are
+ * published (devices brought up to date) before the untimed read, as the
+ * exact path does. */
+#define PSX_BLK_LOAD_FN(T, name, read, size)                                    \
+    static inline T name(uint32_t packed, CPUState* cpu, uint32_t addr,        \
+                         uint32_t rt, uint32_t reg_mask) {                     \
+        (void)rt; (void)reg_mask;                                              \
+        psx_cpu_charge(psx_blk_access_cost(packed, addr & 0x1FFFFFFFu, size, 2u)); \
+        overlay_flush_cycles();                                                \
+        return (T)cpu->read(addr);                                             \
     }
-#else
-#define PSX_BLK_LOAD_FN(T, name, exact)                                          \
-    static inline T name(uint32_t cost, CPUState* cpu, uint32_t addr,           \
-                         uint32_t rt, uint32_t reg_mask) {                      \
-        uint32_t phys = addr & 0x1FFFFFFFu;                                     \
-        (void)cost;                                                             \
-        if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u &&          \
-            addr < 0xC0000000u) {                                               \
-            T v;                                                                \
-            psx_cyc_charge(g_psx_blk_ram_load);                                 \
-            memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));         \
-            return v;                                                           \
-        }                                                                       \
-        return (T)exact(cpu, addr, rt, reg_mask);                               \
-    }
-#endif
-PSX_BLK_LOAD_FN(uint32_t, psx_blk_load_word, psx_cyc_load_word)
-PSX_BLK_LOAD_FN(uint16_t, psx_blk_load_half, psx_cyc_load_half)
-PSX_BLK_LOAD_FN(uint8_t,  psx_blk_load_byte, psx_cyc_load_byte)
+PSX_BLK_LOAD_FN(uint32_t, psx_blk_load_word, read_word, 4u)
+PSX_BLK_LOAD_FN(uint16_t, psx_blk_load_half, read_half, 2u)
+PSX_BLK_LOAD_FN(uint8_t,  psx_blk_load_byte, read_byte, 1u)
 #undef PSX_BLK_LOAD_FN
+static inline uint32_t psx_blk_lwc2_read(uint32_t packed, CPUState* cpu, uint32_t addr) {
+    psx_cpu_charge(psx_blk_access_cost(packed, addr & 0x1FFFFFFFu, 4u, 1u));
+    overlay_flush_cycles();
+    return cpu->read_word(addr);
+}
+#else
+/* Main RAM and scratchpad inline; everything else (devices, BIOS, the
+ * recording modes) through memory.c. */
+uint32_t psx_blk_load_slow(uint32_t packed, CPUState* cpu, uint32_t addr,
+                           uint32_t size, uint32_t compl_cost);
+#define PSX_BLK_LOAD_FN(T, name, size)                                          \
+    static inline T name(uint32_t packed, CPUState* cpu, uint32_t addr,        \
+                         uint32_t rt, uint32_t reg_mask) {                     \
+        (void)rt; (void)reg_mask;                                              \
+        if (g_ls_mode == 0 && !g_ds_recording && addr < 0xC0000000u) {          \
+            const uint32_t phys = addr & 0x1FFFFFFFu;                           \
+            T v;                                                               \
+            if (phys < 0x00800000u) {                                          \
+                psx_cyc_charge((packed & 3u) + 5u);                            \
+                memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));    \
+                return v;                                                      \
+            }                                                                  \
+            if (phys - (uint32_t)PSX_SCRATCH_PHYS <= (uint32_t)PSX_SCRATCH_BYTES - size) { \
+                psx_cyc_charge((packed >> 8) & 0xFFu);                         \
+                memcpy(&v, g_psx_scratch + (phys - (uint32_t)PSX_SCRATCH_PHYS), sizeof(v)); \
+                return v;                                                      \
+            }                                                                  \
+        }                                                                      \
+        return (T)psx_blk_load_slow(packed, cpu, addr, size, 2u);              \
+    }
+PSX_BLK_LOAD_FN(uint32_t, psx_blk_load_word, 4u)
+PSX_BLK_LOAD_FN(uint16_t, psx_blk_load_half, 2u)
+PSX_BLK_LOAD_FN(uint8_t,  psx_blk_load_byte, 1u)
+#undef PSX_BLK_LOAD_FN
+static inline uint32_t psx_blk_lwc2_read(uint32_t packed, CPUState* cpu, uint32_t addr) {
+    if (g_ls_mode == 0 && !g_ds_recording && addr < 0xC0000000u) {
+        const uint32_t phys = addr & 0x1FFFFFFFu;
+        uint32_t v;
+        if (phys < 0x00800000u) {
+            psx_cyc_charge((packed & 3u) + 4u);
+            memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));
+            return v;
+        }
+        if (phys - (uint32_t)PSX_SCRATCH_PHYS <= (uint32_t)PSX_SCRATCH_BYTES - 4u) {
+            memcpy(&v, g_psx_scratch + (phys - (uint32_t)PSX_SCRATCH_PHYS), sizeof(v));
+            return v;
+        }
+    }
+    return psx_blk_load_slow(packed, cpu, addr, 4u, 1u);
+}
+#endif
 
 /* [recompiler] ram_fast_path (docs/PERFORMANCE_MODES.md): the entries the game
  * emitter uses in place of cpu->write_* and psx_cyc_load_byte. Main RAM takes
@@ -474,6 +623,13 @@ static inline uint8_t psx_cyc_load_byte_fast(CPUState* cpu, uint32_t addr,
         }
         return g_psx_ram[phys & g_psx_ram_mask];
     }
+    if (g_ls_mode == 0 && !g_ds_recording) {
+        uint32_t off;
+        if (psx_cyc_scratch_off(addr, 1u, &off)) {
+            psx_cyc_scratch_timing(cpu, rt, reg_mask);
+            return g_psx_scratch[off];
+        }
+    }
 #endif
     return psx_cyc_load_byte(cpu, addr, rt, reg_mask);
 }
@@ -488,7 +644,41 @@ extern void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
 /* LWC2 (GTE load) ReadMemory timing only (completion +1, NO LDWhich arm — the dest
  * is a GTE register). Call AFTER psx_cyc_step(cpu,0) (§1+DO_LDS) and psx_gte_stall.
  * Returns the raw 32-bit value. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
 extern uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr);
+#else
+uint32_t psx_cyc_lwc2_read_slow(CPUState* cpu, uint32_t addr);
+/* Main RAM and scratchpad inline (psx_cyc_readmem's sequence with completion
+ * +1 and no arm; no PSX_LOAD_DELAY gate, as in the slow path); devices, BIOS
+ * and the recording modes take the slow path. */
+static inline uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (g_ls_mode == 0 && !g_ds_recording && addr < 0xC0000000u) {
+        const uint32_t phys = addr & 0x1FFFFFFFu;
+        uint32_t value, off;
+        if (phys < 0x00800000u) {
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            const uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
+            cpu->ld_absorb = 4u; /* main-RAM wait 3 + completion 1 */
+            psx_cyc_charge(fudge + 4u);
+            cpu->ld_which_t = 0x20u;
+            memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
+            return value;
+        }
+        if (psx_cyc_scratch_off(addr, 4u, &off)) {
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            cpu->ld_absorb = 0u;
+            cpu->ld_which_t = 0x20u;
+            memcpy(&value, g_psx_scratch + off, sizeof(value));
+            return value;
+        }
+    }
+#endif
+    return psx_cyc_lwc2_read_slow(cpu, addr);
+}
+#endif
 
 #ifdef __cplusplus
 }

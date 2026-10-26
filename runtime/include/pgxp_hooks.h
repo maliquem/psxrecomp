@@ -95,9 +95,26 @@ enum {
 #define PGXP_ALU_MASK_MOVES ((1u << PGXP_ALU_K_MOVE) | (1u << PGXP_ALU_K_LUI) | (1u << PGXP_ALU_K_ORI))
 extern uint32_t g_pgxp_alu_mask;   /* pgxp_session.cpp */
 
+/* [video] pgxp_mem (docs/PERFORMANCE_MODES.md): the load/store hooks left
+ * out, one bit per opcode & 31 (0x20..0x3F). 0 = every one ("all", the
+ * default); "words" leaves out the byte and halfword ones (LB LH LBU LHU SB
+ * SH): what they write loses its shadow, which the engine's value check turns
+ * into the plain integer position, never a wrong one. */
+#define PGXP_MEM_SKIP_WORDS ((1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 8) | (1u << 9))
+extern uint32_t g_pgxp_mem_skip;   /* pgxp_session.cpp */
+#define PGXP_MEM_ON(instr) (!((g_pgxp_mem_skip >> (((uint32_t)(instr) >> 26) & 31u)) & 1u))
+
 #if defined(PSX_PGXP) && PSX_PGXP
+#if defined(PSX_OVERLAY_DLL_BUILD)
+/* Overlay DLLs cannot see the mask: the host's hook table applies it. */
 #define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
 #define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
+#else
+#define PGXP_LOAD(instr, addr, val) \
+    do { if (PGXP_MEM_ON(instr)) psx_pgxp_load(cpu, (instr), (addr), (val)); } while (0)
+#define PGXP_STORE(instr, addr, val) \
+    do { if (PGXP_MEM_ON(instr)) psx_pgxp_store(cpu, (instr), (addr), (val)); } while (0)
+#endif
 #define PGXP_ALU(instr, res, s1, s2)             psx_pgxp_alu(cpu, (instr), (res), (s1), (s2))
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
