@@ -786,10 +786,15 @@ static void perf_summary_tick(uint64_t frame_count, double standard_hz) {
     p.game_fps = (double)(frame_count - s_perf_last_frame) / secs;
     p.speed = standard_hz > 0 ? p.game_fps / standard_hz : 0;
     p.cores = psx_host_cpu_count();
-    p.emu_cpu_pct = (double)(emu - s_perf_last_emu_cpu) * 1e-9 / secs * 100.0;
+    /* a thread's counter that went back is a new thread (the render thread
+     * started again): nothing to measure in this window */
+    auto cpu_pct = [secs](uint64_t now_ns, uint64_t then_ns) {
+        return now_ns >= then_ns ? (double)(now_ns - then_ns) * 1e-9 / secs * 100.0 : 0.0;
+    };
+    p.emu_cpu_pct = cpu_pct(emu, s_perf_last_emu_cpu);
     p.render_thread = gl_renderer_render_thread_active();
-    p.render_cpu_pct = p.render_thread ? (double)(gl - s_perf_last_gl_cpu) * 1e-9 / secs * 100.0 : 0.0;
-    p.process_cpu_pct = (double)(proc - s_perf_last_proc_cpu) * 1e-9 / secs * 100.0 / p.cores;
+    p.render_cpu_pct = p.render_thread ? cpu_pct(gl, s_perf_last_gl_cpu) : 0.0;
+    p.process_cpu_pct = cpu_pct(proc, s_perf_last_proc_cpu) / p.cores;
     (void)gl_renderer_present_pacing(secs < 1.0 ? 1.0 : secs, &p.pace);
     (void)psx_host_gpu_stats(&p.gpu);
     p.valid = 1;
