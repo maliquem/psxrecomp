@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -31,6 +32,14 @@ static bool should_print_reserved_opcode_warning(uint32_t addr) {
         return true;
     static std::unordered_set<uint32_t> seen;
     return seen.insert(addr).second;
+}
+
+/* Cycle-step folding (psx_cyc_steps2..4): on by default; PSX_CODEGEN_CYC_FOLD=0
+ * emits one psx_cyc_step per instruction as before (A/B). */
+static bool codegen_cyc_fold() {
+    const char* e = std::getenv("PSX_CODEGEN_CYC_FOLD");
+    if (e != nullptr && e[0] != '\0') return e[0] != '0';
+    return true;
 }
 
 static bool codegen_cycle_per_insn() {
@@ -2059,13 +2068,57 @@ std::string CodeGenerator::translate_basic_block(
     // 0x20-0x26) are SKIPPED here — psx_cyc_load_* runs their full interlock inside
     // the body (and arms LDWhich=rt). The dep/res mask is a gen-time literal. This
     // replaces the old flat per-instruction psx_advance_cycles(1u).
-    auto emit_pre_timing = [&](uint32_t in, const std::string& indent) {
+    /* Cycle-step folding (exact): a run of up to four instructions in one I-cache
+     * line whose bodies do not observe the clock (pure ALU, the exit branch; a
+     * store may end the run) charges their steps in one psx_cyc_steps<N> call at
+     * the head; the others emit none. Planned per block below, before the loop.
+     * A run never crosses an I-cache fetch (a miss clears the load give-back), a
+     * load (its step lives in psx_cyc_load_*), a mod instruction hook (it may
+     * read or save the guest clock) or a label (another entry). Under PSX_COSIM
+     * every instruction keeps its own step. */
+    std::map<uint32_t, std::vector<uint32_t>> cyc_fold_head;   /* head addr -> the run's masks */
+    std::map<uint32_t, bool> cyc_fold_member;                  /* member addr -> is the run's last */
+    auto emit_pre_timing = [&](uint32_t at, uint32_t in, const std::string& indent) {
         uint32_t op = in >> 26;
         if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
+        const uint32_t mask = psx_cyc_dep_res_mask(in);
+        auto head = cyc_fold_head.find(at);
+        if (head != cyc_fold_head.end()) {
+            std::string args;
+            for (uint32_t m : head->second) args += fmt::format(", 0x{:X}u", m);
+            ss << "#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_COSIM)\n";
+            ss << indent << fmt::format("psx_cyc_steps{}(cpu{});\n", head->second.size(), args);
+            ss << "#elif defined(PSX_ENABLE_BLOCK_CYCLES)\n";
+            ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n", mask);
+            ss << "#endif\n";
+            return;
+        }
+        if (cyc_fold_member.count(at)) {
+            ss << "#if defined(PSX_ENABLE_BLOCK_CYCLES) && defined(PSX_COSIM)\n";
+            ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n", mask);
+            ss << "#endif\n";
+            return;
+        }
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n",
-                                    psx_cyc_dep_res_mask(in));
+        ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n", mask);
         ss << "#endif\n";
+    };
+    /* A folded instruction whose body runs after a later one's step (the head
+     * and every member but the last) must not observe the clock: a body that
+     * calls into timing, memory or a hook fails the generation instead. */
+    auto cyc_fold_check = [&](uint32_t at, const std::string& body) {
+        const bool head = cyc_fold_head.count(at) != 0;
+        auto mem = cyc_fold_member.find(at);
+        if (!head && (mem == cyc_fold_member.end() || mem->second)) return;
+        static const char* const k_forbidden[] = {
+            "psx_cyc_", "psx_check_interrupts", "psx_advance", "psx_slice", "psx_mod_",
+            "psx_read_", "psx_write_", "psx_store_", "psx_muldiv", "psx_mult", "psx_gte",
+            "psx_icache", "psx_cpu_charge", "cop0", "exception", "longjmp", "psx_sw", "psx_lw",
+        };
+        for (const char* f : k_forbidden)
+            if (body.find(f) != std::string::npos)
+                throw std::runtime_error(fmt::format(
+                    "cycle-step folding: 0x{:08X} is folded but its body uses '{}'", at, f));
     };
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
     // interlock/load — exactly like Beetle ReadInstruction precedes the base, and so a
@@ -2188,6 +2241,82 @@ std::string CodeGenerator::translate_basic_block(
     uint32_t delayed_load_dest = 0u;
     bool delayed_load_active = false;
 
+    /* Cycle-step folding: the block's steps in emission order (its instructions,
+     * the exit branch, a plain delay slot), then the runs (see emit_pre_timing). */
+    if (cycle_per_insn && codegen_cyc_fold()) {
+        enum { K_LOAD, K_PURE, K_STORE, K_OTHER };
+        struct Slot { uint32_t addr, instr; bool fetch; int kind; };
+        auto fetch_at = [&](uint32_t a) {
+            return psx_fetch_uncached(runtime_pc(a)) || a == block.start_addr ||
+                   (a & 0xCu) == 0 || extra_labels_.count(a) != 0;
+        };
+        auto hooked = [&](uint32_t a) {
+            return std::any_of(config_.mod_instruction_sites.begin(),
+                               config_.mod_instruction_sites.end(),
+                               [=](uint32_t site) { return (site & 0x1FFFFFFFu) == (a & 0x1FFFFFFFu); });
+        };
+        auto kind_of = [&](uint32_t a, uint32_t w) -> int {
+            const uint32_t op = w >> 26, fn = w & 63u;
+            if (op >= 0x20u && op <= 0x26u) return K_LOAD;
+            if (hooked(a) || !draw_distance_clamp_prefix(a, w).empty()) return K_OTHER;
+            if (op == 0x28u || op == 0x29u || op == 0x2Au || op == 0x2Bu || op == 0x2Eu) return K_STORE;
+            if (op == 0u) {
+                switch (fn) {
+                case 0x00u: case 0x02u: case 0x03u: case 0x04u: case 0x06u: case 0x07u:  /* shifts */
+                case 0x21u: case 0x23u: case 0x24u: case 0x25u: case 0x26u: case 0x27u:  /* ADDU SUBU AND OR XOR NOR */
+                case 0x2Au: case 0x2Bu:                                                    /* SLT SLTU */
+                    return K_PURE;
+                default:                                   /* ADD/SUB trap, muldiv, syscall... */
+                    return K_OTHER;
+                }
+            }
+            if (op >= 0x09u && op <= 0x0Fu) return K_PURE;  /* ADDIU SLTI SLTIU ANDI ORI XORI LUI */
+            return K_OTHER;                                 /* ADDI traps; COP0/COP2/LWC2/SWC2 */
+        };
+        std::vector<Slot> slots;
+        for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4u) {
+            if (exit_uses_delay_slot && a == block.end_addr) break;
+            const auto w = exe_.read_word(a);
+            if (!w.has_value()) break;
+            if (!ControlFlowAnalyzer::is_control_flow(*w)) {
+                slots.push_back({a, *w, fetch_at(a), kind_of(a, *w)});
+                continue;
+            }
+            if (a != exit_branch_addr) break;
+            /* the exit: plain branches and jumps are pure; their delay slot follows */
+            const uint32_t bop = block.exit_instr.instruction >> 26;
+            const bool plain = !block.exit_instr.is_likely && !(bop >= 0x14u && bop <= 0x17u) &&
+                               !hooked(a) &&
+                               (block.exit_instr.type == ControlFlowType::Branch ||
+                                block.exit_instr.type == ControlFlowType::Jump ||
+                                block.exit_instr.type == ControlFlowType::JumpLink ||
+                                block.exit_instr.type == ControlFlowType::JumpRegister ||
+                                block.exit_instr.type == ControlFlowType::JumpLinkReg ||
+                                block.exit_instr.type == ControlFlowType::Return);
+            slots.push_back({a, block.exit_instr.instruction, fetch_at(a), plain ? K_PURE : K_OTHER});
+            if (plain && block.exit_instr.has_delay_slot) {
+                const auto dw = exe_.read_word(a + 4u);
+                if (dw.has_value() && !ControlFlowAnalyzer::is_control_flow(*dw))
+                    slots.push_back({a + 4u, *dw, fetch_at(a + 4u), kind_of(a + 4u, *dw)});
+            }
+            break;
+        }
+        for (size_t i = 0; i < slots.size(); i++) {
+            if (slots[i].kind != K_PURE) continue;           /* a head: its body runs after the run's steps */
+            std::vector<uint32_t> masks{psx_cyc_dep_res_mask(slots[i].instr)};
+            size_t j = i + 1;
+            while (j < slots.size() && masks.size() < 4 && !slots[j].fetch &&
+                   (slots[j].kind == K_PURE || slots[j].kind == K_STORE)) {
+                masks.push_back(psx_cyc_dep_res_mask(slots[j].instr));
+                if (slots[j++].kind == K_STORE) break;       /* a store only ends a run */
+            }
+            if (masks.size() < 2) continue;
+            cyc_fold_head[slots[i].addr] = masks;
+            for (size_t k = i + 1; k < j; k++) cyc_fold_member[slots[k].addr] = (k + 1 == j);
+            i = j - 1;
+        }
+    }
+
     while (addr <= block.end_addr) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt.has_value()) {
@@ -2219,7 +2348,7 @@ std::string CodeGenerator::translate_basic_block(
 
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
-            if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            if (cycle_per_insn) emit_pre_timing(addr, instr, config_.indent);
             // If this is the successor half of a deferred load pair AND it is an
             // LWL/LWR merging into that same register, hardware forwards the
             // pending load into the merge (see set_lwlr_merge_forward). Point
@@ -2235,6 +2364,7 @@ std::string CodeGenerator::translate_basic_block(
                     fmt::format("psx_ldd_{:08X}", delayed_load_addr));
             }
             std::string emitted = translate_instruction(addr, instr);
+            cyc_fold_check(addr, emitted);
             if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
@@ -2346,7 +2476,7 @@ std::string CodeGenerator::translate_basic_block(
                 if (cycle_per_insn)
                     emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
-                    emit_pre_timing(block.exit_instr.instruction, config_.indent);
+                    emit_pre_timing(exit_branch_addr, block.exit_instr.instruction, config_.indent);
 
                 // Register-indirect targets are resolved at the jump instruction.
                 // The delay slot may overwrite the source register, so all JR/JALR
@@ -2428,8 +2558,12 @@ std::string CodeGenerator::translate_basic_block(
                             ss << config_.indent << "/* delay slot (always executes) */\n";
                             // Delay slot's own fetch + §1+deps+DO_LDS, before its body (skipped if a load).
                             if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
-                            if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
-                            ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
+                            if (cycle_per_insn) emit_pre_timing(delay_slot_addr, delay_instr, config_.indent);
+                            {
+                                const std::string ds_body = translate_instruction(delay_slot_addr, delay_instr);
+                                cyc_fold_check(delay_slot_addr, ds_body);
+                                ss << ds_body << "\n";
+                            }
                             emit_cosim_instr(delay_slot_addr, config_.indent);
                         }
                     }

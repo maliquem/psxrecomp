@@ -255,6 +255,46 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_lds(cpu);
 }
 
+/* A run of plain instructions' steps in one call (the game emitter folds
+ * them: recompiler/src/code_generator.cpp, "cycle-step folding"): each
+ * instruction's §1 base, GPR_DEPRES and DO_LDS exactly as psx_cyc_step does
+ * them, in program order, with their +1s added up into one charge. Nothing
+ * in such a run observes the clock (pure ALU and branches; a store may be
+ * the last: its body comes after every step), so one charge at the head is
+ * the same guest time at every observation point; the pipeline state ends
+ * byte for byte as the per-instruction steps leave it. */
+/* One call per run, not the run's body at every site: tens of thousands of
+ * runs inlined made the game's code a third bigger. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PSX_CYC_RUN_FN static __attribute__((noinline))
+#else
+#define PSX_CYC_RUN_FN static
+#endif
+static inline uint32_t psx_cyc_base_take(CPUState* cpu) {
+    uint8_t w = cpu->read_absorb_which;
+    if (cpu->read_absorb[w]) { cpu->read_absorb[w]--; return 0u; }
+    return 1u;
+}
+PSX_CYC_RUN_FN void psx_cyc_steps2(CPUState* cpu, uint32_t m0, uint32_t m1) {
+    uint32_t c = psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m0); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m1); psx_cyc_lds(cpu);
+    psx_cyc_charge(c);
+}
+PSX_CYC_RUN_FN void psx_cyc_steps3(CPUState* cpu, uint32_t m0, uint32_t m1, uint32_t m2) {
+    uint32_t c = psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m0); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m1); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m2); psx_cyc_lds(cpu);
+    psx_cyc_charge(c);
+}
+PSX_CYC_RUN_FN void psx_cyc_steps4(CPUState* cpu, uint32_t m0, uint32_t m1, uint32_t m2,
+                                  uint32_t m3) {
+    uint32_t c = psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m0); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m1); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m2); psx_cyc_lds(cpu);
+    c += psx_cyc_base_take(cpu); psx_cyc_deps(cpu, m3); psx_cyc_lds(cpu);
+    psx_cyc_charge(c);
+}
+
 /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */
