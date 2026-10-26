@@ -31,6 +31,10 @@ void host_osd_set_diagnostics(const char *first, const char *second);
 
 /* Right-side vertical volume bar (percent clamped 0..100). */
 void host_osd_show_volume(int percent, int duration_ms);
+/* A title showing the volume itself (psx_mod_set_volume_handler): the bar
+ * goes to `handler` first; it returns 1 when it took it. NULL = none. */
+typedef int (*HostOsdVolumeHandler)(int percent, int duration_ms);
+void host_osd_set_volume_handler(HostOsdVolumeHandler handler);
 
 /* Host master volume 0..100 (applied by the audio pump). */
 int  host_volume_get(void);

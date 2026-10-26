@@ -393,13 +393,19 @@ void host_osd_set_diagnostics(const char *first,const char *second) {
 #endif
 }
 
+static HostOsdVolumeHandler s_volume_handler;
+
+void host_osd_set_volume_handler(HostOsdVolumeHandler handler) {
+    s_volume_handler = handler;
+}
+
 void host_osd_show_volume(int percent, int duration_ms) {
+    if (duration_ms <= 0) duration_ms = OSD_DEFAULT_MS;
+    if (s_volume_handler && s_volume_handler(clamp_pct(percent), duration_ms)) return;   /* the title shows it */
 #if !HOST_OSD_VISUAL
     (void)percent;
-    (void)duration_ms;
     return;
 #else
-    if (duration_ms <= 0) duration_ms = OSD_DEFAULT_MS;
     s_vol_pct = clamp_pct(percent);
     s_vol_expire_ms = SDL_GetTicks() + (Uint32)duration_ms;
     s_vol_active = 1;
@@ -418,9 +424,7 @@ void host_volume_set(int percent) {
 
 int host_volume_adjust(int delta) {
     s_volume = clamp_pct(s_volume + delta);
-#if HOST_OSD_VISUAL
     host_osd_show_volume(s_volume, OSD_DEFAULT_MS);
-#endif
     return s_volume;
 }
 

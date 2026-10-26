@@ -62,12 +62,17 @@ static uint32_t s_panel[SSM_W * SSM_H];
 static uint32_t s_thumbs[SAVESTATE_SLOTS][SAVESTATE_THUMB_W * SAVESTATE_THUMB_H];
 static int s_have_thumb[SAVESTATE_SLOTS];
 
-/* A title's renderer and its canvas (psx_savestate_menu_set_renderer). */
+/* A title's renderer and its canvas (psx_savestate_menu_set_renderer): 240
+ * lines times the title's scale (psx_savestate_menu_set_scale), each canvas
+ * keeping the size it was drawn at. The buffers are allocated once at the
+ * largest scale: a picture handed to the render thread is never freed. */
 #define SSM_CANVAS_H 240
 #define SSM_CANVAS_MAX_W 1024
+#define SSM_SCALE_MAX 2
+static int s_scale = 1;
 static PsxSaveStateMenuRenderer s_renderer;
 static uint32_t *s_canvas;
-static int s_canvas_w, s_canvas_on;
+static int s_canvas_w, s_canvas_h, s_canvas_on;
 static int s_win_w = 4, s_win_h = 3;
 
 /* A title's page (shares the canvas: never open with the menu) and its HUD
@@ -75,12 +80,12 @@ static int s_win_w = 4, s_win_h = 3;
 static PsxTitleCanvasRenderer s_page, s_hud;
 static int s_page_dirty, s_page_on;
 static uint32_t *s_hud_canvas;
-static int s_hud_w, s_hud_dirty, s_hud_on;
+static int s_hud_w, s_hud_h, s_hud_dirty, s_hud_on;
 /* A title's notices over all of the above (own canvas; s_mix = them blended
  * over the canvas shown under them). */
 static PsxTitleCanvasRenderer s_toast;
 static uint32_t *s_toast_canvas, *s_mix;
-static int s_toast_w, s_toast_dirty, s_toast_on, s_toast_again;
+static int s_toast_w, s_toast_h, s_toast_dirty, s_toast_on, s_toast_again;
 
 static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
 {
@@ -336,15 +341,34 @@ void psx_savestate_menu_set_renderer(PsxSaveStateMenuRenderer renderer)
     s_dirty = 1;
 }
 
+static void all_dirty(void)
+{
+    s_dirty = 1;
+    s_page_dirty = 1;
+    s_hud_dirty = 1;
+    s_toast_dirty = 1;
+}
+
 void psx_savestate_menu_set_window(int w, int h)
 {
     if (w <= 0 || h <= 0 || (w == s_win_w && h == s_win_h)) return;
     s_win_w = w;
     s_win_h = h;
-    s_dirty = 1;
-    s_page_dirty = 1;
-    s_hud_dirty = 1;
-    s_toast_dirty = 1;
+    all_dirty();
+}
+
+void psx_savestate_menu_set_scale(int scale)
+{
+    if (scale < 1) scale = 1;
+    if (scale > SSM_SCALE_MAX) scale = SSM_SCALE_MAX;
+    if (scale == s_scale) return;
+    s_scale = scale;
+    all_dirty();
+}
+
+int psx_savestate_menu_scale(void)
+{
+    return s_scale;
 }
 
 void psx_savestate_menu_set_page(PsxTitleCanvasRenderer page)
@@ -390,37 +414,46 @@ int psx_savestate_menu_overlay_blend(void)
     return (s_page && s_page_on) || (!s_page && s_hud_on) || s_toast_on;
 }
 
+static int canvas_height(void)
+{
+    return SSM_CANVAS_H * s_scale;
+}
+
 static int canvas_width(void)
 {
-    int cw = (int)((int64_t)SSM_CANVAS_H * s_win_w / s_win_h);
-    if (cw < 320) cw = 320;
-    if (cw > SSM_CANVAS_MAX_W) cw = SSM_CANVAS_MAX_W;
+    int cw = (int)((int64_t)canvas_height() * s_win_w / s_win_h);
+    if (cw < 320 * s_scale) cw = 320 * s_scale;
+    if (cw > SSM_CANVAS_MAX_W * s_scale) cw = SSM_CANVAS_MAX_W * s_scale;
     return cw;
 }
 
 static uint32_t *canvas_buffer(uint32_t **buf)
 {
-    if (!*buf) *buf = (uint32_t *)malloc((size_t)SSM_CANVAS_MAX_W * SSM_CANVAS_H * sizeof(uint32_t));
+    if (!*buf)
+        *buf = (uint32_t *)malloc((size_t)SSM_CANVAS_MAX_W * SSM_SCALE_MAX * SSM_CANVAS_H * SSM_SCALE_MAX *
+                                  sizeof(uint32_t));
     return *buf;
 }
 
 /* The title's canvas, when it has a renderer and draws this time. */
 static int render_canvas(void)
 {
-    const int cw = canvas_width();
+    const int cw = canvas_width(), ch = canvas_height();
     if (!s_renderer || !canvas_buffer(&s_canvas)) return 0;
-    memset(s_canvas, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    memset(s_canvas, 0, (size_t)cw * ch * sizeof(uint32_t));
     s_canvas_w = cw;
-    return s_renderer(s_selected, s_canvas, cw, SSM_CANVAS_H) != 0;
+    s_canvas_h = ch;
+    return s_renderer(s_selected, s_canvas, cw, ch) != 0;
 }
 
-static int title_canvas(PsxTitleCanvasRenderer fn, uint32_t **buf, int *bw)
+static int title_canvas(PsxTitleCanvasRenderer fn, uint32_t **buf, int *bw, int *bh)
 {
-    const int cw = canvas_width();
+    const int cw = canvas_width(), ch = canvas_height();
     if (!fn || !canvas_buffer(buf)) return 0;
-    memset(*buf, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    memset(*buf, 0, (size_t)cw * ch * sizeof(uint32_t));
     *bw = cw;
-    return fn(*buf, cw, SSM_CANVAS_H) != 0;
+    *bh = ch;
+    return fn(*buf, cw, ch) != 0;
 }
 
 static int give(const uint32_t *px, int pw, int ph, const uint32_t **pixels, int *w, int *h)
@@ -437,18 +470,18 @@ static int base_image(const uint32_t **pixels, int *w, int *h)
     if (!s_open) {
         if (s_page) {
             if (s_page_dirty) {
-                s_page_on = title_canvas(s_page, &s_canvas, &s_canvas_w);
+                s_page_on = title_canvas(s_page, &s_canvas, &s_canvas_w, &s_canvas_h);
                 s_page_dirty = 0;
             }
-            return s_page_on ? give(s_canvas, s_canvas_w, SSM_CANVAS_H, pixels, w, h)
+            return s_page_on ? give(s_canvas, s_canvas_w, s_canvas_h, pixels, w, h)
                              : give(NULL, 0, 0, pixels, w, h);
         }
         if (s_hud) {
             if (s_hud_dirty) {
-                s_hud_on = title_canvas(s_hud, &s_hud_canvas, &s_hud_w);
+                s_hud_on = title_canvas(s_hud, &s_hud_canvas, &s_hud_w, &s_hud_h);
                 s_hud_dirty = 0;
             }
-            if (s_hud_on) return give(s_hud_canvas, s_hud_w, SSM_CANVAS_H, pixels, w, h);
+            if (s_hud_on) return give(s_hud_canvas, s_hud_w, s_hud_h, pixels, w, h);
         }
         return give(NULL, 0, 0, pixels, w, h);
     }
@@ -460,7 +493,7 @@ static int base_image(const uint32_t **pixels, int *w, int *h)
     if (s_canvas_on) {
         if (pixels) *pixels = s_canvas;
         if (w) *w = s_canvas_w;
-        if (h) *h = SSM_CANVAS_H;
+        if (h) *h = s_canvas_h;
         return 1;
     }
     if (pixels) *pixels = s_panel;
@@ -472,15 +505,16 @@ static int base_image(const uint32_t **pixels, int *w, int *h)
 /* The notices' canvas, drawn when asked or while moving (renderer 2). */
 static void toast_update(void)
 {
-    const int cw = canvas_width();
+    const int cw = canvas_width(), ch = canvas_height();
     int r;
     if (!s_toast) { s_toast_on = s_toast_again = 0; return; }
-    if (!s_toast_dirty && !s_toast_again && s_toast_w == cw) return;
+    if (!s_toast_dirty && !s_toast_again && s_toast_w == cw && s_toast_h == ch) return;
     s_toast_dirty = 0;
     if (!canvas_buffer(&s_toast_canvas)) { s_toast_on = s_toast_again = 0; return; }
-    memset(s_toast_canvas, 0, (size_t)cw * SSM_CANVAS_H * sizeof(uint32_t));
+    memset(s_toast_canvas, 0, (size_t)cw * ch * sizeof(uint32_t));
     s_toast_w = cw;
-    r = s_toast(s_toast_canvas, cw, SSM_CANVAS_H);
+    s_toast_h = ch;
+    r = s_toast(s_toast_canvas, cw, ch);
     s_toast_on = r != 0;
     s_toast_again = r == 2;
 }
@@ -513,9 +547,9 @@ int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
     const int base = base_image(&bp, &bw, &bh);
     toast_update();
     if (!s_toast_on) return base ? give(bp, bw, bh, pixels, w, h) : give(NULL, 0, 0, pixels, w, h);
-    if (!base || !bp) return give(s_toast_canvas, s_toast_w, SSM_CANVAS_H, pixels, w, h);
+    if (!base || !bp) return give(s_toast_canvas, s_toast_w, s_toast_h, pixels, w, h);
     /* the framework's own panel (no title canvas) keeps its look */
-    if (bh != SSM_CANVAS_H || bw != s_toast_w || !canvas_buffer(&s_mix)) return give(bp, bw, bh, pixels, w, h);
+    if (bh != s_toast_h || bw != s_toast_w || !canvas_buffer(&s_mix)) return give(bp, bw, bh, pixels, w, h);
     blend_over(s_mix, s_toast_canvas, bp, bw * bh);
     return give(s_mix, bw, bh, pixels, w, h);
 }

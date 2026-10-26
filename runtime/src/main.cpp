@@ -588,6 +588,7 @@ static uint64_t s_fps_last_frame = 0;
 static uint64_t s_fps_last_flips = 0;   /* gpu_display_flips() at the window's start */
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
+static PSXModPerfHandler s_perf_handler = nullptr;   /* a title shows the readout (psx_mod_set_perf_handler) */
 static FramePacer s_frame_pacer = { 0 };
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
@@ -657,6 +658,11 @@ static void fps_telemetry_toggle(void) {
         SDL_SetWindowTitle(sdl_window, s_fps_base_title.c_str());
     if (!enabled)
         host_osd_set_status(NULL);
+    if (!enabled && s_perf_handler) {
+        PSXModPerfReadout off{};
+        off.size = (int)sizeof off;
+        s_perf_handler(&off);
+    }
     s_fps_base_title.clear();
     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
 }
@@ -697,6 +703,58 @@ static GlGpuTotals s_perf_last_gpu{};
 static void perf_summary_reset(void) {
     s_perf_last_qpc = 0;
     s_perf.valid = 0;
+}
+/* The readout's figures for a title showing it (psx_mod_set_perf_handler):
+ * the same as the status text's; -1 for what the host cannot read. */
+static void perf_readout_fill(PSXModPerfReadout *r, double fps, double speed, double display_fps) {
+    std::memset(r, 0, sizeof *r);
+    r->size = (int)sizeof *r;
+    r->on = 1;
+    r->game_fps = fps;
+    r->speed = speed;
+    const PerfSummary &p = s_perf;
+    r->display_fps = p.valid && p.pace.presents > 0 ? p.pace.fps : display_fps;
+    r->gen_gpu_ms = r->render_cpu_pct = r->gpu_pct = r->gpu_all_pct = r->vram_gb = -1.0;
+    r->render_ms = r->post_gpu_ms = -1.0;
+    r->gpu_clock_mhz = r->gpu_pstate = -1;
+    r->recording = psx_perf_meter_recording();
+    if (!p.valid) return;
+    r->summary = 1;
+    r->generated = p.pace.generated;
+    r->frame_ms = p.pace.avg_ms;
+    r->frame_p99_ms = p.pace.p99_ms;
+    r->frame_max_ms = p.pace.max_ms;
+    r->low1_fps = p.pace.low1_fps;
+    if (p.gen_timed > 0) r->gen_gpu_ms = p.gen_gpu_ms;
+    r->cpu_pct = p.emu_cpu_pct;
+    if (p.render_thread) r->render_cpu_pct = p.render_cpu_pct;
+    if (p.gpu.engine_ok) {
+        r->gpu_pct = p.gpu.proc_3d_pct;
+        r->gpu_all_pct = p.gpu.all_3d_pct;
+    } else if (p.gpu.ok) {
+        r->gpu_all_pct = (double)p.gpu.util_pct;
+    }
+    if (p.gpu.ok) {
+        r->gpu_clock_mhz = (int)p.gpu.clock_mhz;
+        r->gpu_pstate = p.gpu.pstate;
+    }
+    if (p.gpu.proc_ok) r->vram_gb = p.gpu.proc_vram_mb / 1024.0;
+    PsxPerfWindow mw;
+    psx_perf_meter_window(&mw);
+    if (!mw.valid) return;
+    r->meter = 1;
+    r->vbl_ms = mw.wall_avg;
+    r->busy_ms = mw.busy_avg;
+    r->busy_p99_ms = mw.busy_p99;
+    r->emu_ms = mw.game_avg;
+    r->gpu_ms = mw.sec_avg[PM_GPU];
+    r->present_ms = mw.sec_avg[PM_PRESENT];
+    r->audio_ms = mw.sec_avg[PM_AUDIO];
+    r->debug_ms = mw.sec_avg[PM_DEBUG];
+    if (mw.render_cpu_avg > 0.0 || mw.gpu_frames) {
+        r->render_ms = mw.render_cpu_avg;
+        r->post_gpu_ms = mw.gpu_post_avg;
+    }
 }
 static void perf_summary_tick(uint64_t frame_count, double standard_hz) {
     const Uint64 now = SDL_GetPerformanceCounter(), freq = SDL_GetPerformanceFrequency();
@@ -8942,6 +9000,14 @@ extern "C" void psx_mod_title_hud_redraw(void) { psx_savestate_menu_hud_redraw()
 extern "C" void psx_mod_set_title_toast(PSXModCanvasRenderer render) { psx_savestate_menu_set_toast(render); }
 extern "C" void psx_mod_title_toast_redraw(void) { psx_savestate_menu_toast_redraw(); }
 extern "C" void psx_mod_set_osd_handler(PSXModOsdHandler handler) { host_osd_set_handler(handler); }
+extern "C" void psx_mod_set_title_canvas_scale(int scale) { psx_savestate_menu_set_scale(scale); }
+extern "C" int psx_mod_title_canvas_scale(void) { return psx_savestate_menu_scale(); }
+extern "C" void psx_mod_set_perf_handler(PSXModPerfHandler handler) {
+    if (s_perf_handler == handler) return;
+    s_perf_handler = handler;
+    if (fps_telemetry_enabled()) host_osd_set_status(NULL);   /* the next figures go to the new owner */
+}
+extern "C" void psx_mod_set_volume_handler(PSXModVolumeHandler handler) { host_osd_set_volume_handler(handler); }
 extern "C" int psx_mod_host_pad_kind(void) {
     if (const char* e = std::getenv("PSX_PAD_KIND")) {
         if (!std::strcmp(e, "xbox")) return PSX_MOD_PAD_KIND_XBOX;
@@ -9467,7 +9533,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 }
                 SDL_SetWindowTitle(sdl_window, title);
             }
-            if (!g_headless) {
+            if (!g_headless && s_perf_handler) {   /* the title shows it */
+                PSXModPerfReadout r;
+                perf_readout_fill(&r, fps, speed, display_fps);
+                s_perf_handler(&r);
+            } else if (!g_headless) {
                 char osd[360];
                 const PerfSummary &p = s_perf;
                 if (p.valid) {
@@ -20656,6 +20726,9 @@ int main(int argc, char** argv) {
         title_page_close();
         psx_savestate_menu_set_hud(nullptr);
         psx_savestate_menu_set_toast(nullptr);
+        psx_savestate_menu_set_scale(1);
+        s_perf_handler = nullptr;
+        host_osd_set_volume_handler(nullptr);
         gl_renderer_set_pointer(0, 0.0f, 0.0f);
         gl_renderer_set_pointer_image(nullptr, 0, 0, 0, 0);
         gl_renderer_set_pointer_scale(1.0f);

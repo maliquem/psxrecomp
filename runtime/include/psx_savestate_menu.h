@@ -24,6 +24,12 @@ typedef int (*PsxSaveStateMenuRenderer)(int selected_slot, uint32_t *argb, int w
 void psx_savestate_menu_set_renderer(PsxSaveStateMenuRenderer renderer);
 /* The window's size, for the canvas' aspect (redrawn when it changes). */
 void psx_savestate_menu_set_window(int w, int h);
+/* Every title canvas (this menu's, the page's, the HUD's, the notices') is
+ * 240 x scale lines and 320..1024 x scale columns (1 or 2; 1 by default):
+ * a title drawing the PSX picture's pixels as scale x scale blocks can add
+ * finer detail (half-size text). Redrawn when it changes. */
+void psx_savestate_menu_set_scale(int scale);
+int  psx_savestate_menu_scale(void);
 /* The current image has transparency (a title's canvas): blend it. */
 int  psx_savestate_menu_overlay_blend(void);
 

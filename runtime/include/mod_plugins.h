@@ -1235,10 +1235,52 @@ void psx_mod_title_toast_redraw(void);
  * forward: 4x"...) go to `handler` first (main thread): it returns 1 when the
  * title shows the notice itself (the framework's top-left panel then shows
  * nothing), 0 to have the framework draw it as usual. Status and diagnostic
- * rows and the volume bar stay the framework's. NULL restores; cleared at
- * each session's activation. */
+ * rows stay the framework's (the FPS readout and the volume bar have their
+ * own handlers, below). NULL restores; cleared at each session's activation. */
 typedef int (*PSXModOsdHandler)(const char *msg, int duration_ms);
 void psx_mod_set_osd_handler(PSXModOsdHandler handler);
+/* The title canvases (save state menu renderer, page, HUD, notices) at
+ * `scale` x their size: 240 x scale lines, as wide as the window's aspect
+ * gives (320..1024 x scale columns). 1 (the default) or 2; a title drawing
+ * the PSX picture's pixels as 2 x 2 blocks can add half-size detail (small
+ * text) in between. Cleared to 1 at each session's activation. */
+void psx_mod_set_title_canvas_scale(int scale);
+int  psx_mod_title_canvas_scale(void);
+/* The FPS readout (the DisplayPerf hotkey, F; PSX_FPS_TELEMETRY) shown by the
+ * title: while a handler is set the framework's top-left status text stays
+ * off and `handler` gets the figures each time they are measured (about once
+ * a second, main thread), and once with on = 0 when the readout is turned
+ * off. A figure the host cannot read is -1. NULL restores; cleared at each
+ * session's activation. */
+typedef struct PSXModPerfReadout {
+    int    size;                 /* sizeof(PSXModPerfReadout) */
+    int    on;                   /* 0: the readout was turned off (nothing else set) */
+    double game_fps;             /* the game's own frames (its display flips) per second */
+    double speed;                /* VBlanks / the console's rate (1.00 = full speed) */
+    double display_fps;          /* the window's frames per second */
+    int    summary;              /* 1: the figures down to vram_gb are measured */
+    int    generated;            /* generated frames among the window's (Smooth motion) */
+    double frame_ms, frame_p99_ms, frame_max_ms, low1_fps;   /* intervals between the window's frames */
+    double gen_gpu_ms;           /* GPU time of a generated frame (-1 none) */
+    double cpu_pct;              /* the emulation thread, % of one core */
+    double render_cpu_pct;       /* the render thread (-1 without one) */
+    double gpu_pct, gpu_all_pct; /* the 3D engine: this process's share, every process's */
+    int    gpu_clock_mhz, gpu_pstate;
+    double vram_gb;              /* this process's video memory */
+    int    meter;                /* 1: the per-VBlank figures below are measured (perf_meter.h) */
+    double vbl_ms, busy_ms, busy_p99_ms;   /* a VBlank's time, less the waits, its 99th percentile */
+    double emu_ms, gpu_ms, present_ms, audio_ms, debug_ms;   /* sections of a VBlank */
+    double render_ms, post_gpu_ms;         /* the render thread's time, the effects' GPU time (-1 none) */
+    int    recording;            /* the meter's records are being written */
+} PSXModPerfReadout;
+typedef void (*PSXModPerfHandler)(const PSXModPerfReadout *r);
+void psx_mod_set_perf_handler(PSXModPerfHandler handler);
+/* The host volume keys' bar (VolumeUp / VolumeDown) shown by the title:
+ * `handler` gets the new volume (0..100) first (main thread) and returns 1
+ * when the title shows it itself (the framework's bar then stays hidden).
+ * NULL restores; cleared at each session's activation. */
+typedef int (*PSXModVolumeHandler)(int percent, int duration_ms);
+void psx_mod_set_volume_handler(PSXModVolumeHandler handler);
 /* The kind of P1's host controller, for a title's button prompts: the
  * assigned gamepad's family (PSX_MOD_PAD_KIND_NONE without one). The debug
  * host layer counts as OTHER; PSX_PAD_KIND=xbox|playstation|nintendo|other|
