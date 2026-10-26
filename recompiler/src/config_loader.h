@@ -85,6 +85,31 @@ inline bool video_fmv_filter_parse(const std::string& s, int* out) {
     return false;
 }
 
+// [video] texture_filtering names, the values of PSX_TEXTURE_FILTER_*
+// (runtime/include/video_texture_filter.h), and the edge modes
+// (PSX_TEXTURE_EDGE_*: texture_edges and the class ones).
+inline const char* video_texture_filter_name(int v) {
+    static const char* const k[] = {"nearest", "bilinear", "stable", "xbr", "sharp_bilinear", "jinc2",
+                                    "monotonic_cubic", "dcci", "scale2x", "scale3x", "mmpx"};
+    return v >= 0 && v < 11 ? k[v] : "nearest";
+}
+inline bool video_texture_filter_parse(const std::string& s, int* out) {
+    for (int i = 0; i < 11; i++)
+        if (s == video_texture_filter_name(i)) { *out = i; return true; }
+    if (s == "stable_world") { *out = 2; return true; }
+    if (s == "epx")          { *out = 8; return true; }
+    if (s == "cubic")        { *out = 6; return true; }
+    return false;
+}
+inline const char* video_texture_edge_name(int v) {
+    return v == 1 ? "clean" : v == 2 ? "soft" : "ps1";
+}
+inline bool video_texture_edge_parse(const std::string& s, int* out) {
+    for (int i = 0; i < 3; i++)
+        if (s == video_texture_edge_name(i)) { *out = i; return true; }
+    return false;
+}
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI or ADDIU rt,zero,imm instruction
@@ -521,9 +546,23 @@ struct RuntimeConfig {
     int                   video_supersample_milli = 1000;
 
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
-    // | "xbr" (3: edge-directed magnification, OpenGL only)
-    // (smooths textures and 2D backgrounds). Stored as 0/1.
+    // | "xbr" (3: edge-directed magnification, OpenGL only) and the filters of
+    // gl_texfilter.inc: "sharp_bilinear", "jinc2", "monotonic_cubic", "dcci",
+    // "scale2x", "scale3x", "mmpx" (OpenGL only). Stored as PSX_TEXTURE_FILTER_*
+    // (video_texture_filter_parse). The world's filter; sprites and UI follow
+    // it unless set below.
     int                   video_texture_filter = 0;
+    // sprite_texture_filtering: the same names for 2D (rectangles, quads drawn
+    // as rectangles, polygons without PGXP); ui_texture_filtering: for what the
+    // game draws in its ordering table's front (menus, HUD). -1 = follow
+    // texture_filtering. texture_edges / sprite_texture_edges /
+    // ui_texture_edges: "ps1" (the PS1 cutout) | "clean" (the filter's outline,
+    // hard) | "soft" (the same, blended); -1 = unset (ps1).
+    int                   video_sprite_texture_filter = -1;
+    int                   video_ui_texture_filter = -1;
+    int                   video_texture_edges = -1;
+    int                   video_sprite_texture_edges = -1;
+    int                   video_ui_texture_edges = -1;
 
     // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
     // (a 320x192-class movie blown up to the window). Only consulted when
@@ -1615,7 +1654,13 @@ struct UserSettings {
     // both the launcher and the emulator window so they boot at the same size.
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
-    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    bool has_texture_filter = false; int  texture_filter = 0; // PSX_TEXTURE_FILTER_*
+    // The class filters and edges (RuntimeConfig::video_sprite_texture_filter...).
+    bool has_sprite_texture_filter = false; int sprite_texture_filter = -1;
+    bool has_ui_texture_filter     = false; int ui_texture_filter     = -1;
+    bool has_texture_edges         = false; int texture_edges         = 0;
+    bool has_sprite_texture_edges  = false; int sprite_texture_edges  = 0;
+    bool has_ui_texture_edges      = false; int ui_texture_edges      = 0;
     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
     bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;

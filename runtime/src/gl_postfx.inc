@@ -1478,6 +1478,12 @@ static void pfx_sm_init(void) {
         "void main(){\n"
 #define SM_FS_TEXEL \
         "  if (v_dw.x < 0) return;\n" \
+        "  if (v_dw.x == 3 && v_dw.y == -1) {   /* a filtered outline: the cut-out's opacity, bilinear, at one half */\n" \
+        "    vec2 q = v_uv - 0.5; ivec2 b = ivec2(floor(q)); vec2 f = q - vec2(b);\n" \
+        "    float a = mix(mix(texelFetch(u_atl, b, 0).r, texelFetch(u_atl, b + ivec2(1, 0), 0).r, f.x),\n" \
+        "                  mix(texelFetch(u_atl, b + ivec2(0, 1), 0).r, texelFetch(u_atl, b + ivec2(1, 1), 0).r, f.x), f.y);\n" \
+        "    if (a < 0.5) discard; return;\n" \
+        "  }\n" \
         "  if (v_dw.x == 3) { if (texelFetch(u_atl, ivec2(floor(v_uv)), 0).r < 0.5) discard; return; }\n" \
         "  int u = int(floor(v_uv.x)) & 255, v = int(floor(v_uv.y)) & 255;\n" \
         "  ivec4 tw = ivec4(v_dw.y & 31, (v_dw.y >> 5) & 31, (v_dw.y >> 10) & 31, (v_dw.y >> 15) & 31);\n" \

@@ -225,6 +225,10 @@ typedef void   (APIENTRY *PFN_glEndQuery)(GLenum);
 typedef void   (APIENTRY *PFN_glGetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
 typedef void   (APIENTRY *PFN_glGetQueryObjectiv)(GLuint, GLenum, GLint *);
 typedef void   (APIENTRY *PFN_glQueryCounter)(GLuint, GLenum);
+/* The textured program's filter variants copy their uniforms (tex_prog_switch). */
+typedef void   (APIENTRY *PFN_glGetActiveUniform)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *);
+typedef void   (APIENTRY *PFN_glGetUniformfv)(GLuint, GLint, GLfloat *);
+typedef void   (APIENTRY *PFN_glGetUniformiv)(GLuint, GLint, GLint *);
 /* Buffer mapping for asynchronous pixel-pack readback (presented-image ring). */
 typedef void * (APIENTRY *PFN_glMapBuffer)(GLenum, GLenum);
 typedef GLboolean (APIENTRY *PFN_glUnmapBuffer)(GLenum);
@@ -292,9 +296,14 @@ static PFN_glEndQuery            p_glEndQuery;
 static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
 static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
 static PFN_glQueryCounter        p_glQueryCounter;
+static PFN_glGetActiveUniform    p_glGetActiveUniform;
+static PFN_glGetUniformfv        p_glGetUniformfv;
+static PFN_glGetUniformiv        p_glGetUniformiv;
 static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
 static void gl_perf_mirror_begin(void); /* frame_perf: GPU-time bracket around ONE native-wide */
 static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits scene canonical/mirror) */
+static void gl_perf_tex_begin(void);    /* frame_perf "tex": GPU-time bracket around ONE textured */
+static void gl_perf_tex_end(void);      /* batch's draws (timestamp pair; the texture filters' cost) */
 /* Native-wide mirror ABLATION (perf attribution, debug cmd gl_ws_ablate):
  * 0 = normal, 1 = skip the whole mirror pass, 2 = full mirror state churn but no
  * draw calls, 3 = mirror draws land in the hr FBO (no per-pass FBO rebind; wide
@@ -376,6 +385,11 @@ static int load_modern_gl(void) {
     p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
     p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
     p_glQueryCounter        = (void *)SDL_GL_GetProcAddress("glQueryCounter");
+    /* Optional: without them a texture filter past the first four stays off
+     * (its program variant is never switched to). */
+    p_glGetActiveUniform    = (void *)SDL_GL_GetProcAddress("glGetActiveUniform");
+    p_glGetUniformfv        = (void *)SDL_GL_GetProcAddress("glGetUniformfv");
+    p_glGetUniformiv        = (void *)SDL_GL_GetProcAddress("glGetUniformiv");
     /* Optional (XR colour program cleanup only): never fails modern-GL init. */
     p_glDeleteProgram       = (void *)SDL_GL_GetProcAddress("glDeleteProgram");
     /* Optional: only the debug presented-image ring maps pack buffers. */
@@ -1080,9 +1094,11 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
     sl->use = ++s_sc_use;
 }
 /* A 2D textured triangle (not proven 3D): kept while sprites cast, so the
- * pieces drawn around a foot point can stand there in the shadow map. */
+ * pieces drawn around a foot point can stand there in the shadow map.
+ * smooth: drawn with a filtered outline (gl_texfilter.inc's Clean or Soft
+ * edges), which the sprite input and its shadows then follow. */
 static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, const int *ys,
-                              const int *us, const int *vs, const float *tex6, int semi) {
+                              const int *us, const int *vs, const float *tex6, int semi, int smooth) {
     if (!s_spr_on || s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
@@ -1116,21 +1132,30 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
             v0 = vs[i] < v0 ? vs[i] : v0; w1 = vs[i] > w1 ? vs[i] : w1;
         }
         const int px = (int)tex6[0], py = (int)tex6[1], cx = (int)tex6[2], cy = (int)tex6[3], win = (int)tex6[5];
-        const int key[10] = {px, py, cx, cy, depth, win, u0, v0, u1, w1};
+        const int key[10] = {px, py, cx, cy, depth, win | (smooth << 20), u0, v0, u1, w1};
         const int w = u1 - u0 + 1, hgt = w1 - v0 + 1;
+        /* a filtered outline (smooth): the sprite input reads the cut-out
+         * bilinearly, so the piece gets a one-texel apron */
+        const int pad = smooth ? 1 : 0;
+        const int s_hi = pad && w > 1 ? w - 2 : w - 1, t_hi = pad && hgt > 1 ? hgt - 2 : hgt - 1;
         if (!memcmp(key, sl->atl_key, sizeof key)) {   /* the quad's other half */
             ax = sl->atl_kx; ay = sl->atl_ky; lo = sl->atl_klo; hi = sl->atl_khi; fill = sl->atl_kfill;
         }
         else if (w > 0 && hgt > 0 && w <= 256 && hgt <= 256) {
             if (!sl->atl) sl->atl = (uint8_t *)malloc((size_t)SC_ATL * SC_ATL);
-            if (sl->atl_x + w > SC_ATL) { sl->atl_x = 0; sl->atl_y += sl->atl_h; sl->atl_h = 0; }
-            if (sl->atl && sl->atl_y + hgt <= SC_ATL) {
-                ax = sl->atl_x; ay = sl->atl_y;
+            if (sl->atl_x + w + 2 * pad > SC_ATL) { sl->atl_x = 0; sl->atl_y += sl->atl_h; sl->atl_h = 0; }
+            if (sl->atl && sl->atl_y + hgt + 2 * pad <= SC_ATL) {
+                ax = sl->atl_x + pad; ay = sl->atl_y + pad;
                 int drawn = 0;
                 const int twx = win & 31, twy = (win >> 5) & 31, tox = (win >> 10) & 31, toy = (win >> 15) & 31;
-                for (int t = 0; t < hgt; t++)
-                    for (int s = 0; s < w; s++) {
-                        int u = (u0 + s) & 255, vv = (v0 + t) & 255;
+                for (int t = -pad; t < hgt + pad; t++)
+                    for (int s = -pad; s < w + pad; s++) {
+                        /* the apron (pad): the edge texels again, as the textured
+                         * shader clamps to the piece's own bounds (the far row
+                         * and column are not drawn) */
+                        const int sc = s < 0 ? 0 : s > s_hi ? s_hi : s;
+                        const int tc = t < 0 ? 0 : t > t_hi ? t_hi : t;
+                        int u = (u0 + sc) & 255, vv = (v0 + tc) & 255;
                         if (twx | twy) { u = (u & ~(twx * 8)) | ((tox & twx) * 8); vv = (vv & ~(twy * 8)) | ((toy & twy) * 8); }
                         const int row = ((py + vv) & 511) * 1024;
                         uint16_t raw;
@@ -1138,12 +1163,13 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
                         else if (depth == 1) raw = s_vram[(cy & 511) * 1024 + ((cx + ((s_vram[row + ((px + (u >> 1)) & 1023)] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
                         else raw = s_vram[row + ((px + u) & 1023)];
                         sl->atl[(size_t)(ay + t) * SC_ATL + ax + s] = raw ? 255 : 0;
+                        if (s < 0 || t < 0 || s >= w || t >= hgt) continue;
                         drawn += raw != 0;
                         /* the row and column past the far edges (v1, u1 themselves)
                          * are not drawn: the sheet's next picture may be there */
                         if (raw && (t < hgt - 1 || hgt == 1) && (s < w - 1 || w == 1)) { if (lo < 0) lo = t; hi = t; }
                     }
-                sl->atl_x += w; if (hgt > sl->atl_h) sl->atl_h = hgt;
+                sl->atl_x += w + 2 * pad; if (hgt + 2 * pad > sl->atl_h) sl->atl_h = hgt + 2 * pad;
                 fill = (float)drawn / (float)(w * hgt);
                 memcpy(sl->atl_key, key, sizeof key); sl->atl_kx = ax; sl->atl_ky = ay;
                 sl->atl_klo = lo; sl->atl_khi = hi; sl->atl_kfill = fill;
@@ -1158,6 +1184,7 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
         for (int k = 0; k < 6; k++) v[5 + k] = tex6[k];
         if (ax >= 0) {   /* atlas texel coordinates; page/CLUT kept to tell sprites apart */
             v[3] = (float)(ax + us[i] - u0); v[4] = (float)(ay + vs[i] - v0); v[9] = 3.0f;
+            if (smooth) v[10] = -1.0f;   /* the cut-out read bilinearly (SM_FS_TEXEL) */
         }
     }
     /* how low on the picture it draws something: below its last drawn row
@@ -1751,6 +1778,7 @@ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uHdTexture = -1;
 static GLint s_uPalette = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+static GLint s_tex_uSoftok = -1;   /* gl_texfilter.inc: this pass may blend Soft edges */
 static GLint s_uMaskset = -1;
 static GLint s_uLimits = -1;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
@@ -1855,6 +1883,32 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
 static int s_mask_set = 0, s_mask_check = 0;
 static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
 static int s_tex_filter = 0;
+/* Texture filters by class (gl_renderer_set_texture_filter_class): 0 world
+ * (textured polygons whose corners PGXP proved 3D), 1 sprites (rectangles,
+ * quads drawn as rectangles, untracked polygons), 2 UI (anything in the
+ * ordering table's front, gpu_ot_front_now). -1 follows s_tex_filter as it
+ * always did: the world takes it, sprites and UI too except Stable world (2),
+ * which keeps them nearest. Edges: PSX_TEXTURE_EDGE_* (gl_texfilter.inc).
+ * s_tf_eff: the filter each class draws with now; s_tf_soft: some class
+ * blends its edges (opaque batches then draw with dual-source blending, exact
+ * where a texel is fully covered). */
+static int s_tf_class[3] = {-1, -1, -1}, s_tf_edge[3] = {0, 0, 0};
+static int s_tf_eff[3] = {0, 0, 0}, s_tf_soft = 0;
+static uint64_t s_tf_prims[3];   /* textured triangles drawn per class (TCP texture_filter) */
+static void tf_update(void) {
+    s_tf_soft = 0;
+    for (int c = 0; c < 3; c++) {
+        int f = s_tf_class[c];
+        if (f < 0) f = (c == 0 || s_tex_filter != PSX_TEXTURE_FILTER_STABLE_WORLD) ? s_tex_filter : 0;
+        s_tf_eff[c] = f;
+        if (f && s_tf_class[c] >= 0 && s_tf_edge[c] == PSX_TEXTURE_EDGE_SOFT) s_tf_soft = 1;
+    }
+}
+/* The a_filter bits of a primitive of class c (sampler | edge << 5). */
+static int tf_bits(int c) {
+    const int f = s_tf_eff[c];
+    return f ? f | ((s_tf_class[c] >= 0 ? s_tf_edge[c] : 0) << 5) : 0;
+}
 /* [video] texture_lod (0 off, 1 mipmap emulation) and anisotropic_filtering
  * (taps along the footprint's major axis, 1..16). */
 static int s_tex_lod = 0, s_tex_aniso = 1;
@@ -2902,6 +2956,7 @@ static const char *GEO_FS =
  * a batch. Sampling mode also travels per primitive, so sharp UI and filtered
  * world geometry can share a draw. The remaining uniforms (u_maskset/u_semipass) are the
  * batch keys + per-pass state. */
+#include "gl_texfilter.inc"   /* PSX_TEXFILTER_GLSL: the filters past the first four */
 static const char *TEX_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;\n"
@@ -2917,7 +2972,7 @@ static const char *TEX_VS =
     "layout(location=10) in float a_twin; /* GP0(E2h) bits 0..19 */\n"
     "layout(location=11) in vec4 a_hd_source; /* page origin + native extent */\n"
     "layout(location=12) in float a_hd_mode;\n"
-    "layout(location=13) in float a_filter; /* 0 nearest, 1 bilinear, 2 stable */\n"
+    "layout(location=13) in float a_filter; /* sampler | LOD 16 | edge << 5 (gl_texfilter.inc) */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
@@ -3134,9 +3189,13 @@ static const char *TEX_FS =
     "  float a = clamp((l.x + l.y - 1.5) / w + 0.5, 0.0, 1.0);\n"
     "  return mix(xbr_c(E), xbr_c(px), a);\n"
     "}\n"
+    PSX_TEXFILTER_GLSL
     "void main(){\n"
     "  int stp; vec3 rgb;\n"
-    "  int fmode = v_filter & 15;\n"
+    "  int fmode = v_filter & 15, fedge = (v_filter >> 5) & 3;\n"
+    "#if TF_MASK != 0\n"
+    "  float tf_cov = 1.0;   /* Soft edges: the filtered opacity, blended at the output */\n"
+    "#endif\n"
     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
     "   * default is the PS1's affine (noperspective) mapping. */\n"
@@ -3163,6 +3222,21 @@ static const char *TEX_FS =
     "    if (raw == 0) discard;\n"
     "    rgb = col5(raw);\n"
     "    stp = (raw >> 15) & 1;\n"
+    "#if TF_MASK != 0\n"
+    "  } else if (fmode >= 4 || (fedge != 0 && fmode != 2)) {\n"
+    "    /* gl_texfilter.inc: the filters past the first four, and edge modes */\n"
+    "    int base = stable_texel(ivec2(floor(uv)));\n"
+    "    if (fedge == 0 && base == 0) discard;\n"
+    "    vec4 rc = tf_sample(fmode, fedge, uv, base, abs(dx) + abs(dy), stp);\n"
+    "    if (fedge != 0) {\n"
+    "      /* the marks (u_bcls) take the outline at one half, as the sprite\n"
+    "       * input does: what is under a soft edge keeps its own mark */\n"
+    "      bool soft = fedge == 2 && u_softok != 0 && u_bcls == 0;\n"
+    "      if (rc.a < (soft ? 1.0 / 64.0 : 0.5)) discard;\n"
+    "      if (soft) tf_cov = rc.a;\n"
+    "    }\n"
+    "    rgb = rc.rgb;\n"
+    "#endif\n"
     "  } else if (fmode == 3) {\n"
     "    /* The nearest texel stays the PS1 one (floor of the unshifted uv). */\n"
     "    int raw = stable_texel(ivec2(floor(uv)));\n"
@@ -3236,6 +3310,11 @@ static const char *TEX_FS =
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
     "  }\n"
+    "#if TF_MASK != 0\n"
+    "  if (tf_cov < 1.0) {   /* a Soft edge over what is under it (u_softok) */\n"
+    "    rgb *= tf_cov; dst_factor = dst_factor * tf_cov + (1.0 - tf_cov);\n"
+    "  }\n"
+    "#endif\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
@@ -3338,6 +3417,98 @@ static GLuint build_program_ex(const char *vs, const char *fs, int dual_source) 
 }
 static GLuint build_program(const char *vs, const char *fs) {
     return build_program_ex(vs, fs, 0);
+}
+
+/* ---- the textured program's filter variants ------------------------------
+ * TEX_FS has gl_texfilter.inc's samplers behind #if (TF_MASK & TFM_*): the
+ * program in use (s_tex_prog) is built with the samplers some class draws
+ * with now, so with none it is the program TEX_FS always was, and a picked
+ * filter compiles small (a GeForce: ~0.5 s the first time, the driver caches
+ * it) with its texels in registers. Each set is built once (s_tfp: the base
+ * first, then the last few sets); a switch, at the next textured flush,
+ * copies every uniform's value from the program in use and fetches the
+ * locations again. */
+enum { TFP_MAX = 6 };
+static struct { unsigned mask; GLuint prog; } s_tfp[TFP_MAX];
+static int s_tfp_n = 0, s_tfp_next = 1;
+static unsigned s_tf_mask_built = 0;
+static GLuint tex_prog_build(unsigned mask) {
+    static const char ver[] = "#version 330\n";
+    const size_t vl = sizeof ver - 1;
+    const char *body = strncmp(TEX_FS, ver, vl) == 0 ? TEX_FS + vl : TEX_FS;
+    const size_t n = vl + strlen(body) + 48;
+    char *src = (char *)malloc(n);
+    if (!src) return 0;
+    snprintf(src, n, "%s#define TF_MASK %u\n%s", ver, mask, body);
+    const GLuint p = build_program_ex(TEX_VS, src, 1);
+    free(src);
+    return p;
+}
+/* The samplers the classes use now (gl_texfilter.inc's TFM_*). */
+static unsigned tf_mask_now(void) {
+    unsigned m = 0;
+    for (int c = 0; c < 3; c++) {
+        const int e = s_tf_class[c] >= 0 ? s_tf_edge[c] : 0;
+        switch (s_tf_eff[c]) {
+        case PSX_TEXTURE_FILTER_BILINEAR:        if (e) m |= TFM_BILINEAR; break;
+        case PSX_TEXTURE_FILTER_SHARP_BILINEAR:  m |= TFM_BILINEAR; break;
+        case PSX_TEXTURE_FILTER_JINC2:           m |= TFM_JINC2; break;
+        case PSX_TEXTURE_FILTER_MONOTONIC_CUBIC: m |= TFM_CUBIC; break;
+        case PSX_TEXTURE_FILTER_DCCI:            m |= TFM_DCCI; break;
+        case PSX_TEXTURE_FILTER_XBR:             if (e) m |= TFM_XBR; break;
+        case PSX_TEXTURE_FILTER_SCALE2X:         m |= TFM_SCALE2X; break;
+        case PSX_TEXTURE_FILTER_SCALE3X:         m |= TFM_SCALE3X; break;
+        case PSX_TEXTURE_FILTER_MMPX:            m |= TFM_MMPX; break;
+        default: break;
+        }
+    }
+    return m;
+}
+static void tex_prog_locations(void);
+/* Every uniform of `from` (TEX_FS has scalars and samplers only) into `to`. */
+static void tex_prog_copy_uniforms(GLuint from, GLuint to) {
+    GLint n = 0;
+    p_glGetProgramiv(from, 0x8B86 /*GL_ACTIVE_UNIFORMS*/, &n);
+    p_glUseProgram(to);
+    for (GLint i = 0; i < n; i++) {
+        char name[64];
+        GLint size = 0;
+        GLenum type = 0;
+        name[0] = 0;
+        p_glGetActiveUniform(from, (GLuint)i, (GLsizei)sizeof name, NULL, &size, &type, name);
+        const GLint lf = p_glGetUniformLocation(from, name), lt = p_glGetUniformLocation(to, name);
+        if (lf < 0 || lt < 0 || size != 1) continue;
+        if (type == GL_FLOAT) { GLfloat v = 0.0f; p_glGetUniformfv(from, lf, &v); p_glUniform1f(lt, v); }
+        else { GLint v = 0; p_glGetUniformiv(from, lf, &v); p_glUniform1i(lt, v); }   /* int, bool, samplers */
+    }
+}
+static void tex_prog_switch(unsigned mask) {
+    s_tf_mask_built = mask;   /* a failed build is not tried again at every flush */
+    if (!p_glGetActiveUniform || !p_glGetUniformfv || !p_glGetUniformiv) return;
+    GLuint np = 0;
+    for (int i = 0; i < s_tfp_n; i++) if (s_tfp[i].mask == mask) np = s_tfp[i].prog;
+    if (!np) {
+        np = tex_prog_build(mask);
+        if (!np) return;
+        int slot = s_tfp_n;
+        if (slot >= TFP_MAX) {   /* the base (slot 0) stays; the others in turn */
+            slot = s_tfp_next;
+            s_tfp_next = s_tfp_next + 1 < TFP_MAX ? s_tfp_next + 1 : 1;
+            if (s_tfp[slot].prog == s_tex_prog) {
+                slot = s_tfp_next;
+                s_tfp_next = s_tfp_next + 1 < TFP_MAX ? s_tfp_next + 1 : 1;
+            }
+            if (p_glDeleteProgram) p_glDeleteProgram(s_tfp[slot].prog);
+        } else {
+            s_tfp_n++;
+        }
+        s_tfp[slot].mask = mask;
+        s_tfp[slot].prog = np;
+    }
+    if (np == s_tex_prog) return;
+    tex_prog_copy_uniforms(s_tex_prog, np);
+    s_tex_prog = np;
+    tex_prog_locations();
 }
 
 /* ---- pixel conversion (PS1 1555: bit15=mask, B[14:10] G[9:5] R[4:0]) ---- */
@@ -4830,11 +5001,34 @@ static int b3dm_passes(int semi, int b3d) {
 /* tb_mask / check are the batch's set-mask and the mask-check state it was
  * drawn under; track_stencil lets the canonical pass record deferred stencil
  * (a replay into the high-resolution window must not touch that flag). */
+/* Soft texture edges (gl_texfilter.inc) blend where the pass draws with
+ * dual-source factors: opaque batches then draw that way too (a fully covered
+ * texel gives dst factor 0: the same pixels), the semi batches of modes 0/1/3
+ * already do; elsewhere the edge is cut (Clean). */
+static void tex_opaque_blend(void) {
+    if (s_tf_soft) {
+        glEnable(GL_BLEND);
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+        p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    p_glUniform1i(s_tex_uSoftok, s_tf_soft);
+}
+static void tex_draw_passes_ex_(int nverts, int semi, int tb_mask, int check,
+                                int track_stencil, int b3d);
 static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
                                int track_stencil, int b3d) {
+    gl_perf_tex_begin();
+    tex_draw_passes_ex_(nverts, semi, tb_mask, check, track_stencil, b3d);
+    gl_perf_tex_end();
+}
+static void tex_draw_passes_ex_(int nverts, int semi, int tb_mask, int check,
+                                int track_stencil, int b3d) {
     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+    p_glUniform1i(s_tex_uSoftok, 0);
     if (semi < 0) {
-        glDisable(GL_BLEND);
+        tex_opaque_blend();
         mask_stencil_ex(tb_mask, check);
         p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
         glDrawArrays(GL_TRIANGLES, 0, nverts);
@@ -4859,6 +5053,7 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
         if (tb_mask) mask_stencil_ex(1, check); else glDisable(GL_STENCIL_TEST);
         p_glUniform1i(s_uSemipass, 0);
+        p_glUniform1i(s_tex_uSoftok, s_tf_soft);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
         if (!tb_mask && track_stencil) s_stencil_valid = 0;
     } else {
@@ -4893,7 +5088,7 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         p_glUniform1i(s_tex_uBcls, 0);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         if (semi < 0) {
-            glDisable(GL_BLEND);
+            tex_opaque_blend();
             mask_stencil_ex(check ? 1 : tb_mask, check);
             p_glUniform1i(s_uSemipass, check ? 2 : 0);
         } else if (!check && semi == 4) {
@@ -5277,6 +5472,8 @@ static void flush_tex_batch_impl(void) {
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
     hr_begin(1);
+    {   const unsigned tfm = tf_mask_now();   /* the filters' program variant */
+        if (tfm != s_tf_mask_built) tex_prog_switch(tfm); }
     p_glUseProgram(s_tex_prog);
     bind_textured_resources(s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex,
         s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex, s_tb_hd_tex);
@@ -5944,14 +6141,16 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     /* PS1 dithering: texture-modulated polygons only (never raw texels or
      * rectangles), while E1 bit 9 is set. */
     const int dither_tex = s_dither_mode && s_dither_bit && !rawtex && !s_prim_rect;
-    // Mode 2 needs proven world geometry. Sprites, HUD and untracked packets
-    // retain point sampling; their cutout pixels must stay sharp.
+    // World textures need proven world geometry. Sprites, HUD and untracked
+    // packets take their own classes (by default nearest under Stable world:
+    // their cutout pixels stay sharp).
     const int untracked=(lim && !s_projected_uv_valid) || (!s_pc_valid && !s_pq_valid);
     /* [video] texture_lod rides in the filter batch key (bit 4) for proven
      * world geometry only; sprites and HUD keep their exact texels. */
+    const int tf_cls = ctx_prim_front() ? 2 : untracked ? 1 : 0;
     const int filter = s_selected_bank_tex ? 0 :
-        ((s_tex_filter==2 && untracked ? 0 : s_tex_filter) |
-         (s_tex_lod && !untracked ? 16 : 0));
+        (tf_bits(tf_cls) | (s_tex_lod && !untracked ? 16 : 0));
+    s_tf_prims[tf_cls]++;
     int lim_buf[4];
     int uv_buf[6];
     if (!lim) {
@@ -6034,7 +6233,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             const float t6[6] = {(float)base_x, (float)base_y, (float)clut_x, (float)clut_y,
                                  s_selected_bank_tex ? -1.0f : (float)depth,
                                  (float)(twx | (twy << 5) | (tox << 10) | (toy << 15))};
-            sc_add_sprite_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, us, vs, t6, semi);
+            sc_add_sprite_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, xs, ys, us, vs, t6, semi,
+                              (filter & 15) != 0 && ((filter >> 5) & 3) != 0);
         }
         int reason = -1;
         if (s_tb_n > 0) {
@@ -6426,8 +6626,28 @@ void gl_renderer_set_dithering(int mode) {
     if (s_ctx) dither_apply_uniforms();
 }
 int gl_renderer_dithering(void) { return s_dither_mode; }
-static void glb_set_texture_filter(int b) { s_tex_filter = b >= 0 && b <= 3 ? b : 0; sw_set_texture_filter(b != 0); }
+static void glb_set_texture_filter(int b) {
+    s_tex_filter = b >= 0 && b < PSX_TEXTURE_FILTER_COUNT ? b : 0;
+    tf_update();
+    sw_set_texture_filter(s_tex_filter != 0);
+}
 static int  glb_texture_filter(void) { return s_tex_filter; }
+void gl_renderer_set_texture_filter_class(int cls, int filter, int edge) {
+    if (cls < 0 || cls > 2) return;
+    GL_RT_SYNC("texture_filter_class");
+    s_tf_class[cls] = filter >= 0 && filter < PSX_TEXTURE_FILTER_COUNT ? filter : -1;
+    s_tf_edge[cls] = edge >= 0 && edge < PSX_TEXTURE_EDGE_COUNT ? edge : 0;
+    tf_update();
+}
+int gl_renderer_texture_filter_class(int cls, int *edge) {
+    if (cls < 0 || cls > 2) return 0;
+    if (edge) *edge = s_tf_class[cls] >= 0 ? s_tf_edge[cls] : 0;
+    return s_tf_eff[cls];
+}
+void gl_renderer_texture_filter_stats(uint64_t prims[3], int *soft) {
+    for (int c = 0; c < 3; c++) prims[c] = s_tf_prims[c];
+    if (soft) *soft = s_tf_soft;
+}
 
 static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m & 3; sw_set_semi_transparency(e, m); }
 static void glb_set_mask_bits(int s, int c) {
@@ -7158,6 +7378,35 @@ static int alloc_hr_targets(int S) {
     return ok;
 }
 
+/* The textured program's uniform locations after a filter variant switch
+ * (tex_prog_switch): init_gpu_raster's, and the lazy ones fetched again when
+ * next set. */
+static void tex_prog_locations(void) {
+    s_uVram = p_glGetUniformLocation(s_tex_prog, "u_vram");
+    s_uPalette = p_glGetUniformLocation(s_tex_prog, "u_palette");
+    s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+    s_uClut = p_glGetUniformLocation(s_tex_prog, "u_clut");
+    s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
+    s_uRaw = p_glGetUniformLocation(s_tex_prog, "u_raw");
+    s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
+    s_uSemimode = p_glGetUniformLocation(s_tex_prog, "u_semimode");
+    s_tex_uSoftok = p_glGetUniformLocation(s_tex_prog, "u_softok");
+    s_uMaskset = p_glGetUniformLocation(s_tex_prog, "u_maskset");
+    s_uLimits = p_glGetUniformLocation(s_tex_prog, "u_limits");
+    s_uHdTexture = p_glGetUniformLocation(s_tex_prog, "u_hd_texture");
+    s_tex_uBcls = p_glGetUniformLocation(s_tex_prog, "u_bcls");
+    s_tex_uBaddonly = p_glGetUniformLocation(s_tex_prog, "u_baddonly");
+    s_tex_uXoff = p_glGetUniformLocation(s_tex_prog, "u_xoff");
+    s_tex_uXhalf = p_glGetUniformLocation(s_tex_prog, "u_xhalf");
+    s_tex_uXscale = p_glGetUniformLocation(s_tex_prog, "u_xscale");
+    s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+    s_tex_uShift = p_glGetUniformLocation(s_tex_prog, "u_shift");
+    s_tex_uZbias = p_glGetUniformLocation(s_tex_prog, "u_zbias");
+    s_uAniso = -1;
+    s_uAccurate = -1;
+    s_tex_uDither = -1;
+}
+
 static int init_gpu_raster(void) {
     /* Effective scale: the request, clamped to what the driver can allocate
      * for the full-VRAM surface and to the memory budget. Logged whenever it
@@ -7229,7 +7478,10 @@ static int init_gpu_raster(void) {
     }
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
-    s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
+    s_tex_prog  = tex_prog_build(0);
+    s_tfp_n = 0;
+    if (s_tex_prog) { s_tfp[0].mask = 0; s_tfp[0].prog = s_tex_prog; s_tfp_n = 1; }
+    s_tf_mask_built = 0;
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_blit_hi_prog = build_program(BLIT_VS_HI, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
@@ -7292,6 +7544,7 @@ static int init_gpu_raster(void) {
     s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
     s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
     s_uSemimode = p_glGetUniformLocation(s_tex_prog, "u_semimode");
+    s_tex_uSoftok = p_glGetUniformLocation(s_tex_prog, "u_softok");
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uAniso = -1;
     lod_apply_uniforms();
@@ -8496,6 +8749,7 @@ typedef struct {
     double   scene_gpu_ms;    /* GPU: all scene draws this frame               */
     double   present_gpu_ms;  /* GPU: the present clear+blit                   */
     double   mirror_gpu_ms;   /* GPU: of scene_gpu, the native-wide mirror passes */
+    double   tex_gpu_ms;      /* GPU: the textured batches' draws (frame_perf "tex" on) */
     double   prims;           /* scene primitives submitted this frame         */
     double   mirror_passes;   /* mirror passes this frame (measured + overflow) */
     double   cw_flush_ms;     /* CPU wall inside flush_tex_batch this frame    */
@@ -8518,6 +8772,13 @@ static int    s_mq_n[GLPERF_NBUF];     /* pairs recorded this frame        */
 static int    s_mq_over[GLPERF_NBUF];  /* passes beyond the pool (counted, untimed) */
 static int    s_mq_open = 0;           /* begin issued, end pending        */
 static int    s_mq_ok = 0;             /* glQueryCounter available         */
+/* The same for every textured batch's draws (tex_draw_passes_ex, canonical
+ * and mirrored), while TCP frame_perf "tex":1 is on: where the texture
+ * filters' cost lands. Off: nothing is issued. */
+#define GLPERF_TEXQ 1024
+static GLuint s_tq_q[GLPERF_NBUF][GLPERF_TEXQ * 2];
+static int    s_tq_n[GLPERF_NBUF];
+static int    s_tq_open = 0, s_tq_on = 0, s_tq_made = 0;
 
 static int      s_pf_on = 0;
 static GLuint   s_pf_scene_q[GLPERF_NBUF];
@@ -8601,6 +8862,28 @@ static void gl_perf_mirror_end(void) {
     s_mq_n[b]++;
     s_mq_open = 0;
 }
+static void gl_perf_tex_begin(void) {
+    if (!s_tq_on || !s_pf_on || !s_mq_ok || rthf_owns_timer()) return;
+    int b = s_pf_b;
+    if (s_tq_n[b] >= GLPERF_TEXQ) return;
+    p_glQueryCounter(s_tq_q[b][s_tq_n[b] * 2], GL_TIMESTAMP);
+    s_tq_open = 1;
+}
+static void gl_perf_tex_end(void) {
+    if (!s_tq_open) return;
+    int b = s_pf_b;
+    p_glQueryCounter(s_tq_q[b][s_tq_n[b] * 2 + 1], GL_TIMESTAMP);
+    s_tq_n[b]++;
+    s_tq_open = 0;
+}
+void gl_renderer_perf_tex_timing(int on) {
+    GL_RT_SYNC("perf_tex_timing");
+    if (on && !s_tq_made && s_pf_on && s_mq_ok) {
+        for (int i = 0; i < GLPERF_NBUF; i++) { p_glGenQueries(GLPERF_TEXQ * 2, s_tq_q[i]); s_tq_n[i] = 0; }
+        s_tq_made = 1;
+    }
+    s_tq_on = on && s_tq_made;
+}
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
 static void gl_perf_present_enter(void) {
@@ -8660,7 +8943,15 @@ static void gl_perf_present_exit(int wide) {
             p_glGetQueryObjectui64v(s_mq_q[rd][i * 2 + 1], GL_QUERY_RESULT, &t1);
             if (t1 > t0) mir += (double)(t1 - t0);
         }
+        double tex = 0.0;
+        for (int i = 0; i < s_tq_n[rd]; i++) {   /* ... and its textured batches' pairs */
+            GLuint64 t0 = 0, t1 = 0;
+            p_glGetQueryObjectui64v(s_tq_q[rd][i * 2],     GL_QUERY_RESULT, &t0);
+            p_glGetQueryObjectui64v(s_tq_q[rd][i * 2 + 1], GL_QUERY_RESULT, &t1);
+            if (t1 > t0) tex += (double)(t1 - t0);
+        }
         GlPerfSample *s = &s_pf_ring[s_pf_ring_seq % GLPERF_RING];
+        s->tex_gpu_ms      = tex / 1.0e6;
         s->total_ms        = s_pf_buf_total[rd];
         s->present_wall_ms = s_pf_buf_pwall[rd];
         s->scene_gpu_ms    = (double)sc / 1.0e6;
@@ -8681,6 +8972,7 @@ static void gl_perf_present_exit(int wide) {
         atomic_fetch_add(&s_pf_tot_frames, 1);   /* last: the totals above are in */
     }
     s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */
+    s_tq_n[rd] = 0;
     s_pf_count++;
     s_pf_b = rd;                                          /* reuse oldest for next frame */
     p_glBeginQuery(GL_TIME_ELAPSED, s_pf_scene_q[s_pf_b]); /* open next frame's scene draws */
@@ -8730,6 +9022,22 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
         out[13]/=n; out[14]/=n; out[15]/=n; out[16]/=n; out[17]/=n;
     }
     out[0] = (double)n;
+    return n;
+}
+
+/* The textured batches' GPU time per frame over the ring (frame_perf "tex"):
+ * the average, and the frames that had it measured. */
+int gl_renderer_perf_tex_gpu(double *avg_ms) {
+    GL_RT_SYNC("perf_tex_gpu");
+    double sum = 0.0;
+    int n = 0;
+    const int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
+    const uint64_t start = s_pf_ring_seq - (uint64_t)navail;
+    for (int i = 0; i < navail; i++) {
+        const GlPerfSample *s = &s_pf_ring[(start + i) % GLPERF_RING];
+        if (s->tex_gpu_ms > 0.0) { sum += s->tex_gpu_ms; n++; }
+    }
+    *avg_ms = n ? sum / n : 0.0;
     return n;
 }
 

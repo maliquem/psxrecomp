@@ -88,6 +88,45 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+## MMPX — pixel-art magnification (McGuire & Gagiu)
+
+The `texture_filtering = "mmpx"` mode (`tf_mmpx` in `runtime/src/gl_texfilter.inc`)
+follows MMPX, "MMPX Style-Preserving Pixel Art Magnification" (Morgan McGuire
+and Mara Gagiu, Journal of Computer Graphics Techniques 10(1), 2021): its 1:1
+slope, intersection and 2:1 slope rules over the 5x5 neighbourhood (and the
+four texels three away). It is our GLSL, evaluated per output pixel on CLUT
+texels with transparent ones the brightest, not a copy of a source file, but
+it derives from the authors' work, whose reference code is licensed MIT:
+
+```
+Copyright 2020 Morgan McGuire & Mara Gagiu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+The other filters of `gl_texfilter.inc` are written from published
+descriptions with no third-party code: Scale2x/EPX and Scale3x (the rules
+published by Andrea Mazzoleni; EPX by Eric Johnston), JINC2 (an EWA jinc
+kernel; J1 from Abramowitz & Stegun 9.4.4/9.4.6), monotonic cubic
+(Fritsch & Carlson 1980) and DCCI (Zhou, Shen & Dong, IET Image Processing
+2012).
+
 ## Vendored libraries
 
 These are checked in under `recompiler/lib/` and `runtime/third_party/` with

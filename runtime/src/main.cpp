@@ -1480,13 +1480,18 @@ static inline int launcher_fmv_filter_to_cfg(int ls_value) {
  * keep any of these values across startup and soft return instead of
  * collapsing them to Nearest/Bilinear. */
 #if defined(RECOMP_LAUNCHER) && defined(RECOMP_LAUNCHER_HAS_TEXTURE_FILTER_CATALOG)
-static const char* const kPsxTextureFilterLabels[] = {"Nearest", "Bilinear", "xBR"};
+static const char* const kPsxTextureFilterLabels[] = {
+    "Nearest", "Bilinear", "Sharp bilinear", "JINC2", "Monotonic cubic", "DCCI", "xBR",
+    "Scale2x (EPX)", "Scale3x", "MMPX"};
 static const int kPsxTextureFilterValues[] = {
-    PSX_TEXTURE_FILTER_NEAREST, PSX_TEXTURE_FILTER_BILINEAR, PSX_TEXTURE_FILTER_XBR};
+    PSX_TEXTURE_FILTER_NEAREST, PSX_TEXTURE_FILTER_BILINEAR, PSX_TEXTURE_FILTER_SHARP_BILINEAR,
+    PSX_TEXTURE_FILTER_JINC2, PSX_TEXTURE_FILTER_MONOTONIC_CUBIC, PSX_TEXTURE_FILTER_DCCI,
+    PSX_TEXTURE_FILTER_XBR, PSX_TEXTURE_FILTER_SCALE2X, PSX_TEXTURE_FILTER_SCALE3X,
+    PSX_TEXTURE_FILTER_MMPX};
 static void psx_launcher_texture_filter_catalog(RecompLauncherCGameInfo* gi) {
     gi->texture_filter_labels = kPsxTextureFilterLabels;
     gi->texture_filter_values = kPsxTextureFilterValues;
-    gi->num_texture_filters = 3;
+    gi->num_texture_filters = (int)(sizeof kPsxTextureFilterValues / sizeof kPsxTextureFilterValues[0]);
 }
 #elif defined(RECOMP_LAUNCHER)
 static void psx_launcher_texture_filter_catalog(RecompLauncherCGameInfo*) {}
@@ -1496,12 +1501,45 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
     return cfg_value + 1;
 }
-static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
+static int           g_video_texfilter = 0; /* PSX_TEXTURE_FILTER_* */
 static int           g_mod_texfilter = -1;
 extern "C" void psx_mod_set_texture_filter(int mode) {
-    if(mode < 0 || mode > 2) return;
+    if(mode < 0 || mode >= PSX_TEXTURE_FILTER_COUNT) return;
     g_mod_texfilter = mode;
     gr_set_texture_filter(mode);
+}
+/* Texture filters by class (PSX_TEXTURE_CLASS_*): [video]
+ * sprite_texture_filtering / ui_texture_filtering and texture_edges /
+ * sprite_texture_edges / ui_texture_edges, then the PSX_*_TEXTURE_* env. -1
+ * unset: the class follows texture_filtering (and the world's filter is always
+ * texture_filtering; texture_edges only gives it an outline). A class a mod
+ * set (psx_mod_set_texture_filter_class) is the mod's until a session reset. */
+static int           g_video_tf_cls[3]  = {-1, -1, -1};
+static int           g_video_tf_edge[3] = {-1, -1, -1};
+static int           g_mod_tf_owned = 0;
+static void psx_texfilter_apply_classes() {
+    for (int c = 0; c < 3; c++) {
+        if (g_mod_tf_owned & (1 << c)) continue;
+        int f = c == PSX_TEXTURE_CLASS_WORLD ? -1 : g_video_tf_cls[c];
+        const int e = g_video_tf_edge[c];
+        if (f < 0 && e > 0) {   /* an outline on the filter it follows */
+            const int legacy = gr_texture_filter();
+            f = (c == PSX_TEXTURE_CLASS_WORLD || legacy != PSX_TEXTURE_FILTER_STABLE_WORLD) ? legacy : 0;
+        }
+        gl_renderer_set_texture_filter_class(c, f, e > 0 ? e : 0);
+    }
+}
+extern "C" void psx_mod_set_texture_filter_class(int cls, int filter, int edge) {
+    if (cls < 0 || cls > 2) return;
+    g_mod_tf_owned |= 1 << cls;
+    gl_renderer_set_texture_filter_class(cls, filter, edge);
+}
+/* PSX_TEXTURE_FILTER and friends: a number or a config name. */
+static int psx_env_texfilter(const char* name, int edge) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return -2;
+    if (*e >= '0' && *e <= '9') return std::atoi(e);
+    return edge ? psx_texture_edge_parse(e) : psx_texture_filter_parse(e);
 }
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
@@ -1920,6 +1958,11 @@ static void quality_apply_video_globals(const PSXRecompV4::RuntimeConfig& r) {
     g_video_post_aa      = r.video_antialiasing_mode;
     g_video_ss_milli     = r.video_supersample_milli;
     g_video_texfilter    = r.video_texture_filter;
+    g_video_tf_cls[PSX_TEXTURE_CLASS_SPRITE] = r.video_sprite_texture_filter;
+    g_video_tf_cls[PSX_TEXTURE_CLASS_UI]     = r.video_ui_texture_filter;
+    g_video_tf_edge[PSX_TEXTURE_CLASS_WORLD]  = r.video_texture_edges;
+    g_video_tf_edge[PSX_TEXTURE_CLASS_SPRITE] = r.video_sprite_texture_edges;
+    g_video_tf_edge[PSX_TEXTURE_CLASS_UI]     = r.video_ui_texture_edges;
     g_video_fmv_filter   = r.video_fmv_filter;
     g_video_geometry_correction   = r.video_geometry_correction ? 1 : 0;
     g_video_perspective_texturing = r.video_perspective_texturing ? 1 : 0;
@@ -2207,7 +2250,9 @@ static void reset_mod_owned_presentation(void) {
     g_mod_native_vblank_rate = false;
     g_mod_native_vblank_fps = 0;
     g_mod_texfilter = -1;
+    g_mod_tf_owned = 0;
     gr_set_texture_filter(g_video_texfilter);
+    psx_texfilter_apply_classes();
     if (!first) {
         psx_ram_reset_size_request();
         psx_mod_set_texture_bank_resolver(nullptr);
@@ -10959,6 +11004,7 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
     if (m & PSX_VIDEO_LIVE_TEXTURE_FILTER) {
         g_video_texfilter = psx_texture_filter_from_ui(next->texture_filter);
         if (g_mod_texfilter < 0) gr_set_texture_filter(g_video_texfilter);
+        psx_texfilter_apply_classes();
     }
     if (m & PSX_VIDEO_LIVE_FMV_FILTER) {
         g_video_fmv_filter = next->fmv_filter;
@@ -11029,7 +11075,7 @@ static int debug_toggles_on(void) {
 }
 static int s_dbg_scale_target = 0;
 static const char *dbg_texfilter_name(int f) {
-    return f == 1 ? "bilinear" : f == 2 ? "stable world" : f == 3 ? "xbr" : "nearest";
+    return psx_texture_filter_name(f);
 }
 static void debug_toggle_summary(char *buf, size_t cap) {
     GlDynresStats st; gl_renderer_dynres_stats(&st);
@@ -19067,6 +19113,11 @@ int main(int argc, char** argv) {
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+        if (us.has_sprite_texture_filter) g_video_tf_cls[PSX_TEXTURE_CLASS_SPRITE] = us.sprite_texture_filter;
+        if (us.has_ui_texture_filter)     g_video_tf_cls[PSX_TEXTURE_CLASS_UI]     = us.ui_texture_filter;
+        if (us.has_texture_edges)         g_video_tf_edge[PSX_TEXTURE_CLASS_WORLD]  = us.texture_edges;
+        if (us.has_sprite_texture_edges)  g_video_tf_edge[PSX_TEXTURE_CLASS_SPRITE] = us.sprite_texture_edges;
+        if (us.has_ui_texture_edges)      g_video_tf_edge[PSX_TEXTURE_CLASS_UI]     = us.ui_texture_edges;
         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
         if (us.has_geometry_correction)
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
@@ -21039,8 +21090,17 @@ session_reboot:
                             (net_cfg.enabled && s_netplay_gl_present &&
                              gl_renderer_cpu_auth_dual());
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
-    if (const char* e = std::getenv("PSX_TEXTURE_FILTER")) g_video_texfilter = std::atoi(e);
+    {   /* env (tests): a number or a config name each; -2 = not set */
+        int v = psx_env_texfilter("PSX_TEXTURE_FILTER", 0);
+        if (v >= 0) g_video_texfilter = v;
+        if ((v = psx_env_texfilter("PSX_SPRITE_TEXTURE_FILTER", 0)) > -2) g_video_tf_cls[PSX_TEXTURE_CLASS_SPRITE] = v;
+        if ((v = psx_env_texfilter("PSX_UI_TEXTURE_FILTER", 0)) > -2) g_video_tf_cls[PSX_TEXTURE_CLASS_UI] = v;
+        if ((v = psx_env_texfilter("PSX_TEXTURE_EDGES", 1)) > -2) g_video_tf_edge[PSX_TEXTURE_CLASS_WORLD] = v;
+        if ((v = psx_env_texfilter("PSX_SPRITE_TEXTURE_EDGES", 1)) > -2) g_video_tf_edge[PSX_TEXTURE_CLASS_SPRITE] = v;
+        if ((v = psx_env_texfilter("PSX_UI_TEXTURE_EDGES", 1)) > -2) g_video_tf_edge[PSX_TEXTURE_CLASS_UI] = v;
+    }
     gr_set_texture_filter(g_mod_texfilter < 0 ? g_video_texfilter : g_mod_texfilter);
+    psx_texfilter_apply_classes();
     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
      * with both off every setter below leaves the tracking caches disabled and
      * the draw path is the faithful integer one, unchanged. */
@@ -21186,7 +21246,7 @@ session_reboot:
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
                      requested_scale, g_video_aa ? "on" : "off",
-                     g_video_texfilter ? "bilinear" : "nearest");
+                     psx_texture_filter_name(g_video_texfilter));
     if (g_video_screen != 0)
         std::fprintf(stdout, "psxrecomp: screen-colour model %s\n",
                      g_video_screen == 1 ? "crt" : g_video_screen == 2 ? "composite"

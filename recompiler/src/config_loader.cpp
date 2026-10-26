@@ -911,11 +911,28 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("texture_filtering")) {
             const auto mode = toml::find<std::string>(video, "texture_filtering");
-            if (mode == "nearest")       rt.video_texture_filter = 0;
-            else if (mode == "bilinear") rt.video_texture_filter = 1;
-            else if (mode == "xbr")      rt.video_texture_filter = 3;
-            else throw std::runtime_error(fmt::format(
-                "[video] texture_filtering must be \"nearest\", \"bilinear\" or \"xbr\": {}", mode));
+            if (!video_texture_filter_parse(mode, &rt.video_texture_filter))
+                throw std::runtime_error(fmt::format(
+                    "[video] texture_filtering must be \"nearest\", \"bilinear\", \"xbr\", "
+                    "\"sharp_bilinear\", \"jinc2\", \"monotonic_cubic\", \"dcci\", \"scale2x\", "
+                    "\"scale3x\" or \"mmpx\": {}", mode));
+        }
+        {   /* the class filters and outlines (video_texture_filter.h) */
+            const struct { const char* key; int* out; bool edge; } k[] = {
+                {"sprite_texture_filtering", &rt.video_sprite_texture_filter, false},
+                {"ui_texture_filtering", &rt.video_ui_texture_filter, false},
+                {"texture_edges", &rt.video_texture_edges, true},
+                {"sprite_texture_edges", &rt.video_sprite_texture_edges, true},
+                {"ui_texture_edges", &rt.video_ui_texture_edges, true},
+            };
+            for (const auto& e : k) {
+                if (!video.contains(e.key)) continue;
+                const auto m = toml::find<std::string>(video, e.key);
+                if (!(e.edge ? video_texture_edge_parse(m, e.out) : video_texture_filter_parse(m, e.out)))
+                    throw std::runtime_error(e.edge
+                        ? fmt::format("[video] {} must be \"ps1\", \"clean\" or \"soft\": {}", e.key, m)
+                        : fmt::format("[video] {} must be a texture_filtering name: {}", e.key, m));
+            }
         }
         if (video.contains("fmv_filter")) {
             const auto mode = toml::find<std::string>(video, "fmv_filter");
@@ -3135,10 +3152,23 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("texture_filtering")) try_get([&]{
             const auto m = toml::find<std::string>(v, "texture_filtering");
-            if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
-            else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
-            else if (m == "xbr") { s.texture_filter = 3; s.has_texture_filter = true; }
+            if (video_texture_filter_parse(m, &s.texture_filter)) s.has_texture_filter = true;
         });
+        {   /* the class filters and outlines */
+            const struct { const char* key; int* out; bool* has; bool edge; } k[] = {
+                {"sprite_texture_filtering", &s.sprite_texture_filter, &s.has_sprite_texture_filter, false},
+                {"ui_texture_filtering", &s.ui_texture_filter, &s.has_ui_texture_filter, false},
+                {"texture_edges", &s.texture_edges, &s.has_texture_edges, true},
+                {"sprite_texture_edges", &s.sprite_texture_edges, &s.has_sprite_texture_edges, true},
+                {"ui_texture_edges", &s.ui_texture_edges, &s.has_ui_texture_edges, true},
+            };
+            for (const auto& e : k)
+                if (v.contains(e.key)) try_get([&]{
+                    const auto m = toml::find<std::string>(v, e.key);
+                    if (e.edge ? video_texture_edge_parse(m, e.out) : video_texture_filter_parse(m, e.out))
+                        *e.has = true;
+                });
+        }
         if (v.contains("fmv_filter")) try_get([&]{
             const auto m = toml::find<std::string>(v, "fmv_filter");
             if (video_fmv_filter_parse(m, &s.fmv_filter)) s.has_fmv_filter = true;
@@ -3571,7 +3601,17 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_antialiasing)
         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
     if (s.has_texture_filter)
-        f << "texture_filtering = \"" << (s.texture_filter == 3 ? "xbr" : s.texture_filter ? "bilinear" : "nearest") << "\"\n";
+        f << "texture_filtering = \"" << video_texture_filter_name(s.texture_filter) << "\"\n";
+    if (s.has_sprite_texture_filter)
+        f << "sprite_texture_filtering = \"" << video_texture_filter_name(s.sprite_texture_filter) << "\"\n";
+    if (s.has_ui_texture_filter)
+        f << "ui_texture_filtering = \"" << video_texture_filter_name(s.ui_texture_filter) << "\"\n";
+    if (s.has_texture_edges)
+        f << "texture_edges     = \"" << video_texture_edge_name(s.texture_edges) << "\"\n";
+    if (s.has_sprite_texture_edges)
+        f << "sprite_texture_edges = \"" << video_texture_edge_name(s.sprite_texture_edges) << "\"\n";
+    if (s.has_ui_texture_edges)
+        f << "ui_texture_edges  = \"" << video_texture_edge_name(s.ui_texture_edges) << "\"\n";
     if (s.has_fmv_filter)
         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
     if (s.has_geometry_correction)

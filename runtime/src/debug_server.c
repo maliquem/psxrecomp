@@ -8903,12 +8903,28 @@ static void handle_accurate_blending(int id, const char *json)
 }
 
 /* texture_filter: {"cmd":"texture_filter"} reads, {"cmd":"texture_filter",
- * "mode":0..3} sets it live (nearest, bilinear, stable world, xbr). */
+ * "mode":0..10} sets it live (PSX_TEXTURE_FILTER_*: the world, and sprites
+ * and UI where they follow it); {"class":0|1|2,"filter":-1..10,"edge":0..2}
+ * sets one class (world, sprites, UI; filter -1 = follow "mode"). The reply
+ * has each class's filter and edge now, and the textured triangles drawn per
+ * class so far ("prims": compare two reads). */
 static void handle_texture_filter(int id, const char *json)
 {
     int mode = json_get_int(json, "mode", -1);
     if (mode >= 0) gr_set_texture_filter(mode);
-    send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gr_texture_filter());
+    const int cls = json_get_int(json, "class", -1);
+    if (cls >= 0 && cls <= 2)
+        gl_renderer_set_texture_filter_class(cls, json_get_int(json, "filter", -1), json_get_int(json, "edge", 0));
+    int edge[3];
+    int f[3];
+    for (int c = 0; c < 3; c++) f[c] = gl_renderer_texture_filter_class(c, &edge[c]);
+    uint64_t prims[3];
+    int soft = 0;
+    gl_renderer_texture_filter_stats(prims, &soft);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d,\"filter\":[%d,%d,%d],\"edge\":[%d,%d,%d],"
+             "\"soft\":%d,\"prims\":[%llu,%llu,%llu]}", id, gr_texture_filter(), f[0], f[1], f[2],
+             edge[0], edge[1], edge[2], soft, (unsigned long long)prims[0],
+             (unsigned long long)prims[1], (unsigned long long)prims[2]);
 }
 
 /* dithering: {"cmd":"dithering"} reads, {"cmd":"dithering","mode":0|1|2}
@@ -8922,7 +8938,10 @@ static void handle_dithering(int id, const char *json)
 
 static void handle_frame_perf(int id, const char *json)
 {
-    (void)json;
+    const int tex_on = json_get_int(json, "tex", -1);   /* time the textured batches too */
+    if (tex_on >= 0) gl_renderer_perf_tex_timing(tex_on);
+    double tex_ms = 0.0;
+    const int tex_n = gl_renderer_perf_tex_gpu(&tex_ms);
     double all[18], wide[18], n43[18];
     int na = gl_renderer_perf_aggregate(-1, all);
     gl_renderer_perf_aggregate(1, wide);
@@ -8940,6 +8959,7 @@ static void handle_frame_perf(int id, const char *json)
     uint64_t br[9]; extern void gl_renderer_batch_diag(uint64_t out[9]);
     gl_renderer_batch_diag(br);
     send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
+             "\"tex_gpu_ms_avg\":%.3f,\"tex_gpu_frames\":%d,"
              "\"tex_frac\":%.3f,\"ws_ablate\":%d,"
              "\"batch_diag\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
@@ -8956,7 +8976,7 @@ static void handle_frame_perf(int id, const char *json)
              "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
              "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f}}",
-             id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
+             id, na, (int)wide[0], (int)n43[0], tex_ms, tex_n, tex_frac, gl_renderer_get_ws_ablate(),
              (unsigned long long)br[0], (unsigned long long)br[1],
              (unsigned long long)br[2], (unsigned long long)br[3],
              (unsigned long long)br[4], (unsigned long long)br[5],

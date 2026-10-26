@@ -935,10 +935,46 @@ output pixel wide. Flat areas, straight edges and gradients stay crisp
 texels; diagonals and curves lose their staircase. It acts only where a
 texel spans two or more output pixels (high internal scale or a magnified
 texture), so a 1:1 draw is exactly nearest; cutouts and STP stay the centre
-texel's. It costs up to 13 texel fetches per pixel. JINC2 is not offered.
-`PSX_TEXTURE_FILTER=0..3` overrides it for one run (2 is the mod-only "stable
-world" minification filter) and the `texture_filter` TCP command switches it
-live. The launcher's toggle still offers nearest and bilinear.
+texel's. It costs up to 13 texel fetches per pixel.
+
+OpenGL also has (`runtime/src/gl_texfilter.inc`): `sharp_bilinear` (texels
+stay flat, the blend squeezed into the one output pixel on each boundary),
+`jinc2` (an EWA jinc kernel over 4x4 texels, clamped to the nearest four
+against ringing), `monotonic_cubic` (Fritsch-Carlson: smooth, no overshoot),
+`dcci` (directional cubic convolution: the 2x image along its edges, then
+bilinear), and the pixel-art scalers `scale2x` (`epx`), `scale3x` and `mmpx`
+(MMPX, MIT: see `THIRD_PARTY_ATTRIBUTION.md`), which act where a texel covers
+more than 4/3 of an output pixel. `stable` is the "stable world" filter
+(bilinear over the pixel's footprint).
+
+```toml
+[video]
+texture_filtering        = "nearest"   # the 3D world (PGXP-proven polygons)
+sprite_texture_filtering = "mmpx"      # 2D: rectangles, polygons without PGXP
+ui_texture_filtering     = "nearest"   # the ordering table's front (menus)
+texture_edges            = "ps1"       # ps1 | clean | soft
+sprite_texture_edges     = "clean"
+ui_texture_edges         = "ps1"
+```
+
+`texture_filtering` alone keeps its old meaning: it filters every textured
+primitive, except that under `stable` sprites and UI stay nearest. The
+`sprite_`/`ui_` keys give those classes a filter of their own. The edges say
+who draws the outline of a filtered texture's cutout: `ps1` the nearest
+texel, as the PS1 (the filter only changes colours inside it); `clean` the
+filter's own opacity cut at one half (a smooth, hard outline: "no edge
+blending"); `soft` the same outline blended by that opacity (dual-source
+blending: opaque batches then draw blended too, with the same pixels where a
+texel is fully covered). Nearest everywhere draws exactly as before. A clean
+or soft sprite outline also shapes the `sprite` input and the sprites' shadows.
+
+`PSX_TEXTURE_FILTER`, `PSX_SPRITE_TEXTURE_FILTER`, `PSX_UI_TEXTURE_FILTER`
+(a number or a name) and `PSX_TEXTURE_EDGES`, `PSX_SPRITE_TEXTURE_EDGES`,
+`PSX_UI_TEXTURE_EDGES` override them for one run. The `texture_filter` TCP
+command switches them live (`"mode"`, or `"class"` + `"filter"` + `"edge"`)
+and reports the textured triangles drawn per class; `frame_perf` with
+`"tex":1` times the textured batches' GPU work (`tex_gpu_ms_avg`). Mods set a
+class with `psx_mod_set_texture_filter_class`.
 
 The runtime clamps N per backend:
 

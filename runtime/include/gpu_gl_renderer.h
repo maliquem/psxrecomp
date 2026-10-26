@@ -440,6 +440,17 @@ void gl_renderer_set_pgxp_depth(int on);
 void gl_renderer_set_texture_lod(int mode, int aniso);
 int  gl_renderer_texture_lod(void);
 int  gl_renderer_anisotropy(void);
+/* Texture filters by class (video_texture_filter.h: PSX_TEXTURE_CLASS_* world,
+ * sprite, UI; PSX_TEXTURE_FILTER_*; PSX_TEXTURE_EDGE_*). filter -1 hands the
+ * class back to gr_set_texture_filter's value ([video] texture_filtering; the
+ * world takes it, sprites and UI too except under Stable world), with the PS1
+ * outline. Nearest everywhere draws exactly as before. Live, any thread. */
+void gl_renderer_set_texture_filter_class(int cls, int filter, int edge);
+/* What class cls draws with now (its edge in *edge, may be NULL). */
+int  gl_renderer_texture_filter_class(int cls, int *edge);
+/* Textured triangles drawn per class since start (a counter: read twice and
+ * subtract), and whether some class blends its edges now (*soft). */
+void gl_renderer_texture_filter_stats(uint64_t prims[3], int *soft);
 /* [video] accurate_blending: store every VRAM write in the k*8/255 basis so
  * 8-bit GL blending truncated to 5 bits is exactly the PS1's semi-transparency
  * arithmetic (whites of fills and textures become 248 instead of 255, as
@@ -712,6 +723,10 @@ int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
  * sets/frame avg, [17]=wide FBO creations/frame avg. GPU phases are true
  * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
 int gl_renderer_perf_aggregate(int wide_filter, double out[18]);
+/* frame_perf "tex": time every textured batch's draws (GL timestamps) while
+ * on; perf_tex_gpu: their average GPU ms per frame and the frames measured. */
+void gl_renderer_perf_tex_timing(int on);
+int  gl_renderer_perf_tex_gpu(double *avg_ms);
 
 /* Native-wide mirror ablation (perf attribution, debug cmd gl_ws_ablate):
  * 0 = normal, 1 = skip the whole mirror pass (incl. wide_clear), 2 = full mirror

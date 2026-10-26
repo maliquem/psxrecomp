@@ -95,6 +95,12 @@ void psx_mod_counter_add(const char* name, uint32_t delta);
  * OpenGL; untracked UI stays nearest. Other backends use bilinear. A session
  * reset restores the player's configured filter. */
 void psx_mod_set_texture_filter(int mode);
+/* The filter of one class of textured primitive (video_texture_filter.h:
+ * PSX_TEXTURE_CLASS_WORLD / _SPRITE / _UI, PSX_TEXTURE_FILTER_*, edge
+ * PSX_TEXTURE_EDGE_*; OpenGL). filter -1 gives the class back to the mode
+ * above. The class stays the mod's until a session reset (the player's
+ * [video] sprite_texture_filtering and the like no longer apply to it). */
+void psx_mod_set_texture_filter_class(int cls, int filter, int edge);
 /* Entry callbacks can make nested guest calls while retaining host registers.
  * Save/load and rewind must wait until that host context has returned. */
 int psx_mod_function_entry_active(void);
