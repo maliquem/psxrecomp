@@ -6008,6 +6008,9 @@ static void handle_core_rates(int id, const char *json)
     extern uint64_t psx_get_cycle_count(void);
     extern uint64_t g_psx_store_slow[4], g_psx_store_raw[3], g_guest_store_count;
     extern uint64_t g_psx_mmio_hist[16];
+    extern uint64_t g_psx_cyc_gate_stale;
+    extern uint64_t g_spu_blocks, g_spu_blocks_by_voice, g_spu_frames_by_voice;
+    extern uint64_t g_text_ok_cmp_calls, g_text_ok_cmp_bytes;
 #define H(i) (unsigned long long)g_psx_mmio_hist[i]
     extern uint64_t overlay_loader_gen_fastpath(void);
     extern void overlay_loader_get_reload_debug(int*, uint32_t*, uint32_t*, uint32_t*,
@@ -6023,6 +6026,7 @@ static void handle_core_rates(int id, const char *json)
              "\"idle_skip_cycles\":%llu,\"stores\":%llu,\"st_kernel\":%llu,"
              "\"st_exec\":%llu,\"st_watch\":%llu,\"st_text\":%llu,"
              "\"ovl_reval\":%u,\"ovl_fast\":%llu,\"raw_cpu\":%llu,\"raw_dma\":%llu,\"raw_io\":%llu,"
+             "\"cyc_gate_stale\":%llu,\"spu_blocks\":%llu,\"spu_blocks_voice\":%llu,\"spu_frames_voice\":%llu,\"text_cmp\":%llu,\"text_cmp_bytes\":%llu,"
              "\"mmio\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]}",
              id, (unsigned long long)s_frame_count, (unsigned long long)psx_get_cycle_count(),
              (unsigned long long)g_psx_svc_calls, (unsigned long long)g_psx_mmio_sync_calls,
@@ -6036,6 +6040,10 @@ static void handle_core_rates(int id, const char *json)
              (unsigned long long)overlay_loader_gen_fastpath(),
              (unsigned long long)g_psx_store_raw[0], (unsigned long long)g_psx_store_raw[1],
              (unsigned long long)g_psx_store_raw[2],
+             (unsigned long long)g_psx_cyc_gate_stale,
+             (unsigned long long)g_spu_blocks, (unsigned long long)g_spu_blocks_by_voice,
+             (unsigned long long)g_spu_frames_by_voice,
+             (unsigned long long)g_text_ok_cmp_calls, (unsigned long long)g_text_ok_cmp_bytes,
              H(0), H(1), H(2), H(3), H(4), H(5), H(6), H(7),
              H(8), H(9), H(10), H(11), H(12), H(13), H(14), H(15));
 #undef H
@@ -14897,6 +14905,7 @@ static void handle_overlay_native_event_granularity(int id, const char *json)
     }
     int conservative = (strcmp(mode, "conservative") == 0);
     g_event_step_conservative = conservative;
+    { extern void psx_cyc_gate_refresh(void); psx_cyc_gate_refresh(); }
     send_fmt("{\"id\":%d,\"ok\":true,\"event_granularity\":\"%s\"}\n",
              id, conservative ? "conservative" : "normal");
 }

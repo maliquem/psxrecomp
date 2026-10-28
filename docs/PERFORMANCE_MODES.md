@@ -199,6 +199,47 @@ Measured on BoF4 (16:9, 8x, turbo uncapped), PGO + ThinLTO with the same
 profile, against the build before: barco +15-29%, battle +29-35%, dungeon
 +24-30%, magic +34-40%, field 7.8x (held at the title's 8x cap) -> 13.3x.
 
+Cycle 6 (2026-10-28), the same checks (frame fingerprints for 630 frames in 8
+scenes with effects on, sound, pictures, cold boot through the opening movie):
+
+- **SPU voice by voice** (`spu.c`): `spu_render_block` mixed frame by frame,
+  every voice in each frame. Within a frame the voices touch only their own
+  state, except through SPU RAM: the frame writes the capture buffers
+  (0x000-0xFFF) and, with SPUCNT.7, the reverb work area, and a block fetch
+  reads SPU RAM. When the IRQ compare is off and no active voice can fetch from
+  those areas during the block (`spu_voice_reads_written` walks each voice's
+  fetches exactly: the headers it reads lie outside the written areas), each
+  voice runs the block on its own in slices of 128 frames, leaving its
+  contribution per frame, and the frame loop mixes those as before. A voice's
+  registers are read once per block (no guest access can land inside a render).
+  The noise LFSR is replayed ahead. Only the debug SPU event ring sees a
+  different order inside a block. TCP `core_rates` `spu_blocks*`.
+- SPU: the SPUCNT.6 test of `spu_irq_check` inline, the reverb work-area
+  address without a 64-bit division, direct-mode volume sweeps tested inline.
+- **Cycle charge gate** (`psx_edge.h`, `g_psx_cyc_gate`): the emitted charge
+  read five mode flags; four (guest cycle scale, lockstep replay, conservative
+  stepping, device service) are now one word kept by their writers
+  (`psx_cyc_gate_refresh`); any other case calls `psx_cyc_charge` as before.
+  TCP `core_rates` `cyc_gate_stale` counts a service finding it stale (0).
+- **Block-mode loads inline** (`psx_edge.h`): `psx_blk_load_*` and
+  `psx_blk_lwc2_read` with the same main RAM and scratchpad paths, forced
+  inline (the large generated functions kept them out of line).
+- **Game text validation by 64-byte line** (`memory.c`): a range on a page
+  marked modified or dirty was compared whole on every dispatch. BoF4 has one
+  large function on pages it shares with data written every frame: ~800 KB
+  compared per frame in battle. A line bitmap now marks the lines that may
+  differ from the reference (a guarded write that differs, a plain store to a
+  modified page, a page or range marked dirty, a blessed patch; recomputed from
+  the bytes wherever the page marks are reset) and only those are compared; a
+  line found equal is unmarked. Battle: 160 bytes per frame. TCP `core_rates`
+  `text_cmp`, `text_cmp_bytes`.
+
+All in files outside the codegen hash and the execution identity: no re-stamp,
+the overlay cache stays valid, overlay DLLs unchanged. Measured on BoF4 (16:9,
+8x, turbo uncapped, PGO + ThinLTO each with its own profile, 3 rounds) against
+cycle 5: battle +5-10%, barco +3-10%, dungeon +3-7%, magic +4-8%, field
+-2..+8%; with effects on +1-6%.
+
 ## Measured on Breath of Fire IV (2026-10-26)
 
 Turbo speed of the emulation thread (median of 2 alternated rounds; campo and

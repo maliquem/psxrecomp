@@ -251,10 +251,12 @@ static uint32_t dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
  * code change — a cached kind must never survive an overlay reload. */
 uint32_t g_dirty_ram_code_gen = 1;
 
+static void text_lines_mark_range(uint32_t lo, uint32_t len);   /* below */
 static inline void dirty_ram_mark_page(uint32_t phys) {
     if (phys >= RAM_LIVE) return;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t bit = 1u << (page & 31u);
+    text_lines_mark_range(page << DIRTY_RAM_PAGE_SHIFT, 1u << DIRTY_RAM_PAGE_SHIFT);
     /* Generation bumps on the clean->dirty TRANSITION only: kernel-window data
      * writes land here on every guest store, and bumping per write would
      * invalidate the per-PC site caches continuously. Overlay (re)loads always
@@ -549,6 +551,47 @@ static uint8_t *text_ref_image = NULL;
 static uint32_t text_ref_lo = 0, text_ref_hi = 0;
 static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
+
+/* Text lines (64 bytes) whose bytes may differ from the reference image. Set
+ * by every write that can make one differ: a guarded write that differs, a
+ * plain store to a page already marked modified, a page or range marked dirty,
+ * a blessed patch of the image. Cleared only by a compare of the whole line
+ * that finds it equal; recomputed from the bytes whenever the page marks are
+ * reset. Validation of a range on a modified or dirty page then compares only
+ * its marked lines: in BoF4 one large function shares pages with data the
+ * game writes all the time, and its whole range (~24 KB) was compared on
+ * every dispatch (800 KB per frame in battle). */
+#define TEXT_LINE_SHIFT 6u
+#define TEXT_LINE_BYTES (1u << TEXT_LINE_SHIFT)
+static uint32_t text_line_bitmap[(RAM_SIZE >> TEXT_LINE_SHIFT) / 32u];
+static inline int text_line_marked(uint32_t off) {
+    const uint32_t l = off >> TEXT_LINE_SHIFT;
+    return (text_line_bitmap[l >> 5] >> (l & 31u)) & 1u;
+}
+static inline void text_line_mark(uint32_t off) {
+    const uint32_t l = off >> TEXT_LINE_SHIFT;
+    text_line_bitmap[l >> 5] |= 1u << (l & 31u);
+}
+static void text_lines_mark_range(uint32_t lo, uint32_t len) {
+    if (!text_ref_image || len == 0 || lo >= text_ref_hi || lo + len <= text_ref_lo) return;
+    uint32_t hi = lo + len;
+    if (lo < text_ref_lo) lo = text_ref_lo;
+    if (hi > text_ref_hi) hi = text_ref_hi;
+    for (uint32_t a = lo & ~(TEXT_LINE_BYTES - 1u); a < hi; a += TEXT_LINE_BYTES)
+        text_line_mark(a);
+}
+/* Every line of the reference range that differs, from the bytes. */
+static void text_lines_recompute(void) {
+    memset(text_line_bitmap, 0, sizeof(text_line_bitmap));
+    if (!text_ref_image || text_ref_hi <= text_ref_lo) return;
+    for (uint32_t a = text_ref_lo & ~(TEXT_LINE_BYTES - 1u); a < text_ref_hi; a += TEXT_LINE_BYTES) {
+        uint32_t lo = a < text_ref_lo ? text_ref_lo : a;
+        uint32_t hi = a + TEXT_LINE_BYTES > text_ref_hi ? text_ref_hi : a + TEXT_LINE_BYTES;
+        if (hi > RAM_LIVE) hi = RAM_LIVE;
+        if (hi <= lo || memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) != 0)
+            text_line_mark(a);
+    }
+}
 static uint64_t g_text_native_blocked = 0;
 static uint32_t g_text_diverged_pages = 0;
 static uint64_t g_text_exact_mismatches = 0;
@@ -567,6 +610,7 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     text_ref_hi = phys_lo + len;
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
+    text_lines_recompute();
     g_text_native_blocked = 0;
     g_text_diverged_pages = 0;
     g_text_exact_mismatches = 0;
@@ -588,6 +632,7 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        text_line_mark(phys);
     }
 }
 
@@ -652,6 +697,8 @@ int dirty_ram_text_native_ok(uint32_t phys) {
  * DMA needs to start; charged cycles, which every instruction and a running
  * DMA needs; the code generation); while all are unchanged the same ranges
  * hold the same bytes and the answer is the same. */
+/* TCP core_rates: the byte compares that validation could not skip. */
+uint64_t g_text_ok_cmp_calls, g_text_ok_cmp_bytes;
 static const uint32_t *s_text_ok_pairs;
 static uint32_t s_text_ok_count, s_text_ok_batch, s_text_ok_codegen;
 static uint64_t s_text_ok_cycle, s_text_ok_stores;
@@ -697,7 +744,26 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             }
             if (clean) continue;
         }
-        if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
+        /* Only the lines that may differ (text_line_bitmap); a whole line
+         * found equal is unmarked. */
+        int differs = 0;
+        for (uint32_t a = phys & ~(TEXT_LINE_BYTES - 1u); a < phys + len; a += TEXT_LINE_BYTES) {
+            if (!text_line_marked(a)) continue;
+            const uint32_t lo = a < phys ? phys : a;
+            const uint32_t hi = a + TEXT_LINE_BYTES < phys + len ? a + TEXT_LINE_BYTES : phys + len;
+            g_text_ok_cmp_calls++;
+            g_text_ok_cmp_bytes += hi - lo;
+            if (memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) != 0) {
+                differs = 1;
+                break;
+            }
+            if (a >= text_ref_lo && a + TEXT_LINE_BYTES <= text_ref_hi &&
+                (lo != a || hi != a + TEXT_LINE_BYTES
+                     ? memcmp(ram + a, text_ref_image + (a - text_ref_lo), TEXT_LINE_BYTES) == 0
+                     : 1))
+                text_line_bitmap[(a >> TEXT_LINE_SHIFT) >> 5] &= ~(1u << ((a >> TEXT_LINE_SHIFT) & 31u));
+        }
+        if (differs) {
             uint32_t off = 0;
             const uint8_t *live = ram + phys;
             const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
@@ -765,6 +831,7 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
     memcpy(ref, src, hi - lo);
+    text_lines_mark_range(lo, hi - lo);
     /* Re-open the affected pages: clear the sticky diverged bit so the next
      * dispatch re-runs the compare against the now-updated reference. */
     uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
@@ -795,6 +862,7 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     for (uint32_t page = first_page; page <= last_page; page++) {
         dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
     }
+    text_lines_mark_range(phys, end - phys + 1u);
     g_dirty_ram_code_gen++;
 }
 
@@ -896,6 +964,7 @@ void dirty_ram_reset_for_boot(void) {
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
+    text_lines_recompute();
     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
@@ -978,6 +1047,7 @@ void dirty_ram_text_guard_resync_after_restore(void) {
                 text_modified_bitmap[p >> 5] |= (1u << (p & 31u));
         }
     }
+    text_lines_recompute();
 }
 
 void overlay_watch_invalidate_after_ram_restore(void) {
@@ -2747,16 +2817,19 @@ static inline uint8_t *psx_store_fast_ptr(uint32_t addr, uint32_t size, uint32_t
     const uint32_t pg = off >> DIRTY_RAM_PAGE_SHIFT, bit = 1u << (pg & 31u);
     if (g_dirty_ram_exec_page_bitmap[pg >> 5] & bit) { g_psx_store_slow[1]++; return NULL; }
     if (overlay_watch_bitmap[pg >> 5] & bit) { g_psx_store_slow[2]++; return NULL; }
-    if (text_ref_image && off + size > text_ref_lo && off < text_ref_hi &&
-        !(text_modified_bitmap[pg >> 5] & bit)) {
-        /* Game text not yet seen modified (in BoF4 the executable's range
-         * holds hot data too): text_guard_note_write marks the page only for
-         * bytes that differ from the image, so a store of the image's own
-         * bytes is a plain store. (val's low `size` bytes, little-endian.) */
-        if (off < text_ref_lo || off + size > text_ref_hi ||
-            memcmp(text_ref_image + (off - text_ref_lo), &val, size) != 0) {
-            g_psx_store_slow[3]++;
-            return NULL;
+    if (text_ref_image && off + size > text_ref_lo && off < text_ref_hi) {
+        if (!(text_modified_bitmap[pg >> 5] & bit)) {
+            /* Game text not yet seen modified (in BoF4 the executable's range
+             * holds hot data too): text_guard_note_write marks the page only for
+             * bytes that differ from the image, so a store of the image's own
+             * bytes is a plain store. (val's low `size` bytes, little-endian.) */
+            if (off < text_ref_lo || off + size > text_ref_hi ||
+                memcmp(text_ref_image + (off - text_ref_lo), &val, size) != 0) {
+                g_psx_store_slow[3]++;
+                return NULL;
+            }
+        } else {
+            text_line_mark(off);   /* a page already modified: no compare here */
         }
     }
     if (size == 4u && off == D44_PHYS) return NULL;

@@ -38,6 +38,18 @@ static uint32_t s_psx_gcs_ram_n = 0;
 static int      s_psx_gcs_ram_open = 0; /* last VBlank's verdict */
 static uint32_t (*s_psx_gcs_ram_read)(uint32_t phys, uint32_t size) = NULL;
 
+/* psx_edge.h's charge: nonzero while a charge must take psx_cyc_charge's
+ * own checks (guest cycle scale, lockstep replay, conservative stepping,
+ * device service). Every writer of those calls psx_cyc_gate_refresh;
+ * TCP core_rates counts the times a device service found it stale. */
+uint32_t g_psx_cyc_gate = 0;
+uint64_t g_psx_cyc_gate_stale = 0;
+static inline uint32_t psx_cyc_gate_value(void) {
+    return (g_psx_gcs_recip_q16 != 65536u ? 1u : 0u) | (g_ls_replay_active ? 2u : 0u) |
+           (g_event_step_conservative ? 4u : 0u) | (psx_in_device_service ? 8u : 0u);
+}
+void psx_cyc_gate_refresh(void) { g_psx_cyc_gate = psx_cyc_gate_value(); }
+
 static void psx_guest_cycle_scale_apply(void) {
     const int open = (!s_psx_gcs_gated || s_psx_gcs_open) &&
                      (s_psx_gcs_ram_n == 0u || s_psx_gcs_ram_open);
@@ -46,6 +58,7 @@ static void psx_guest_cycle_scale_apply(void) {
     s_psx_gcs_live = n;
     g_psx_gcs_recip_q16 = psx_gcs_recip_for(n);
     g_psx_gcs_frac = 0u;
+    psx_cyc_gate_refresh();
 }
 
 void psx_guest_cycle_scale_set(uint32_t scale) {
@@ -213,6 +226,7 @@ int g_event_step_conservative = 0;
 void psx_event_step_conservative_env_init(void) {
     const char *e = getenv("PSX_EVENT_STEP_CONSERVATIVE");
     if (e && e[0] == '1') g_event_step_conservative = 1;
+    psx_cyc_gate_refresh();
 }
 
 static void advance_devices(uint32_t c) {
@@ -362,7 +376,9 @@ void psx_devices_service_to_now(void) {
     g_psx_svc_calls++;
     if (g_plp_cycle_diag) g_plp_svc_calls++;
     g_psx_cycle_fast_limit = 0;
+    if (g_psx_cyc_gate != psx_cyc_gate_value()) g_psx_cyc_gate_stale++;
     s_in_device_service = 1;
+    g_psx_cyc_gate |= 8u;
     uint64_t target = psx_cycle_count;
     if (s_devices_synced_cycle < target) {
         /* Rewind and re-play the gap in event-bounded chunks so device
@@ -396,6 +412,7 @@ void psx_devices_service_to_now(void) {
     psx_cycle_sample_check(target);
     psx_devices_recompute_deadline();
     psx_in_device_service = 0;
+    psx_cyc_gate_refresh();
 
     /* Sparse host maintenance (was on every psx_advance_cycles). HARD_CAP
      * guarantees we land here at least every 16K guest cycles. */
@@ -925,6 +942,7 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     s_devices_synced_cycle = psx_cycle_count;
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
+    psx_cyc_gate_refresh();
     /* Idle-skip detector latches absolute cycle/store counters from the
      * pre-load timeline; drop them so a rewound clock cannot false-train. */
     s_idle_pc = 0;
@@ -979,6 +997,7 @@ void psx_cycles_reset_for_boot(void) {
     s_devices_synced_cycle = 0;
     s_next_service_cycle   = 0;
     s_in_device_service    = 0;
+    psx_cyc_gate_refresh();
     g_psx_cycle_fast_limit = 0;
     s_next_watchdog        = 0;
     s_next_pc_sample       = 0;
@@ -1166,6 +1185,7 @@ static void freeze_save(PsxCycleFreeze *save) {
     g_psx_cyc_batch_limit = 0;
     g_psx_cyc_local_acc = NULL;
     psx_in_device_service = 0;
+    psx_cyc_gate_refresh();
     s_freeze_start = psx_cycle_count;
 }
 
@@ -1177,6 +1197,7 @@ static void freeze_restore_deferred(const PsxCycleFreeze *save) {
     g_psx_cyc_local_acc = save->local_acc;
     if (save->local_acc) *save->local_acc = save->local_acc_value;
     psx_in_device_service = save->in_device_service;
+    psx_cyc_gate_refresh();
     g_psx_cyc_bb_defer = save->bb_defer;
 }
 

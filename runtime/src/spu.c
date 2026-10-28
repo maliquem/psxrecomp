@@ -259,13 +259,10 @@ static void calc_vc_delta(uint8_t zs, uint8_t speed, int log_mode, int dec_mode,
     *out_divinco   = divinco;
 }
 
-/* Step ADSR envelope by one output sample for voice `idx`. Mirrors
- * Beetle's PS_SPU::RunEnvelope. */
-static void adsr_run(int idx, SpuVoice *v) {
-    uint32_t raw = (uint32_t)voice_reg(idx,4)
-                 | ((uint32_t)voice_reg(idx,5) << 16);
-
-    int     Sl           = (int)(raw >> 0)  & 0x0F;
+/* Step ADSR envelope by one output sample. `raw` is the voice's ADSR register
+ * pair (reg 4 | reg 5 << 16). Mirrors Beetle's PS_SPU::RunEnvelope. */
+static inline void adsr_run(SpuVoice *v, uint32_t raw) {
+    int     Sl          = (int)(raw >> 0)  & 0x0F;
     int     Dr           = (int)(raw >> 4)  & 0x0F;
     int     Ar           = (int)(raw >> 8)  & 0x7F;
     int     attack_exp   = (int)((raw >> 15) & 1);
@@ -386,8 +383,7 @@ static void sweep_env_write(SweepEnv *sw, uint16_t raw) {
  * wrong side of zero is clamped to 0 before stepping. Increase saturates at
  * 0x7FFF, decrease at 0, matching the ADSR clamp behaviour. Candidate for
  * oracle verification. */
-static void sweep_env_step(SweepEnv *sw, uint16_t raw) {
-    if (!(raw & 0x8000u)) return;
+static void sweep_env_step_sweep(SweepEnv *sw, uint16_t raw) {
     int     exp_mode  = (raw >> 14) & 1;
     int     dec_mode  = (raw >> 13) & 1;
     int     neg_phase = (raw >> 12) & 1;
@@ -412,6 +408,12 @@ static void sweep_env_step(SweepEnv *sw, uint16_t raw) {
     }
 }
 
+/* Direct-mode registers (bit 15 clear) do not step; tested inline, as the
+ * mix calls this twice per voice per sample. */
+static inline void sweep_env_step(SweepEnv *sw, uint16_t raw) {
+    if (raw & 0x8000u) sweep_env_step_sweep(sw, raw);
+}
+
 /* Live effective volume of a volume register: the register decode in direct
  * mode, the sweep envelope's current level in sweep mode. */
 static inline int16_t chan_volume(uint16_t raw, const SweepEnv *sw) {
@@ -424,8 +426,7 @@ static inline int16_t chan_volume(uint16_t raw, const SweepEnv *sw) {
  * work-area reads/writes, and the transfer/IRQ-address/SPUCNT register
  * writes). `addr`/`len` describe the accessed byte range; the compare is at
  * 8-byte-unit granularity because that is the IRQ address register's unit. */
-static void spu_irq_check(uint32_t addr, uint32_t len) {
-    if (!(RREG(0x1F801DAAu) & 0x0040u)) return;   /* SPUCNT.6 IRQ enable */
+static void spu_irq_check_enabled(uint32_t addr, uint32_t len) {
     if (len == 0) return;
     uint32_t target = RREG(0x1F801DA4u);          /* in 8-byte units */
     uint32_t a = addr & (SPU_RAM_SIZE - 1u);
@@ -441,6 +442,13 @@ static void spu_irq_check(uint32_t addr, uint32_t len) {
             return;
         }
     }
+}
+
+/* The SPUCNT.6 test inline: every capture write and reverb access runs it,
+ * and with the IRQ off (the usual case) it is all they do here. */
+static inline void spu_irq_check(uint32_t addr, uint32_t len) {
+    if (RREG(0x1F801DAAu) & 0x0040u)   /* SPUCNT.6 IRQ enable */
+        spu_irq_check_enabled(addr, len);
 }
 
 static inline int16_t cd_input_volume(uint16_t raw) {
@@ -633,19 +641,21 @@ static void decode_block(SpuVoice *v) {
  * of the noise unit; the shift/step semantics above are the documented
  * reading, but the exact counter width/reload behaviour is a candidate for
  * oracle verification against Beetle's audio OUTPUT. */
-static void noise_clock(uint16_t ctrl) {
+static inline void noise_clock_state(uint16_t ctrl, uint16_t *lfsr, int32_t *timer) {
     int     step   = 4 + ((ctrl >> 8) & 3);
     int     shift  = (ctrl >> 10) & 0x0F;
     int32_t reload = (int32_t)(0x20000u >> shift);
-    noise_timer -= step;
-    if (noise_timer < 0) {
-        uint16_t parity = (uint16_t)(((noise_lfsr >> 15) ^ (noise_lfsr >> 12) ^
-                                      (noise_lfsr >> 11) ^ (noise_lfsr >> 10) ^ 1u) & 1u);
-        noise_lfsr = (uint16_t)((noise_lfsr << 1) | parity);
-        noise_timer += reload;
-        if (noise_timer < 0) noise_timer += reload;  /* worst case: step 7, reload 4 */
+    *timer -= step;
+    if (*timer < 0) {
+        uint16_t x = *lfsr;
+        uint16_t parity = (uint16_t)(((x >> 15) ^ (x >> 12) ^ (x >> 11) ^ (x >> 10) ^ 1u) & 1u);
+        *lfsr = (uint16_t)((x << 1) | parity);
+        *timer += reload;
+        if (*timer < 0) *timer += reload;  /* worst case: step 7, reload 4 */
     }
 }
+
+static void noise_clock(uint16_t ctrl) { noise_clock_state(ctrl, &noise_lfsr, &noise_timer); }
 
 /* ---- Capture buffers ----------------------------------------------------- */
 static void capture_write(uint32_t base, int16_t s) {
@@ -713,8 +723,18 @@ static uint32_t rev_ea(uint32_t reg_addr, int32_t bias) {
     uint32_t size = SPU_RAM_SIZE - base;
     int64_t  rel  = (int64_t)rev_cur - (int64_t)base
                   + ((int64_t)RREG(reg_addr) << 3) + (int64_t)bias;
-    rel %= (int64_t)size;
-    if (rel < 0) rel += (int64_t)size;
+    /* The same remainder; a step or two of the size covers the usual
+     * offsets without the 64-bit division. */
+    if (rel >= (int64_t)size) {
+        rel -= (int64_t)size;
+        if (rel >= (int64_t)size) rel %= (int64_t)size;
+    } else if (rel < 0) {
+        rel += (int64_t)size;
+        if (rel < 0) {
+            rel %= (int64_t)size;
+            if (rel < 0) rel += (int64_t)size;
+        }
+    }
     return (base + (uint32_t)rel) & 0x7FFFEu;
 }
 
@@ -890,10 +910,25 @@ typedef char spu_shadow_voice_count_check[
 const void* spu_shadow_tap_buffer(void) { return s_shadow_tap; }
 int         spu_shadow_tap_count(void)  { return s_shadow_tap_frame; }
 
-static int16_t voice_next_sample(int idx) {
-    SpuVoice *v = &voices[idx];
-    if (!v->active) return 0;
+/* What a voice's sample step reads from its registers. Registers cannot
+ * change inside spu_render_block (every guest access catches up first, and
+ * the only register the render writes is the repeat-address latch, reg 7,
+ * read by none of these), so a block reads them once. */
+static inline uint32_t voice_adsr_raw(int idx) {
+    return (uint32_t)voice_reg(idx, 4) | ((uint32_t)voice_reg(idx, 5) << 16);
+}
+static inline int voice_is_noise(int idx) {
+    uint32_t non_mask = (uint32_t)spu_regs[reg_index(0x1F801D94u)]
+                      | ((uint32_t)spu_regs[reg_index(0x1F801D96u)] << 16);
+    return idx < SPU_VOICE_COUNT ? (non_mask & (1u << idx)) != 0
+                                 : (private_modes[idx - SPU_VOICE_COUNT] & 1u) != 0;
+}
 
+/* One output sample of an active voice. `noise_val` is the LFSR value the
+ * voice sees this frame and `tap_frame` the shadow tap's frame index. */
+static inline int16_t voice_step(int idx, SpuVoice *v, uint32_t adsr_raw,
+                                 uint32_t pitch, int noise, uint16_t noise_val,
+                                 int tap_frame) {
     if (v->sample_idx >= SPU_BLOCK_SAMPLES) {
         if (v->flags & 0x01u) {
             /* END flag: the decode pointer jumps to the latched repeat
@@ -932,11 +967,8 @@ static int16_t voice_next_sample(int idx) {
      * decoding/address advance, ENDX latching, pitch stepping, the ADSR
      * envelope and the volume stages — behaves exactly as for ADPCM. */
     int16_t raw_s;
-    uint32_t non_mask = (uint32_t)spu_regs[reg_index(0x1F801D94u)]
-                      | ((uint32_t)spu_regs[reg_index(0x1F801D96u)] << 16);
-    if (idx<SPU_VOICE_COUNT?(non_mask & (1u << idx)):
-            (private_modes[idx-SPU_VOICE_COUNT]&1u)) {
-        raw_s = (int16_t)noise_lfsr;
+    if (noise) {
+        raw_s = (int16_t)noise_val;
     } else {
         raw_s = spu_gaussian_interpolate(v->previous_samples,
                                          v->samples,
@@ -953,9 +985,9 @@ static int16_t voice_next_sample(int idx) {
      * advances. The optional shadow keeps its own cubic, block-clamped window;
      * the canonical hardware path above independently uses the preceding
      * block's tail for Gaussian interpolation. */
-    if (s_shadow_tap_on && s_shadow_tap_frame < SPU_SHADOW_TAP_FRAMES) {
+    if (s_shadow_tap_on && tap_frame < SPU_SHADOW_TAP_FRAMES) {
         SpuShadowVoiceTap *t =
-            &s_shadow_tap[s_shadow_tap_frame].voice[idx];
+            &s_shadow_tap[tap_frame].voice[idx];
         int si = v->sample_idx;
         int i0 = si - 1, i2 = si + 1, i3 = si + 2;
         if (i0 < 0) i0 = 0;
@@ -971,7 +1003,7 @@ static int16_t voice_next_sample(int idx) {
     }
 
     /* Step envelope once per output sample (44.1 kHz). */
-    adsr_run(idx, v);
+    adsr_run(v, adsr_raw);
     /* Deactivate once Release fully decays to silence. */
     if (v->adsr_phase == ADSR_RELEASE && v->env_level == 0) {
         v->active = 0;
@@ -986,7 +1018,6 @@ static int16_t voice_next_sample(int idx) {
      * bytes past their own repeat address and turned the menu into a
      * continuous mid-band buzz. DuckStation and Beetle both just add the
      * pitch to the counter, so zero holds. */
-    uint32_t pitch = voice_reg(idx, 2) & 0x3FFFu;
     v->phase += pitch;
     while (v->phase >= 0x1000u) {
         v->phase -= 0x1000u;
@@ -994,6 +1025,139 @@ static int16_t voice_next_sample(int idx) {
         if (v->sample_idx >= SPU_BLOCK_SAMPLES) break;
     }
     return (int16_t)shaped;
+}
+
+static int16_t voice_next_sample(int idx) {
+    SpuVoice *v = &voices[idx];
+    if (!v->active) return 0;
+    return voice_step(idx, v, voice_adsr_raw(idx), voice_reg(idx, 2) & 0x3FFFu,
+                      voice_is_noise(idx), noise_lfsr, s_shadow_tap_frame);
+}
+
+/* ---- Voice by voice -------------------------------------------------------
+ * spu_render_block mixes frame by frame, every voice in each frame. Within a
+ * frame the voices touch only their own state, except through SPU RAM: the
+ * frame then writes the capture buffers (0x000..0xFFF) and, with SPUCNT.7,
+ * the reverb work area, and an ADPCM block fetch reads SPU RAM. So when no
+ * active voice can fetch from those areas during the block, and the IRQ
+ * compare is off (its first hit would otherwise depend on the access order),
+ * each voice can run the whole block on its own and leave its contribution
+ * per frame; the frame loop then mixes those exactly as before. The noise
+ * LFSR, clocked once per frame after the voices, is replayed ahead. */
+/* TCP core_rates: blocks rendered, and the blocks / frames voice by voice. */
+uint64_t g_spu_blocks, g_spu_blocks_by_voice, g_spu_frames_by_voice;
+static int32_t s_vm_l[2048], s_vm_r[2048], s_vm_rev_l[2048], s_vm_rev_r[2048];
+static int16_t s_vm_v1[2048], s_vm_v3[2048];
+static uint16_t s_vm_noise[2048];
+
+/* Could the voice's block fetches in the next `frames` frames read SPU RAM
+ * this block writes (the capture area, and with SPUCNT.7 the reverb work
+ * area [rev_lo, end))? The walk follows decode_block and voice_next_sample:
+ * the next block is the repeat address after an END, else the one after the
+ * current; a LOOP_START moves the repeat address to its own block; an END
+ * without REPEAT fetches the repeat block and the voice stops. Each header it
+ * reads lies outside the written areas (or the walk stops there), so the
+ * block cannot change it first. The fetch count is a bound (one is due when
+ * 28 samples are consumed, the pitch adding at most 4 per frame). */
+static int spu_voice_reads_written(const SpuVoice *v, uint32_t pitch, int frames,
+                                   uint32_t rev_lo, int rev_wren) {
+    const uint64_t adv = ((uint64_t)v->phase + (uint64_t)frames * pitch) >> 12;
+    const uint64_t fetches = 2u + ((uint64_t)v->sample_idx + adv) / SPU_BLOCK_SAMPLES;
+    uint32_t cur = v->cur_addr & (SPU_RAM_SIZE - 1u), rep = v->repeat_addr;
+    uint8_t flags = v->flags;
+    for (uint64_t k = 0; k < fetches; k++) {
+        const int stop = (flags & 0x01u) && !(flags & 0x02u);
+        uint32_t a = (flags & 0x01u) ? (rep & (SPU_RAM_SIZE - 1u)) : cur;
+        if (a + 16u > SPU_RAM_SIZE) a = 0;
+        if (a < 0x1000u || (rev_wren && a + 16u > rev_lo)) return 1;
+        if (stop) break;
+        flags = spu_ram[a + 1u];
+        if (flags & 0x04u) rep = a;
+        cur = (a + 16u) & (SPU_RAM_SIZE - 1u);
+    }
+    return 0;
+}
+
+static int spu_voice_major_ok(int frames, int mix_voices, uint16_t ctrl, int rev_wren) {
+    if (frames > 2048 || (ctrl & 0x0040u)) return 0;
+    const uint32_t rev_lo = rev_mbase();
+    for (int idx = 0; idx < mix_voices; idx++) {
+        const SpuVoice *v = &voices[idx];
+        if (!v->active || v->sample_bank) continue;   /* banks are read-only */
+        if (spu_voice_reads_written(v, voice_reg(idx, 2) & 0x3FFFu, frames, rev_lo, rev_wren))
+            return 0;
+    }
+    return 1;
+}
+
+/* Every voice over `frames` frames into s_vm_*: the per-frame sums, reverb
+ * sends and the voice 1 / voice 3 outputs, in the order of operations the
+ * frame loop uses for each voice (its two sweep steps, then its sample).
+ * In slices of SPU_VM_SLICE frames, all voices per slice: the shadow tap
+ * (spu_hq) keeps one ~1 KB record per frame, and a voice walking a whole
+ * block wrote a field of each across megabytes; a slice's records stay in
+ * the cache. A voice's state carries from slice to slice in its struct. */
+#define SPU_VM_SLICE 128
+static void spu_render_voices(int frames, int mix_voices, uint16_t ctrl, uint32_t eon) {
+    memset(s_vm_l, 0, (size_t)frames * sizeof s_vm_l[0]);
+    memset(s_vm_r, 0, (size_t)frames * sizeof s_vm_r[0]);
+    memset(s_vm_rev_l, 0, (size_t)frames * sizeof s_vm_rev_l[0]);
+    memset(s_vm_rev_r, 0, (size_t)frames * sizeof s_vm_rev_r[0]);
+    memset(s_vm_v1, 0, (size_t)frames * sizeof s_vm_v1[0]);
+    memset(s_vm_v3, 0, (size_t)frames * sizeof s_vm_v3[0]);
+    for (int v = 0; v < mix_voices; v++) {
+        if (!voices[v].active || !voice_is_noise(v)) continue;
+        uint16_t lfsr = noise_lfsr;
+        int32_t timer = noise_timer;
+        for (int f = 0; f < frames; f++) {
+            s_vm_noise[f] = lfsr;
+            noise_clock_state(ctrl, &lfsr, &timer);
+        }
+        break;
+    }
+    const int tap = s_shadow_tap_on;
+    for (int f0 = 0; f0 < frames; f0 += SPU_VM_SLICE) {
+        const int f1 = frames - f0 < SPU_VM_SLICE ? frames : f0 + SPU_VM_SLICE;
+        for (int v = 0; v < mix_voices; v++) {
+            const uint16_t rl = voice_reg(v, 0), rr = voice_reg(v, 1);
+            SpuVoice *vp = &voices[v];
+            const int sweep = ((rl | rr) & 0x8000u) != 0;
+            /* Inactive (it cannot start inside a block), volumes direct, no
+             * tap: every frame would be a no-op. */
+            if (!vp->active && !sweep && !tap) continue;
+            const uint32_t adsr_raw = voice_adsr_raw(v), pitch = voice_reg(v, 2) & 0x3FFFu;
+            const int noise = voice_is_noise(v);
+            const int send = v < SPU_VOICE_COUNT ? (eon & (1u << v)) != 0
+                                                 : (private_modes[v - SPU_VOICE_COUNT] & 2u) != 0;
+            SweepEnv *swl = &sweep_voice_env[v][0], *swr = &sweep_voice_env[v][1];
+            for (int f = f0; f < f1; f++) {
+                if (sweep) {
+                    sweep_env_step(swl, rl);
+                    sweep_env_step(swr, rr);
+                }
+                int16_t s = vp->active ? voice_step(v, vp, adsr_raw, pitch, noise, s_vm_noise[f], f) : 0;
+                if (v == 1) s_vm_v1[f] = s;
+                if (v == 3) s_vm_v3[f] = s;
+                int16_t vl = chan_volume(rl, swl);
+                int16_t vr = chan_volume(rr, swr);
+                if (tap && f < SPU_SHADOW_TAP_FRAMES) {
+                    SpuShadowVoiceTap *t = &s_shadow_tap[f].voice[v];
+                    /* Tap keeps its historical 1.14 volume scale. */
+                    t->vol_l = (int16_t)(vl >> 1);
+                    t->vol_r = (int16_t)(vr >> 1);
+                }
+                if (!s) continue;
+                int32_t cl = ((int32_t)s * vl) >> 15;
+                int32_t cr = ((int32_t)s * vr) >> 15;
+                s_vm_l[f] += cl;
+                s_vm_r[f] += cr;
+                if (send) {
+                    s_vm_rev_l[f] += cl;
+                    s_vm_rev_r[f] += cr;
+                }
+            }
+        }
+    }
 }
 
 static void key_on(uint32_t mask) {
@@ -1257,6 +1421,14 @@ static void spu_render_block(int16_t* out_stereo, int frames) {
     static int16_t s_voice_sum[2048 * 2];
     int voice_sum_cap = frames < 2048 ? frames : 2048;
     int voice_sum_pos = 0;
+    const int by_voice = enabled && any_voice &&
+                         spu_voice_major_ok(frames, mix_voices, ctrl, rev_wren);
+    g_spu_blocks++;
+    if (by_voice) {
+        g_spu_blocks_by_voice++;
+        g_spu_frames_by_voice += (uint64_t)frames;
+        spu_render_voices(frames, mix_voices, ctrl, eon);
+    }
 
     for (int f = 0; f < frames; f++) {
         int32_t mix_l = 0;
@@ -1280,14 +1452,21 @@ static void spu_render_block(int16_t* out_stereo, int frames) {
              * sweeps only matter while a voice is active. */
             sweep_env_step(&sweep_main_env[0], spu_regs[reg_index(0x1F801D80u)]);
             sweep_env_step(&sweep_main_env[1], spu_regs[reg_index(0x1F801D82u)]);
-            if (any_voice) {
+            if (by_voice) {
+                voice_l = s_vm_l[f];
+                voice_r = s_vm_r[f];
+                rev_send_l = s_vm_rev_l[f];
+                rev_send_r = s_vm_rev_r[f];
+                v1_out = s_vm_v1[f];
+                v3_out = s_vm_v3[f];
+            } else if (any_voice) {
                 for (int v = 0; v < mix_voices; v++) {
                     sweep_env_step(&sweep_voice_env[v][0], voice_reg(v, 0));
                     sweep_env_step(&sweep_voice_env[v][1], voice_reg(v, 1));
                 }
             }
 
-            if (any_voice) {
+            if (any_voice && !by_voice) {
                 for (int v = 0; v < mix_voices; v++) {
                     int16_t s = voice_next_sample(v);
                     if (v == 1) v1_out = s;

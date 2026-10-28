@@ -838,7 +838,8 @@ void psx_scheduler_run(CPUState* cpu)
             /* Soft-exit / yield longjmps out of vblank inside
              * psx_devices_service_to_now; without this the re-entrancy guard
              * stays set and every later advance skips device service forever. */
-            { extern int psx_in_device_service; psx_in_device_service = 0; }
+            { extern int psx_in_device_service; psx_in_device_service = 0;
+              extern void psx_cyc_gate_refresh(void); psx_cyc_gate_refresh(); }
             /* A longjmp-out through a nested call unit (overlay_loader_call_native
              * or dispatch_nonlocal_call) would skip its depth restore; clear the
              * nested-unit gate so IRQ checks are not wedged-off after the escape

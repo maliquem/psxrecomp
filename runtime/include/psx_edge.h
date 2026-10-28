@@ -126,6 +126,89 @@ static inline void psx_check_interrupts_at_inline(CPUState* cpu, uint32_t resume
 #define psx_check_interrupts_at(cpu, pc) psx_check_interrupts_at_inline((cpu), (pc))
 #endif
 
+/* The emitters' cycle charge, about one for every two guest instructions.
+ * psx_cyc_charge reads five mode flags before its common case (inside a
+ * generated function: add to the batch); here four of them are one word,
+ * g_psx_cyc_gate (psx_cycles.c, kept by their writers), and any other case
+ * takes psx_cyc_charge itself, which decides exactly as before. */
+#if !defined(PSX_COSIM)
+extern uint32_t g_psx_cyc_gate;
+static inline void psx_cyc_charge_edge(uint32_t cycles) {
+    const uint32_t prior = g_psx_cyc_batch, sum = prior + cycles;
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect((g_psx_cyc_gate == 0u) & (g_psx_cyc_local_acc == NULL) &
+                         (g_psx_cyc_bb_defer > 0) & (sum >= prior), 1)) {
+#else
+    if ((g_psx_cyc_gate == 0u) & (g_psx_cyc_local_acc == NULL) &
+        (g_psx_cyc_bb_defer > 0) & (sum >= prior)) {
+#endif
+        g_psx_cyc_batch = sum;
+        return;
+    }
+    psx_cyc_charge(cycles);
+}
+#if !defined(PSX_EDGE_IMPL)
+#define psx_cyc_charge(c) psx_cyc_charge_edge(c)
+#endif
+
+/* The cpu_timing = "block" loads (psx_cyc.h psx_blk_load_*, psx_blk_lwc2_read)
+ * with the same main RAM and scratchpad paths, forced inline: in the large
+ * generated functions the compiler kept them out of line, a call per load. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PSX_EDGE_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define PSX_EDGE_ALWAYS_INLINE inline
+#endif
+#define PSX_BLK_LOAD_EDGE(T, name, size)                                          \
+    static PSX_EDGE_ALWAYS_INLINE T name##_edge(uint32_t packed, CPUState* cpu,   \
+                                                uint32_t addr, uint32_t rt,       \
+                                                uint32_t reg_mask) {              \
+        (void)rt; (void)reg_mask;                                                 \
+        if (g_ls_mode == 0 && !g_ds_recording && addr < 0xC0000000u) {            \
+            const uint32_t phys = addr & 0x1FFFFFFFu;                             \
+            T v;                                                                  \
+            if (phys < 0x00800000u) {                                             \
+                psx_cyc_charge_edge((packed & 3u) + 5u);                          \
+                memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));       \
+                return v;                                                         \
+            }                                                                     \
+            if (phys - (uint32_t)PSX_SCRATCH_PHYS <= (uint32_t)PSX_SCRATCH_BYTES - size) { \
+                psx_cyc_charge_edge((packed >> 8) & 0xFFu);                       \
+                memcpy(&v, g_psx_scratch + (phys - (uint32_t)PSX_SCRATCH_PHYS), sizeof(v)); \
+                return v;                                                         \
+            }                                                                     \
+        }                                                                         \
+        return (T)psx_blk_load_slow(packed, cpu, addr, size, 2u);                 \
+    }
+PSX_BLK_LOAD_EDGE(uint32_t, psx_blk_load_word, 4u)
+PSX_BLK_LOAD_EDGE(uint16_t, psx_blk_load_half, 2u)
+PSX_BLK_LOAD_EDGE(uint8_t,  psx_blk_load_byte, 1u)
+#undef PSX_BLK_LOAD_EDGE
+static PSX_EDGE_ALWAYS_INLINE uint32_t psx_blk_lwc2_read_edge(uint32_t packed, CPUState* cpu,
+                                                              uint32_t addr) {
+    if (g_ls_mode == 0 && !g_ds_recording && addr < 0xC0000000u) {
+        const uint32_t phys = addr & 0x1FFFFFFFu;
+        uint32_t v;
+        if (phys < 0x00800000u) {
+            psx_cyc_charge_edge((packed & 3u) + 4u);
+            memcpy(&v, g_psx_ram + (phys & g_psx_ram_mask), sizeof(v));
+            return v;
+        }
+        if (phys - (uint32_t)PSX_SCRATCH_PHYS <= (uint32_t)PSX_SCRATCH_BYTES - 4u) {
+            memcpy(&v, g_psx_scratch + (phys - (uint32_t)PSX_SCRATCH_PHYS), sizeof(v));
+            return v;
+        }
+    }
+    return psx_blk_load_slow(packed, cpu, addr, 4u, 1u);
+}
+#if !defined(PSX_EDGE_IMPL)
+#define psx_blk_load_word psx_blk_load_word_edge
+#define psx_blk_load_half psx_blk_load_half_edge
+#define psx_blk_load_byte psx_blk_load_byte_edge
+#define psx_blk_lwc2_read psx_blk_lwc2_read_edge
+#endif
+#endif
+
 #ifdef __cplusplus
 }
 #endif
