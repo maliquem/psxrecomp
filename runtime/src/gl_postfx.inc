@@ -1551,6 +1551,14 @@ int gl_renderer_shadow_sun_info(float *elevation_deg, int *scenery) {
     if (elevation_deg) *elevation_deg = el < 0 ? 0.0f : (float)el / 100.0f;
     return el >= 0 && atomic_load_explicit(&s_sun_info_at, memory_order_relaxed) != 0;
 }
+/* gl_renderer_shadow_light_info: the light used, the pass's u_sun, u_moon,
+ * the camera's heading and pitch (hundredths of a degree) */
+static _Atomic int s_light_info[8];
+int gl_renderer_shadow_light_info(float out[8]) {
+    for (int i = 0; i < 8; i++) out[i] = (float)atomic_load_explicit(&s_light_info[i], memory_order_relaxed) / 100.0f;
+    const unsigned at = atomic_load_explicit(&s_sun_info_at, memory_order_relaxed);
+    return at ? (int)((unsigned)s_pfx_presents - at) : -1;
+}
 static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
     if (!s_sm_tex) pfx_sm_init();
     memset(s_sm_u, 0, sizeof s_sm_u);
@@ -1579,15 +1587,30 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         const float *ss = pfx_pass_uniform(ps, "u_ss");
         atomic_store_explicit(&s_sun_scenery, !(ss && ss[1] < 0.5f), memory_order_relaxed);
     }
-    float night_sun[2];  /* gl_renderer_set_night: that far toward the pass's moon (u_moon) */
+    float night_sun[2];  /* gl_renderer_set_night: that far toward the area's moon
+                          * (gpu_shadow_moon_area), else the pass's (u_moon) */
     {
-        const float *moon = pfx_pass_uniform(ps, "u_moon");
-        if (sun && moon && moon[1] > 0.0f && s_night_f > 0.0f) {
+        const float *moon = pfx_pass_uniform(ps, "u_moon"), *psun = pfx_pass_uniform(ps, "u_sun");
+        for (int i = 0; i < 2; i++) {
+            atomic_store_explicit(&s_light_info[2 + i], psun ? (int)lroundf(psun[i] * 100.0f) : 0, memory_order_relaxed);
+            atomic_store_explicit(&s_light_info[4 + i], moon ? (int)lroundf(moon[i] * 100.0f) : 0, memory_order_relaxed);
+        }
+        float area_moon[2];
+        if (sun && s_night_f > 0.0f && gpu_shadow_moon_area(&area_moon[0], &area_moon[1])) {
+            float turn = fmodf(area_moon[0] - sun[0], 360.0f);   /* the short way round */
+            if (turn > 180.0f) turn -= 360.0f;
+            if (turn < -180.0f) turn += 360.0f;
+            night_sun[0] = sun[0] + turn * s_night_f;
+            night_sun[1] = sun[1] + (area_moon[1] - sun[1]) * s_night_f;
+            sun = night_sun;
+        } else if (sun && moon && moon[1] > 0.0f && s_night_f > 0.0f) {
             night_sun[0] = sun[0] + moon[0] * s_night_f;
             night_sun[1] = sun[1] + (moon[1] - sun[1]) * s_night_f;
             sun = night_sun;
         }
     }
+    atomic_store_explicit(&s_light_info[0], sun ? (int)lroundf(sun[0] * 100.0f) : 0, memory_order_relaxed);
+    atomic_store_explicit(&s_light_info[1], sun ? (int)lroundf(sun[1] * 100.0f) : 0, memory_order_relaxed);
     atomic_store_explicit(&s_sun_el_x100, sun ? (int)(sun[1] * 100.0f) : -1, memory_order_relaxed);
     atomic_store_explicit(&s_sun_info_at, (unsigned)s_pfx_presents, memory_order_relaxed);
     const float H = proj ? proj[0] : 0.0f;
@@ -1621,6 +1644,11 @@ static void pfx_shadow_build(const PfxPass *ps, float aspect, int lw, int lh) {
         const float rl = sqrtf(rt[0] * rt[0] + rt[1] * rt[1] + rt[2] * rt[2]);
         if (rl > 1e-4f) for (int i = 0; i < 3; i++) rt[i] /= rl;
         const float fw[3] = {rt[1] * u[2] - rt[2] * u[1], rt[2] * u[0] - rt[0] * u[2], rt[0] * u[1] - rt[1] * u[0]};
+        {   /* the camera (view z) in the sun's terms, for a tuning tool */
+            const float hz = sqrtf(rt[2] * rt[2] + fw[2] * fw[2]);
+            atomic_store_explicit(&s_light_info[6], (int)lroundf(atan2f(fw[2], rt[2]) * 5729.578f), memory_order_relaxed);
+            atomic_store_explicit(&s_light_info[7], (int)lroundf(atan2f(-u[2], hz) * 5729.578f), memory_order_relaxed);
+        }
         for (int i = 0; i < 3; i++) { s_sm_world[0][i] = e[i]; s_sm_world[1][i] = u[i]; }
         s_sm_world[0][3] = s_sm_world[1][3] = 1.0f;
         if (sun) {

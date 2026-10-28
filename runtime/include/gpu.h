@@ -472,6 +472,26 @@ int  gpu_shadow_off_active(void);
 void gpu_set_shadow_sun_areas(const uint32_t *area, const float *az, const float *el, int n);
 int  gpu_shadow_sun_area(float *az, float *el);
 int  gpu_shadow_area_off(void);
+/* Live lights per area, over sun_areas (a title's own file, a tuning tool;
+ * any thread may read them): which 0 = the sun, 1 = the moon (the light at
+ * night, gl_renderer_set_night; without one, the shadow pass's u_moon, a
+ * turn from the sun). mode GPU_LIGHT_NONE drops the live one (the config's,
+ * else the pass's, again), GPU_LIGHT_AT = azimuth/elevation in degrees,
+ * GPU_LIGHT_OFF = none there (no shadows; at night, the moon's "off"). Set
+ * returns 0 when the table is full. Get: layer 0 = the live one, 1 = the
+ * config's (sun only); returns the mode. gpu_shadow_moon_area: the current
+ * area's moon (1) or 0. gpu_shadow_current_area: the area the lights are
+ * looked up for (the mod's map id or the scene_keys'). */
+enum { GPU_LIGHT_NONE = 0, GPU_LIGHT_AT = 1, GPU_LIGHT_OFF = 2 };
+int  gpu_shadow_light_set(uint32_t area, int which, int mode, float az, float el);
+int  gpu_shadow_light_get(uint32_t area, int which, int layer, float *az, float *el);
+int  gpu_shadow_moon_area(float *az, float *el);
+uint32_t gpu_shadow_current_area(void);
+/* The live lights from a file (the runtime reads sun_areas.txt next to the
+ * exe at start, after the config; tools/sun_tool writes it), one area per
+ * line: "0xAREA sun AZ EL moon AZ EL", "off" for either, '#' a comment.
+ * Returns the lights set, -1 with no file. */
+int  gpu_shadow_lights_load(const char *path);
 /* Signed-funnel variants (min/max + center±halfwidth idioms — see
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */

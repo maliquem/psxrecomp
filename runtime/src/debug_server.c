@@ -76,6 +76,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <math.h>
 
 #if defined(_MSC_VER)
 /* MSVC's three-argument reentrant tokenizer is named strtok_s. */
@@ -8811,6 +8812,59 @@ static void handle_shadow_cache(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+/* sun_area: the light per area (gpu_shadow_light_set), for a tool that
+ * tunes it while the game runs. {} reads: the current area, the night's
+ * share, its sun and moon (live layer, config layer: [mode, az, el], mode
+ * 0 none / 1 at / 2 off) and the light last used ("used": az, el, presents
+ * since that shadow build, -1 none; "pass": the shader's u_sun and u_moon;
+ * "camera": the heading the camera looks along, in the sun's azimuths, and
+ * how far it looks down).
+ * {"set":"sun"|"moon","v":"AZ EL"|"off"|"none"} changes the live one first
+ * ("area":"0x..." another area; "none" = the config's again). Allowed in the
+ * restricted mode: it only moves the light. */
+static int sun_area_json(char *out, int cap, uint32_t area, int which)
+{
+    float az = 0.0f, el = 0.0f, caz = 0.0f, cel = 0.0f;
+    const int m = gpu_shadow_light_get(area, which, 0, &az, &el);
+    const int c = gpu_shadow_light_get(area, which, 1, &caz, &cel);
+    return snprintf(out, (size_t)cap, "{\"live\":[%d,%.1f,%.1f],\"config\":[%d,%.1f,%.1f]}",
+                    m, az, el, c, caz, cel);
+}
+static void handle_sun_area(int id, const char *json)
+{
+    char buf[64], v[64];
+    const uint32_t cur = gpu_shadow_current_area();
+    const uint32_t area = json_get_str(json, "area", buf, sizeof buf) ? hex_to_u32(buf) : cur;
+    if (json_get_str(json, "set", buf, sizeof buf)) {
+        const int which = strcmp(buf, "moon") == 0 ? 1 : strcmp(buf, "sun") == 0 ? 0 : -1;
+        if (which < 0 || !json_get_str(json, "v", v, sizeof v)) { send_err(id, "set sun|moon with v"); return; }
+        int mode = GPU_LIGHT_AT;
+        float az = 0.0f, el = 0.0f;
+        if (strcmp(v, "off") == 0) mode = GPU_LIGHT_OFF;
+        else if (strcmp(v, "none") == 0) mode = GPU_LIGHT_NONE;
+        else {
+            char *end;
+            az = strtof(v, &end);
+            el = strtof(end, &end);
+            if (end == v || !(el > 0.0f && el < 90.0f)) { send_err(id, "v: \"AZ EL\" (elevation 0..90), off or none"); return; }
+            az = fmodf(az, 360.0f);
+            if (az < 0.0f) az += 360.0f;
+        }
+        if (!area) { send_err(id, "no area"); return; }
+        if (!gpu_shadow_light_set(area, which, mode, az, el)) { send_err(id, "light table full"); return; }
+    }
+    float info[8];
+    const int age = gl_renderer_shadow_light_info(info);
+    char sun[128], moon[128];
+    sun_area_json(sun, sizeof sun, area, 0);
+    sun_area_json(moon, sizeof moon, area, 1);
+    send_fmt("{\"id\":%d,\"ok\":true,\"area\":\"0x%08x\",\"current\":\"0x%08x\",\"night\":%.3f,"
+             "\"sun\":%s,\"moon\":%s,\"off\":%d,\"used\":[%.2f,%.2f,%d],\"pass\":[%.2f,%.2f,%.2f,%.2f],"
+             "\"camera\":[%.2f,%.2f]}",
+             id, (unsigned)area, (unsigned)cur, gl_renderer_night(), sun, moon, gpu_shadow_area_off(),
+             info[0], info[1], age, info[2], info[3], info[4], info[5], info[6], info[7]);
+}
+
 /* sprite_dump: the foot points and 2D pieces of the picture on screen
  * (sprite shadows, gl_renderer_sprite_dump_json). */
 static void handle_sprite_dump(int id, const char *json)
@@ -16373,6 +16427,7 @@ static const CmdEntry s_commands[] = {
     { "post_shader",       handle_post_shader },
     { "post_uniform",      handle_post_uniform },
     { "shadow_cache",      handle_shadow_cache },
+    { "sun_area",          handle_sun_area },
     { "sprite_dump",       handle_sprite_dump },
     { "postfx_timing",     handle_postfx_timing },
     { "shadow_hide",       handle_shadow_hide },
@@ -16695,6 +16750,7 @@ static int restricted_allows(const char *cmd)
     static const char *const ok[] = {
         "ping", "frame", "quit", "savestate", "savestate_status",
         "mod_counters", "perf_summary", "frame_perf",
+        "sun_area",   /* the light per area only (a tuning tool) */
         "present_shot", "present_shot_seq", "screenshot", "screenshot_hires",
         NULL
     };
@@ -17469,7 +17525,11 @@ void debug_server_poll(void)
     req[sizeof(req) - 1] = '\0';
     SDL_UnlockMutex(s_io_mutex);
 
-    passive_on_first_request();
+    {   /* a light tuning tool's polling (sun_area) leaves the recorders off */
+        char c[32];
+        if (!json_get_str(req, "cmd", c, sizeof c) || strcmp(c, "sun_area") != 0)
+            passive_on_first_request();
+    }
     /* Execute on the emu thread (safe point). send_line appends to s_resp_buf. */
     s_resp_len = 0;
     s_resp_overflow = 0;

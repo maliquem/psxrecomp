@@ -1702,6 +1702,7 @@ void gl_renderer_set_night(float f) {
     if (f > 1.0f) f = 1.0f;
     atomic_store_explicit(&s_night_req, f, memory_order_relaxed);
 }
+float gl_renderer_night(void) { return atomic_load_explicit(&s_night_req, memory_order_relaxed); }
 void gl_renderer_shadow_cache_clear(void) {
     GL_RT_SYNC("shadow_cache_clear");
     if (s_scc) scc_clear();
