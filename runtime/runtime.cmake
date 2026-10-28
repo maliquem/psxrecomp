@@ -445,6 +445,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/video_texture_filter.c
     ${PSXRECOMP_ROOT}/runtime/src/video_telemetry.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/bug_report.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c

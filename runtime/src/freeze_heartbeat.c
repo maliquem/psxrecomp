@@ -4,6 +4,7 @@
 #include "psx_memory.h"
 #include "freeze_heartbeat.h"
 #include "freeze_dump_policy.h"
+#include "bug_report.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -736,6 +737,10 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     if (fclose(f) != 0) written = 0;
     if (!written) (void)remove(path);
     freeze_dump_unlock();
+    /* A report points to it when the game really stopped (frames stopped, or a
+     * fatal halt): the other kinds also fire while the picture keeps going (a
+     * title's VSync wait reads as a spin), which the player never saw. */
+    if (written && (wedge_kind == 1 || wedge_kind == 4)) bug_report_note_freeze(path, wedge_kind);
     return written;
 }
 

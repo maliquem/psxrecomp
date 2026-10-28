@@ -47,6 +47,7 @@
 #include "gpu_timeline.h"
 #include "gte_nclip_stats.h"
 #include "present_image_ring.h"
+#include "bug_report.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
@@ -11129,6 +11130,33 @@ static void handle_wide_shot(int id, const char *json)
              id, path, W, H);
 }
 
+/* The bug report's PSX picture (bug_report.c): the presented native-wide
+ * surface, 0 when none is (the report then reads the display area). */
+int debug_server_write_wide_picture(const char *path)
+{
+    extern int gr_wide_supported(void);
+    if (!gr_wide_supported() || ws_nw_extra() <= 0) return 0;
+    return write_wide_png(path, NULL, NULL) == NULL;
+}
+
+/* Player bug reports (bug_report.h), for tests without a keyboard:
+ *   {"cmd":"bug_report","op":"status"|"open"|"save"|"discard"}
+ *   {"cmd":"bug_report","op":"text","chars":"..."}       typed text
+ *   {"cmd":"bug_report","op":"key","sdlk":K,"mods":M}    a key press (SDL keycode)
+ *   {"cmd":"bug_report","op":"set","row":R,"value":V}    a choice (value -1: select row)
+ * (The field names differ from the ops: json_get_* match the first "name".) */
+static void handle_bug_report(int id, const char *json)
+{
+    char op[32] = "status", text[1024] = "", buf[2048];
+    (void)json_get_str(json, "op", op, sizeof op);
+    (void)json_get_str(json, "chars", text, sizeof text);
+    const int key = json_get_int(json, "sdlk", 0);
+    const int row = json_get_int(json, "row", -1);
+    const int value = !strcmp(op, "key") ? json_get_int(json, "mods", 0) : json_get_int(json, "value", -1);
+    (void)bug_report_debug(op, text, key, row, value, buf, sizeof buf);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
+}
+
 /* Operator capture mark. Runs on the present thread (hotkey handler), where
  * the renderer's context is current. Freezes the display and GP0 rings so the
  * frames and draw lists leading up to the mark survive until read, and saves
@@ -16638,6 +16666,7 @@ static const CmdEntry s_commands[] = {
     { "set_snapshot",      handle_set_snapshot },
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_present_screenshot },
+    { "bug_report",        handle_bug_report },
     { "screenshot_file",   handle_screenshot_file },
     { "screenshot_hires",  handle_screenshot_hires },
     { "present_shot",      handle_present_shot },

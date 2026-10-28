@@ -1309,6 +1309,51 @@ void psx_mod_vram_write(int x, int y, int w, int h, const uint16_t *px);
  * a PNG at path; 0 when the backend cannot read it back (Vulkan, headless).
  * One request at a time: a newer one replaces a pending one. */
 int  psx_mod_request_screenshot(const char* path);
+/* Bug reports (docs/BUG_REPORT.md): the BugReport hotkey (config.ini [KeyMap],
+ * Ctrl+B by default) or psx_mod_bug_report_open() takes the moment -- the
+ * presented picture, the PSX picture without effects, a save state, the last
+ * seconds as a clip -- and then opens a form over the frozen game: the bug's
+ * type, severity, frequency and a description typed on the keyboard. Saving
+ * writes one folder per report (report.json + the files) under the reports
+ * folder (PSX_BUG_REPORT_DIR, else bug_reports/ in the working directory);
+ * discarding deletes it. A crash / freeze dump also leaves a report there.
+ *
+ * A title may add its own bug types (listed first, before the framework's),
+ * members for the report's "game" object, files to copy into its config/
+ * folder (paths relative to the working directory), and its own look for the
+ * form: `render` draws the form from `v` like a page's renderer (canvas of
+ * 240 x scale lines, ARGB, blended over the frozen game) and returns 0 to have
+ * the framework's panel this time. The input stays the framework's. All of it
+ * is cleared at each session's activation; main thread. */
+enum {
+    PSX_MOD_BUG_ROW_TYPE = 0, PSX_MOD_BUG_ROW_SEVERITY, PSX_MOD_BUG_ROW_FREQUENCY,
+    PSX_MOD_BUG_ROW_TEXT, PSX_MOD_BUG_ROW_SAVE, PSX_MOD_BUG_ROW_DISCARD, PSX_MOD_BUG_ROWS
+};
+typedef struct PSXModBugReportView {
+    int size;                          /* sizeof(PSXModBugReportView) */
+    int row;                           /* the selected row (PSX_MOD_BUG_ROW_*) */
+    const char *const *types;     int type_count, type;
+    const char *const *severities; int severity_count, severity;
+    const char *const *frequencies; int frequency_count, frequency;
+    const char *text;                  /* the description, UTF-8 */
+    int caret;                         /* the caret, a byte offset into text */
+    int photo;                         /* 1: the picture was saved */
+    int state;                         /* the save state: 1 saved, 0 none, -1 still saving */
+    int clip_frames;                   /* frames in the clip (0: none) */
+    const uint32_t *thumb;             /* the moment, ARGB (NULL: none) */
+    int thumb_w, thumb_h;
+    int confirm_discard;               /* 1: the next discard throws the report away */
+    const char *folder;                /* the report's folder */
+} PSXModBugReportView;
+typedef int (*PSXModBugReportRenderer)(const PSXModBugReportView *v, uint32_t *argb, int w, int h);
+void psx_mod_set_bug_report_renderer(PSXModBugReportRenderer render);
+void psx_mod_bug_report_add_type(const char *name);
+/* Writes "name":value members (comma separated, no braces) into json. */
+typedef int (*PSXModBugReportInfo)(char *json, int cap);
+void psx_mod_set_bug_report_info(PSXModBugReportInfo info);
+void psx_mod_bug_report_add_file(const char *path);
+int  psx_mod_bug_report_open(void);
+int  psx_mod_bug_report_active(void);
 /* A title's mouse pointer (OpenGL): `argb` (straight alpha, at most 64 x 64,
  * copied) is drawn last at every swap -- over every effect, the OSD, the save
  * state menu, pages, HUD and notices -- each of its pixels as big as one of

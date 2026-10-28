@@ -203,6 +203,29 @@ static void draw_text(uint32_t *dst, int x, int y, const char *s,
     }
 }
 
+int psx_ui_text(uint32_t *dst, int dst_w, int dst_h, int x, int y,
+                const char *s, uint32_t col, int scale)
+{
+    if (!dst || !s) return x;
+    for (; *s; s++, x += 8 * scale) {
+        char c = *s;
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (c < 32 || c > 90) c = '?';
+        const uint8_t *g = FONT8[(int)c - 32];
+        for (int gy = 0; gy < 8; gy++)
+            for (int gx = 0; gx < 8; gx++) {
+                if (!(g[gy] & (1u << gx))) continue;
+                for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++) {
+                        const int dx = x + gx * scale + sx, dy = y + gy * scale + sy;
+                        if ((unsigned)dx < (unsigned)dst_w && (unsigned)dy < (unsigned)dst_h)
+                            dst[dy * dst_w + dx] = col;
+                    }
+            }
+    }
+    return x;
+}
+
 static void blit_thumb(uint32_t *dst, int x0, int y0, int w, int h,
                        const uint32_t *src)
 {

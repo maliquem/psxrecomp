@@ -27,7 +27,10 @@ extern "C" {
  * (written just before the program closes, to continue from later). The
  * savestate menu never lists it; the slot API and the TCP command accept it. */
 #define SAVESTATE_QUIT_SLOT 12
-#define SAVESTATE_ALL_SLOTS (SAVESTATE_SLOTS + 1)
+/* And one for the bug report (bug_report.h): written at the report's moment,
+ * then moved into the report's folder. Never listed either. */
+#define SAVESTATE_BUG_SLOT 13
+#define SAVESTATE_ALL_SLOTS (SAVESTATE_SLOTS + 2)
 #define SAVESTATE_THUMB_W 128
 #define SAVESTATE_THUMB_H 96
 
@@ -131,6 +134,9 @@ int savestate_pending(void);
 
 /* Machine-readable lifecycle receipt for deterministic debug harnesses. */
 void savestate_status_json(char* buf, size_t cap);
+/* The same receipt as values: generation bumps when a request settles. */
+void savestate_status_get(uint32_t* generation, int* pending, int* last_ok,
+                          int* last_slot);
 
 /* 1 once after a successful load restore (before scheduler longjmp). Clears. */
 int savestate_take_load_completed(void);

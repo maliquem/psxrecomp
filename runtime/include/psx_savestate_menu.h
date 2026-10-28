@@ -49,6 +49,12 @@ void psx_savestate_menu_hud_redraw(void);
 void psx_savestate_menu_set_toast(PsxTitleCanvasRenderer toast);
 void psx_savestate_menu_toast_redraw(void);
 
+/* The menu's 8x8 font (ASCII space..Z; a..z drawn as capitals, anything else
+ * as '?') into any ARGB canvas, each pixel scale x scale; returns the x after
+ * the text. For the framework's own pages (bug_report.c). */
+int psx_ui_text(uint32_t *dst, int dst_w, int dst_h, int x, int y,
+                const char *s, uint32_t col, int scale);
+
 #ifdef __cplusplus
 }
 #endif

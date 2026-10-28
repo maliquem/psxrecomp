@@ -36,6 +36,7 @@
 #include "savestate.h"
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
+#include "bug_report.h"
 #include "host_osd.h"
 #include "local_mouse_sdl.h"
 #include "pad_external_input.h"
@@ -1255,6 +1256,7 @@ static void savestate_input_guard_arm(void);
 extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) {
     char buf[64];
     const int disp = slot + 1;
+    if (slot == SAVESTATE_BUG_SLOT) return;   /* the bug report's own (bug_report.c) */
     if (!is_load && ok)
         psx_savestate_menu_note_slots_changed();
     if (is_load && ok)
@@ -9046,6 +9048,8 @@ extern "C" int psx_mod_open_title_page(PSXModCanvasRenderer render, PSXModTitleP
     return 1;
 }
 extern "C" int psx_mod_title_page_open(void) { return g_title_page_open; }
+/* The bug report's form closed outside the page's input (debug server). */
+extern "C" void psx_bug_report_close_page(void) { title_page_close(); }
 extern "C" void psx_mod_title_page_redraw(void) { psx_savestate_menu_page_redraw(); }
 extern "C" void psx_mod_set_title_hud(PSXModCanvasRenderer render) { psx_savestate_menu_set_hud(render); }
 extern "C" void psx_mod_title_hud_redraw(void) { psx_savestate_menu_hud_redraw(); }
@@ -9163,6 +9167,13 @@ static void title_page_host_pause_loop(void) {
     uint32_t prev = title_page_buttons();
     uint32_t ignore = prev;      /* held at opening (the shortcut): only after a release */
     uint32_t repeat_at = 0;
+    /* The bug report's form takes typed text (accents, IME) as text events. */
+    const bool text_input = bug_report_page_active() != 0;
+#if defined(PSX_SDL3)
+    if (text_input && sdl_window) SDL_StartTextInput(sdl_window);
+#else
+    if (text_input) SDL_StartTextInput();
+#endif
     while (g_title_page_open) {
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_poll();
@@ -9170,7 +9181,9 @@ static void title_page_host_pause_loop(void) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             (void)psx_local_mouse_event(ev);
-            if (ev.type == SDL_QUIT) {
+            if (ev.type == SDL_TEXTINPUT) {
+                if (g_title_page_open && bug_report_page_active()) bug_report_page_text(ev.text.text);
+            } else if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
                 std::exit(0);
@@ -9216,6 +9229,11 @@ static void title_page_host_pause_loop(void) {
         starvation_watchdog_heartbeat();
         SDL_Delay(8);
     }
+#if defined(PSX_SDL3)
+    if (text_input && sdl_window) SDL_StopTextInput(sdl_window);
+#else
+    if (text_input) SDL_StopTextInput();
+#endif
     psx_sdl_audio_set_paused(sdl_audio_device, 0);
     freeze_heartbeat_set_paused(0);
     /* Resume as host_pause_loop does: re-anchor pacing, audio and dynamic
@@ -9388,6 +9406,12 @@ static bool drain_host_events() {
                                              (int)key, (int)scancode,
                                              (int)mod)) {
                 fast_forward_toggle_flip();
+            }
+            else if (!key_repeat &&
+                     host_keymap_match_event(HOST_KEYMAP_BUG_REPORT,
+                                             (int)key, (int)scancode,
+                                             (int)mod)) {
+                (void)bug_report_begin();
             }
             else if (!key_repeat &&
                      host_keymap_match_event(HOST_KEYMAP_CAPTURE_MARK,
@@ -9740,6 +9764,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
         if (savestate_menu_open)
             savestate_menu_host_pause_loop();
+        (void)bug_report_tick();   /* opens the report's form as a page */
         if (g_title_page_open)
             title_page_host_pause_loop();
         if (psx_rewind_is_open())
@@ -10184,6 +10209,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_pause_service();
                 // A hotkey acquired during pacing may open a host menu.
                 if (savestate_menu_open) savestate_menu_host_pause_loop();
+                (void)bug_report_tick();
                 if (g_title_page_open) title_page_host_pause_loop();
                 if (psx_rewind_is_open()) rewind_host_pause_loop();
                 if (psx_host_pause_depth() > 0) host_pause_loop();
@@ -20789,6 +20815,7 @@ int main(int argc, char** argv) {
         g_mod_fast_forward_blocked = 0;
         g_mod_fast_forward_speed = 0;
         title_page_close();
+        bug_report_reset();
         psx_savestate_menu_set_hud(nullptr);
         psx_savestate_menu_set_toast(nullptr);
         psx_savestate_menu_set_scale(1);

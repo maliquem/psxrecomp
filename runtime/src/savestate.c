@@ -877,6 +877,14 @@ void savestate_status_json(char* buf, size_t cap) {
              s_status_last_slot);
 }
 
+void savestate_status_get(uint32_t* generation, int* pending, int* last_ok,
+                          int* last_slot) {
+    if (generation) *generation = s_status_generation;
+    if (pending) *pending = s_status_pending;
+    if (last_ok) *last_ok = s_status_last_ok;
+    if (last_slot) *last_slot = s_status_last_slot;
+}
+
 int savestate_take_load_completed(void) {
     int v = s_load_completed;
     s_load_completed = 0;
