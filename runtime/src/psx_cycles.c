@@ -17,6 +17,8 @@
 #if defined(PSX_HAS_RECOMP_NET)
 #include "psx_netplay.h"
 #endif
+#define PSX_EDGE_IMPL
+#include "psx_edge.h"   /* g_psx_idle_edge */
 #ifdef PSX_COSIM
 #include "cosim_state.h"
 #endif
@@ -351,9 +353,13 @@ static void psx_devices_recompute_deadline(void) {
     psx_next_service_cycle = psx_cycle_count + (uint64_t)next;
 }
 
+/* TCP core_rates: how often the devices are serviced, and why. */
+uint64_t g_psx_svc_calls = 0, g_psx_mmio_sync_calls = 0;
+
 void psx_devices_service_to_now(void) {
     if (g_psx_guest_time_frozen) { psx_cycle_freeze_tick(); return; }
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    g_psx_svc_calls++;
     if (g_plp_cycle_diag) g_plp_svc_calls++;
     g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
@@ -415,6 +421,7 @@ void psx_devices_service_to_now(void) {
  * advance through service_to_now even when already synced — MotK FMV pays
  * that on every GPU/CD/MDEC MMIO touch. Recompute here instead. */
 void psx_devices_mmio_sync(void) {
+    g_psx_mmio_sync_calls++;
     psx_cyc_batch_flush();
     if (g_psx_guest_time_frozen) { psx_cycle_freeze_tick(); return; }
     if (s_devices_synced_cycle != psx_cycle_count) {
@@ -586,17 +593,21 @@ uint32_t g_idle_skip_last_quantum = 0;
  * delivery still runs normally. */
 int g_idle_note_suppress = 0;
 
-static uint32_t s_idle_pc = 0;
-static uint32_t s_idle_quantum = 0;
-static uint32_t s_idle_streak = 0;
-static int      s_idle_have_snap = 0; /* GPR snapshot valid for s_idle_pc */
+/* The detector's restart state lives in g_psx_idle_edge (psx_edge.h): the
+ * inline block-edge check restarts the detector on a new candidate PC itself,
+ * exactly as the last branch of psx_idle_note_check does. */
+PsxIdleEdge g_psx_idle_edge = { .progress_reg = -2, .store_addr = 0xFFFFFFFFu };
+#define s_idle_pc             g_psx_idle_edge.pc
+#define s_idle_quantum        g_psx_idle_edge.quantum
+#define s_idle_streak         g_psx_idle_edge.streak
+#define s_idle_have_snap      g_psx_idle_edge.have_snap      /* GPR snapshot valid for s_idle_pc */
+#define s_idle_progress_reg   g_psx_idle_edge.progress_reg   /* -2 unknown, -1 stable, 1..31 countdown */
+#define s_idle_progress_delta g_psx_idle_edge.progress_delta
+#define s_idle_last_cycle     g_psx_idle_edge.last_cycle
+#define s_idle_last_stores    g_psx_idle_edge.last_stores
+#define s_idle_last_mmio      g_psx_idle_edge.last_mmio
 static uint32_t s_idle_gpr[32];
 static uint32_t s_idle_hi = 0, s_idle_lo = 0;
-static int      s_idle_progress_reg = -2; /* -2 unknown, -1 stable, 1..31 countdown */
-static int32_t  s_idle_progress_delta = 0;
-static uint64_t s_idle_last_cycle = 0;
-static uint64_t s_idle_last_stores = 0;
-static uint64_t s_idle_last_mmio = 0;
 
 static void idle_snapshot_regs(const CPUState *cpu) {
     for (int i = 1; i < 32; i++) s_idle_gpr[i] = cpu->gpr[i];
@@ -653,19 +664,26 @@ static const uint32_t s_no_store = 0xFFFFFFFFu;
 static int            *s_track = &s_track_dummy;
 static const uint32_t *s_last_addr = &s_no_store, *s_last_val = &s_no_store;
 static void (*s_idle_host_write)(uint32_t addr, uint32_t val) = NULL;
-void psx_idle_skip_set_host_writer(void (*w)(uint32_t, uint32_t)) { s_idle_host_write = w; }
+static void idle_ext_wired_update(void) {
+    g_psx_idle_edge.ext_wired = s_idle_host_write != NULL && s_track != &s_track_dummy;
+}
+void psx_idle_skip_set_host_writer(void (*w)(uint32_t, uint32_t)) {
+    s_idle_host_write = w;
+    idle_ext_wired_update();
+}
 void psx_idle_skip_set_store_tracker(int *gate, const uint32_t *addr, const uint32_t *val) {
     s_track = gate ? gate : &s_track_dummy;
     s_last_addr = addr ? addr : &s_no_store;
     s_last_val = val ? val : &s_no_store;
+    idle_ext_wired_update();
 }
 enum { IDLE_EDGES_MAX = 8, IDLE_SITES_MAX = 16 };
 /* Audited sites. The detector proves the loop's shape over the passes it
  * sees; it cannot prove that no later counter-dependent exit exists (an exit
  * at counter == 500 would be skipped over). Only sites a developer audited
  * and declared are eligible. */
-static uint32_t s_idle_sites[IDLE_SITES_MAX];
-static int      s_idle_site_count = 0;
+#define s_idle_sites      g_psx_idle_edge.sites
+#define s_idle_site_count g_psx_idle_edge.site_count
 void psx_idle_skip_set_store_counter_sites(const uint32_t *pcs, int n) {
     if (n < 0 || !pcs) n = 0;
     if (n > IDLE_SITES_MAX) n = IDLE_SITES_MAX;
@@ -677,11 +695,11 @@ static int idle_site_listed(uint32_t pc) {
         if (s_idle_sites[i] == pc) return 1;
     return 0;
 }
-static uint32_t s_idle_edges = 0;          /* non-anchor edges since the anchor */
+#define s_idle_edges g_psx_idle_edge.edges   /* non-anchor edges since the anchor */
 static uint32_t s_idle_iter_edges = 0;     /* edges in the last whole iteration */
-static uint32_t s_idle_store_addr = 0xFFFFFFFFu;
+#define s_idle_store_addr   g_psx_idle_edge.store_addr
 static uint32_t s_idle_store_val = 0;
-static int      s_idle_mem_progress = 0;
+#define s_idle_mem_progress g_psx_idle_edge.mem_progress
 
 static int idle_skip_ext_on(void) {
     if (g_idle_skip_ext < 0) {

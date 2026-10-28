@@ -9,7 +9,7 @@ extern uint32_t g_debug_last_store_pc;
 
 /* "Armed" byte from the most recent SIO_RX_DATA read inside a card
  * data phase. The next matching RAM write captures it. */
-volatile int             g_card_data_writes_armed = 0;   /* memory.c psx_store_fast_ok reads it */
+volatile int             g_card_data_writes_armed = 0;   /* memory.c psx_store_fast_ptr reads it */
 static uint8_t           s_armed_value = 0;
 static uint16_t          s_armed_state = 0;
 static uint8_t           s_armed_idx   = 0;

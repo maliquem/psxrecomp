@@ -5,6 +5,7 @@
 #include "debug_server.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "psx_edge.h"   /* last: makes psx_check_interrupts_at the inline edge */
 
 #ifdef __cplusplus
 extern "C" {

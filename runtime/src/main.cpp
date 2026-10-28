@@ -862,15 +862,15 @@ static bool host_hotkey_input_focused(void) {
 }
 
 /* psx_mod_set_fast_forward_speed: a title's own speed for the manual
- * fast-forward (0 = none: PSX_FAST_FORWARD_SPEED or 4x). */
+ * fast-forward (0 = none: 4x). PSX_FAST_FORWARD_SPEED wins over both, as the
+ * other environment overrides do (measuring: "max" is the unbounded turbo). */
 static int g_mod_fast_forward_speed = 0;
 
 static int manual_fast_forward_multiplier(void) {
-    static int value = -2; /* -2 = unread, -1 = max/unbounded */
-    if (g_mod_fast_forward_speed) return g_mod_fast_forward_speed;
+    static int value = -2; /* -2 = unread, -1 = max/unbounded, 0 = no env */
     if (value == -2) {
         const char *e = std::getenv("PSX_FAST_FORWARD_SPEED");
-        value = 4;
+        value = 0;
         if (e && e[0]) {
             if (std::strcmp(e, "max") == 0 || std::strcmp(e, "MAX") == 0 ||
                 std::strcmp(e, "0") == 0) {
@@ -882,7 +882,8 @@ static int manual_fast_forward_multiplier(void) {
             }
         }
     }
-    return value;
+    if (value) return value;
+    return g_mod_fast_forward_speed ? g_mod_fast_forward_speed : 4;
 }
 
 static void post_load_probe_stall_pc_note(uint32_t pc) {

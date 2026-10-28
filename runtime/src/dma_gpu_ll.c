@@ -44,6 +44,57 @@ uint32_t dma_gpu_ll_cycles_to_event(const DMAGPULinkedList *state) {
     return state->cycles_remaining ? state->cycles_remaining : 1u;
 }
 
+/* The walk below run on a copy, reading headers with `peek` (no side
+ * effects): the clocks dma_gpu_ll_advance needs to reach the walk's end from
+ * this state, as long as the list's words do not change on the way. 0 when
+ * it ends beyond `cap` clocks or a header cannot be peeked. */
+uint32_t dma_gpu_ll_cycles_to_finish(const DMAGPULinkedList *state,
+                                     const DMAGPULinkedListOps *ops, void *opaque,
+                                     int (*peek)(uint32_t addr, uint32_t *out),
+                                     uint32_t cap) {
+    if (!state->active || !peek) return 0;
+    DMAGPULinkedList s = *state;
+    uint64_t t = 0;
+    for (;;) {
+        t += s.cycles_remaining;
+        if (t > cap) return 0;
+        if (s.phase == DMA_GPU_LL_PHASE_HEADER) {
+            if (s.nodes_processed >= s.max_nodes) return (uint32_t)t;
+            s.current_addr = resolve_address(ops, opaque, s.current_addr);
+            uint32_t header;
+            if (!peek(s.current_addr, &header)) return 0;
+            s.word_count = header >> 24;
+            s.payload_index = 0;
+            s.next_addr = header & 0x00FFFFFFu;
+            s.nodes_processed++;
+            if (s.word_count != 0) {
+                s.phase = DMA_GPU_LL_PHASE_SETUP;
+                s.cycles_remaining = DMA_GPU_LL_SETUP_CYCLES;
+            } else {
+                if (s.next_addr == 0x00FFFFFFu) return (uint32_t)t;
+                s.current_addr = resolve_address(ops, opaque, s.next_addr);
+                s.cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
+            }
+        } else if (s.phase == DMA_GPU_LL_PHASE_SETUP) {
+            s.phase = DMA_GPU_LL_PHASE_PAYLOAD;
+            s.cycles_remaining = 1u;
+        } else if (s.phase == DMA_GPU_LL_PHASE_PAYLOAD) {
+            s.payload_index++;
+            if (s.payload_index < s.word_count) {
+                s.cycles_remaining = 1u;
+            } else if (s.next_addr == 0x00FFFFFFu) {
+                return (uint32_t)t;
+            } else {
+                s.phase = DMA_GPU_LL_PHASE_HEADER;
+                s.current_addr = resolve_address(ops, opaque, s.next_addr);
+                s.cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
+            }
+        } else {
+            return (uint32_t)t;
+        }
+    }
+}
+
 void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
                         const DMAGPULinkedListOps *ops, void *opaque) {
     if (!state->active || cycles == 0 || !ops || !ops->read_word) return;

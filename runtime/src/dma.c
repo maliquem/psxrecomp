@@ -847,6 +847,25 @@ static uint64_t hold_host_ticks_per_sec(void) {
 #endif
 }
 
+/* While the CPU is held and no other DMA moves RAM, the list's words cannot
+ * change under the walk: its end is known in advance (dma_gpu_ll_cycles_to_
+ * finish), and the hold advances there in one go. Its word reads are then
+ * not device events (dma_cycles_to_internal_event leaves them out): the other
+ * devices are advanced in spans bounded by their own events, exactly as the
+ * deadline path does between events, instead of one span per list word
+ * (thousands per frame: every one swept all six devices). The walk itself
+ * runs word by word inside dma_gpu_ll_advance as before; GPU word handling
+ * does not read the guest clock. PSX_DMA_LL_BULK=0: one word per span. */
+static int s_ll_bulk;   /* walker words are not device events */
+static int ll_bulk_enabled(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *v = getenv("PSX_DMA_LL_BULK");
+        e = !(v && v[0] == '0');
+    }
+    return e;
+}
+
 static void hold_cpu_for_gpu_linked_list(void) {
     if (psx_in_device_service || g_ls_replay_active || g_psx_guest_time_frozen)
         return;
@@ -857,8 +876,20 @@ static void hold_cpu_for_gpu_linked_list(void) {
     while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
            channel_enabled(2)) {
         const uint32_t moved = gpu_linked_list.total_words;
-        psx_advance_cycles(dma_gpu_ll_cycles_to_event(&gpu_linked_list));
-        psx_devices_service_to_now();
+        uint32_t fin = 0;
+        if (ll_bulk_enabled() && !mdec_async[0].active && !mdec_async[1].active &&
+            !cdrom_async.active)
+            fin = dma_gpu_ll_cycles_to_finish(&gpu_linked_list, &gpu_ll_ops, NULL,
+                                              psx_peek_word, 1u << 24);
+        if (fin > 1u) {
+            s_ll_bulk = 1;
+            psx_advance_cycles(fin);
+            s_ll_bulk = 0;
+            psx_devices_service_to_now();   /* the deadline again, with the walker */
+        } else {
+            psx_advance_cycles(dma_gpu_ll_cycles_to_event(&gpu_linked_list));
+            psx_devices_service_to_now();
+        }
         steps++;
         if (gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
     }
@@ -1226,7 +1257,7 @@ uint32_t dma_cycles_to_internal_event(void) {
     }
 
     if (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
-        channel_enabled(2)) {
+        channel_enabled(2) && !s_ll_bulk) {
         uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
         if (d < best) best = d;
     }

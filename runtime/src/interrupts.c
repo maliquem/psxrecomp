@@ -200,8 +200,10 @@ static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycle
 extern uint64_t g_vblank_raise_count;
 extern int g_cosim_dirty_pump_site;
 
-/* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
-static int in_exception;
+/* Reentrancy guard: prevent interrupt handler from triggering interrupts.
+ * Exported (with the edge state below) for psx_edge.h's inline edge check. */
+int g_psx_in_exception;
+#define in_exception g_psx_in_exception
 /* Guest-cycle deadline: IRQ delivery is blocked while psx_get_cycle_count() is
  * below this. 0 = no cooldown active. Counted in guest cycles (not calls) so both
  * backends make the identical delivery decision — see the cooldown constants. */
@@ -632,11 +634,14 @@ extern int g_psx_dispatch_depth;
  * the synchronous host window, dirty_ram_dispatch can resume at this guest PC
  * instead of treating the sentinel as pc=0 termination. */
 static uint32_t s_compiled_interrupt_resume_pc = 0;
-static uint32_t s_last_interrupt_check_pc = 0;
-static uint64_t s_last_interrupt_check_cycle = UINT64_MAX;
+uint32_t g_psx_last_interrupt_check_pc = 0;
+uint64_t g_psx_last_interrupt_check_cycle = UINT64_MAX;
+#define s_last_interrupt_check_pc g_psx_last_interrupt_check_pc
+#define s_last_interrupt_check_cycle g_psx_last_interrupt_check_cycle
 /* Poll-throttle counter for fast IRQ paths — host-only; must not survive
  * rewind or load#N can hit the 16K poll edge at a different guest point. */
-static uint32_t s_fast_maintenance = 0;
+uint32_t g_psx_irq_fast_maintenance = 0;
+#define s_fast_maintenance g_psx_irq_fast_maintenance
 
 uint32_t psx_last_irq_check_pc(void) { return s_last_interrupt_check_pc; }
 uint32_t psx_compiled_irq_resume_pc(void) { return s_compiled_interrupt_resume_pc; }
@@ -734,7 +739,8 @@ void psx_irq_arm_compiled_resume_pc(uint32_t pc)
  * detected nested, we record it here, let the outgoing thread resume
  * transparently, and honor it at the next outermost block-leader boundary (top
  * of psx_check_interrupts) where the thread can be re-saved cleanly. */
-static int      s_defer_switch_pending = 0;
+int             g_psx_defer_switch_pending = 0;
+#define s_defer_switch_pending g_psx_defer_switch_pending
 static uint32_t s_defer_switch_target  = 0;  /* TCB PCB[0] should name after the switch */
 static uint32_t s_defer_switch_from    = 0;  /* the interrupted thread to re-save cleanly */
 

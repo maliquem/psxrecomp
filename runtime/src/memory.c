@@ -645,12 +645,29 @@ int dirty_ram_text_native_ok(uint32_t phys) {
  * clipped-away region, executing stale static code (CMR2 overlay
  * corruption, second locus 0x80016B34). A genuinely patched prologue now
  * blocks the whole entry to the interpreter — correct, merely slower. */
+/* The game path validates an entry twice in a row: dirty_ram_dispatch_inner's
+ * psx_game_text_native_ok, then psx_dispatch_game_compiled just before the
+ * call, with no guest instruction between. The last success is remembered
+ * with what would show any change of RAM or code since (guest stores, which
+ * DMA needs to start; charged cycles, which every instruction and a running
+ * DMA needs; the code generation); while all are unchanged the same ranges
+ * hold the same bytes and the answer is the same. */
+static const uint32_t *s_text_ok_pairs;
+static uint32_t s_text_ok_count, s_text_ok_batch, s_text_ok_codegen;
+static uint64_t s_text_ok_cycle, s_text_ok_stores;
+extern uint64_t g_guest_store_count;   /* below: every guest and host store */
+
 int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                          uint32_t count,
                                          uint32_t exec_pc) {
     if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
     if (dirty_ram_force_interp()) return 0;
     (void)exec_pc;
+    if (lo_len_pairs == s_text_ok_pairs && count == s_text_ok_count &&
+        psx_cycle_count == s_text_ok_cycle && g_psx_cyc_batch == s_text_ok_batch &&
+        g_guest_store_count == s_text_ok_stores && g_dirty_ram_code_gen == s_text_ok_codegen &&
+        !(g_psx_cyc_local_acc && *g_psx_cyc_local_acc))
+        return 1;
     int any = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
@@ -701,6 +718,12 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
         g_text_native_blocked++;
         return 0;
     }
+    s_text_ok_pairs = lo_len_pairs;
+    s_text_ok_count = count;
+    s_text_ok_cycle = psx_cycle_count;
+    s_text_ok_batch = g_psx_cyc_batch;
+    s_text_ok_stores = g_guest_store_count;
+    s_text_ok_codegen = g_dirty_ram_code_gen;
     return 1;
 }
 
@@ -1334,7 +1357,25 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
 /* Thin wrapper: record the loaded value into the MMIO-READ trace ring AFTER the
  * single (side-effecting) read. Callers use mmio_read32; the body is _impl, so
  * the device read executes exactly once. */
+/* TCP core_rates: device register accesses by region (reads 0..7, writes
+ * 8..15): memory control and SIO, interrupts, DMA, timers, CD-ROM, GPU,
+ * MDEC, SPU and the rest. */
+uint64_t g_psx_mmio_hist[16];
+static inline void mmio_hist(uint32_t addr, int write) {
+    const uint32_t a = addr & 0x1FFFFFFFu;
+    int r = 7;
+    if (a < 0x1F801070u) r = 0;
+    else if (a < 0x1F801080u) r = 1;
+    else if (a < 0x1F801100u) r = 2;
+    else if (a < 0x1F801800u) r = 3;
+    else if (a < 0x1F801810u) r = 4;
+    else if (a < 0x1F801820u) r = 5;
+    else if (a < 0x1F801830u) r = 6;
+    g_psx_mmio_hist[r + (write ? 8 : 0)]++;
+}
+
 static uint32_t mmio_read32(uint32_t addr) {
+    mmio_hist(addr, 0);
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 4)) return 0;
     psx_devices_mmio_sync();
     uint32_t v = mmio_read32_impl(addr);
@@ -1343,6 +1384,7 @@ static uint32_t mmio_read32(uint32_t addr) {
 }
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
+    mmio_hist(addr, 1);
     psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, val, 4);
@@ -1458,6 +1500,7 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
 }
 
 static uint16_t mmio_read16(uint32_t addr) {
+    mmio_hist(addr, 0);
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 2)) return 0;
     psx_devices_mmio_sync();
     uint16_t v = mmio_read16_impl(addr);
@@ -1466,6 +1509,7 @@ static uint16_t mmio_read16(uint32_t addr) {
 }
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
+    mmio_hist(addr, 1);
     psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
@@ -1578,6 +1622,7 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
 }
 
 static uint8_t mmio_read8(uint32_t addr) {
+    mmio_hist(addr, 0);
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 1)) return 0;
     psx_devices_mmio_sync();
     uint8_t v = mmio_read8_impl(addr);
@@ -1586,6 +1631,7 @@ static uint8_t mmio_read8(uint32_t addr) {
 }
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
+    mmio_hist(addr, 1);
     psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
@@ -1972,7 +2018,8 @@ static void render_pass_store(uint32_t addr, uint32_t val, uint32_t width) {
 }
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
-/* The plain main-RAM store (psx_store_fast_ok, below): taken after the overlay
+extern uint64_t g_psx_store_raw[3];   /* TCP core_rates, below */
+/* The plain main-RAM or scratchpad store (psx_store_fast_ptr, below): taken after the overlay
  * cycles are published, when nothing else here would do more than write. */
 static inline int psx_store_try_word(uint32_t addr, uint32_t val);
 static inline int psx_store_try_half(uint32_t addr, uint16_t val);
@@ -1995,6 +2042,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
+    g_psx_store_raw[(addr & 0x1FFFFFFFu) >= PSX_MAIN_RAM_WINDOW_BYTES ? 2 : g_dma_exec_depth > 0 ? 1 : 0]++;
     if (g_psx_track_last_store) {
         g_guest_last_store_addr = addr;
         g_guest_last_store_val = val;
@@ -2211,6 +2259,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 }
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     g_guest_store_count++;
+    g_psx_store_raw[(addr & 0x1FFFFFFFu) >= PSX_MAIN_RAM_WINDOW_BYTES ? 2 : g_dma_exec_depth > 0 ? 1 : 0]++;
     if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
     if (cpu_store_isolated()) { isc_store(addr, val, 2); return; }
 
@@ -2592,6 +2641,7 @@ void psx_host_write_byte(uint32_t addr, uint8_t val) {
 
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     g_guest_store_count++;
+    g_psx_store_raw[(addr & 0x1FFFFFFFu) >= PSX_MAIN_RAM_WINDOW_BYTES ? 2 : g_dma_exec_depth > 0 ? 1 : 0]++;
     if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
     if (cpu_store_isolated()) { isc_store(addr, val, 1); return; }
 
@@ -2657,63 +2707,89 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
  * as psx_write_* does), no render pass, lockstep, data-shard recording, DMA or host store,
  * cache isolation or armed recorder, and a page no code watcher acts on
  * (executed code whose evidence a write clears, a watched overlay page, game
- * text not yet seen modified). Everything else takes cpu->write_*. */
+ * text not yet seen modified unless the store writes the image's own bytes).
+ * Everything else takes cpu->write_*. */
 extern int g_parity_trace_armed;               /* parity_trace.c */
 extern volatile int g_card_data_writes_armed;  /* card_data_writes.c */
 
-static inline int psx_store_fast_ok(uint32_t addr, uint32_t size, uint32_t *off_out) {
-    if (addr >= 0xC0000000u || (addr & (size - 1u))) return 0;
+/* TCP core_rates: stores the short path left to cpu->write_* past its
+ * global gates, by page kind: kernel window, executed RAM code, watched
+ * overlay page, game text not yet seen modified. */
+uint64_t g_psx_store_slow[4];
+/* Stores that reached the full path: RAM by the CPU or a host, RAM by DMA,
+ * anything else (I/O, scratchpad, BIOS). */
+uint64_t g_psx_store_raw[3];
+
+/* Where a plain store may go directly: main RAM (above the kernel window, on
+ * a page no code watcher acts on) or the scratchpad, which the full path
+ * writes with nothing else to do (no mod aperture reaches 0x1F800000; the
+ * debug trace and the DMA/host PGXP drop are behind the gates). NULL: the
+ * full path (cpu->write_*). */
+static inline uint8_t *psx_store_fast_ptr(uint32_t addr, uint32_t size, uint32_t val) {
+    if (addr >= 0xC0000000u || (addr & (size - 1u))) return NULL;
     const uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys >= PSX_MAIN_RAM_WINDOW_BYTES) return 0;
+    const uint32_t so = phys - 0x1F800000u;
+    if (phys >= PSX_MAIN_RAM_WINDOW_BYTES && so > (uint32_t)SCRATCHPAD_SIZE - size) return NULL;
     if (g_psx_render_pass_active || g_ls_mode != 0 ||
         g_ds_recording || g_dma_exec_depth > 0 || g_host_store_depth > 0 ||
         g_parity_trace_armed || g_card_data_writes_armed ||
         (sr_ptr && (*sr_ptr & 0x10000u)))
-        return 0;
+        return NULL;
 #ifndef PSX_NO_DEBUG_TOOLS
-    if (g_debug_write_trace_live) return 0;
+    if (g_debug_write_trace_live) return NULL;
 #endif
 #ifdef PSX_COSIM
-    return 0;
+    return NULL;
 #endif
+    if (phys >= PSX_MAIN_RAM_WINDOW_BYTES) return &scratchpad[so];
     const uint32_t off = phys & g_psx_ram_mask;
-    if (off < DIRTY_RAM_KERNEL_TRACK_BYTES) return 0;
+    if (off < DIRTY_RAM_KERNEL_TRACK_BYTES) { g_psx_store_slow[0]++; return NULL; }
     const uint32_t pg = off >> DIRTY_RAM_PAGE_SHIFT, bit = 1u << (pg & 31u);
-    if ((g_dirty_ram_exec_page_bitmap[pg >> 5] | overlay_watch_bitmap[pg >> 5]) & bit) return 0;
+    if (g_dirty_ram_exec_page_bitmap[pg >> 5] & bit) { g_psx_store_slow[1]++; return NULL; }
+    if (overlay_watch_bitmap[pg >> 5] & bit) { g_psx_store_slow[2]++; return NULL; }
     if (text_ref_image && off + size > text_ref_lo && off < text_ref_hi &&
-        !(text_modified_bitmap[pg >> 5] & bit))
-        return 0;
-    *off_out = off;
-    return 1;
+        !(text_modified_bitmap[pg >> 5] & bit)) {
+        /* Game text not yet seen modified (in BoF4 the executable's range
+         * holds hot data too): text_guard_note_write marks the page only for
+         * bytes that differ from the image, so a store of the image's own
+         * bytes is a plain store. (val's low `size` bytes, little-endian.) */
+        if (off < text_ref_lo || off + size > text_ref_hi ||
+            memcmp(text_ref_image + (off - text_ref_lo), &val, size) != 0) {
+            g_psx_store_slow[3]++;
+            return NULL;
+        }
+    }
+    if (size == 4u && off == D44_PHYS) return NULL;
+    return &ram[off];
 }
 
 static inline int psx_store_try_word(uint32_t addr, uint32_t val) {
-    uint32_t off;
-    if (!psx_store_fast_ok(addr, 4u, &off) || off == D44_PHYS) return 0;
+    uint8_t *p = psx_store_fast_ptr(addr, 4u, val);
+    if (!p) return 0;
     g_guest_store_count++;
     if (g_psx_track_last_store) {
         g_guest_last_store_addr = addr;
         g_guest_last_store_val = val;
     }
-    memcpy(&ram[off], &val, 4u);
+    memcpy(p, &val, 4u);
     return 1;
 }
 
 static inline int psx_store_try_half(uint32_t addr, uint16_t val) {
-    uint32_t off;
-    if (!psx_store_fast_ok(addr, 2u, &off)) return 0;
+    uint8_t *p = psx_store_fast_ptr(addr, 2u, val);
+    if (!p) return 0;
     g_guest_store_count++;
     if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
-    memcpy(&ram[off], &val, 2u);
+    memcpy(p, &val, 2u);
     return 1;
 }
 
 static inline int psx_store_try_byte(uint32_t addr, uint8_t val) {
-    uint32_t off;
-    if (!psx_store_fast_ok(addr, 1u, &off)) return 0;
+    uint8_t *p = psx_store_fast_ptr(addr, 1u, val);
+    if (!p) return 0;
     g_guest_store_count++;
     if (g_psx_track_last_store) g_guest_last_store_addr = 0xFFFFFFFFu;
-    ram[off] = val;
+    *p = val;
     return 1;
 }
 

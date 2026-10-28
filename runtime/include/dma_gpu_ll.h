@@ -44,6 +44,13 @@ void dma_gpu_ll_start(DMAGPULinkedList *state, uint32_t start_addr,
                       uint32_t max_nodes);
 void dma_gpu_ll_cancel(DMAGPULinkedList *state);
 uint32_t dma_gpu_ll_cycles_to_event(const DMAGPULinkedList *state);
+/* Clocks to the walk's end from this state, walking a copy with `peek` (no
+ * side effects); 0 beyond `cap` or when a header cannot be peeked. Valid while
+ * the list's words do not change (the CPU held, no other DMA writing RAM). */
+uint32_t dma_gpu_ll_cycles_to_finish(const DMAGPULinkedList *state,
+                                     const DMAGPULinkedListOps *ops, void *opaque,
+                                     int (*peek)(uint32_t addr, uint32_t *out),
+                                     uint32_t cap);
 void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
                         const DMAGPULinkedListOps *ops, void *opaque);
 

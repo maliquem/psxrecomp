@@ -5,6 +5,7 @@
  *
  * HIT path is inlined in psx_icache.h; this file owns reset + MISS refill.
  */
+#define PSX_ICACHE_IMPL   /* the real psx_icache_fetch, not the header's inline */
 #include "psx_icache.h"
 #include "cpu_state.h"
 #include "psx_cycles.h"
@@ -68,6 +69,8 @@ void psx_icache_reset(void) {
     for (int i = 0; i < 1024; i++) g_psx_icache_tv[i] = 0x1u;
 }
 
+uint64_t g_psx_icache_misses = 0;   /* TCP core_rates */
+
 void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
     { extern int g_ls_replay_active;
       /* Ordinary lockstep replay must not perturb the shared cache. The whole-
@@ -81,6 +84,7 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
     if (g_psx_icache_tv[idx] == addr) return;        /* HIT: +0, no give-back clear */
 
     /* MISS — clear the pending load give-back (Beetle cpu.cpp:542-543). */
+    g_psx_icache_misses++;
     cpu->read_absorb[cpu->read_absorb_which] = 0u;
     cpu->read_absorb_which = 0u;
 
@@ -148,10 +152,18 @@ void psx_icache_isc_store(uint32_t biu, uint32_t addr, uint32_t value) {
 #endif
 }
 
+/* The addressable fetch (overlay DLLs' callback, older objects): the tag
+ * compare first, as in psx_icache.h's inline; a hit changes nothing. */
 void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (g_psx_icache_tv[(addr & 0xFFCu) >> 2] == addr) return;
+#endif
     psx_icache_fetch_miss(cpu, addr);
 }
 
 void psx_icache_fetch_fn(CPUState* cpu, uint32_t addr) {
-    psx_icache_fetch(cpu, addr);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (g_psx_icache_tv[(addr & 0xFFCu) >> 2] == addr) return;
+#endif
+    psx_icache_fetch_miss(cpu, addr);
 }

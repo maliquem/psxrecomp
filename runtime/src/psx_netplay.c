@@ -19,6 +19,10 @@
 #include <string.h>
 #include <time.h>
 
+/* Set once a netplay session starts (never cleared): psx_edge.h's inline
+ * block-edge check then leaves every edge to psx_check_interrupts. */
+int g_psx_netplay_seen = 0;
+
 #if defined(_WIN32)
 #include <direct.h>
 #include <windows.h>
@@ -4408,6 +4412,7 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
      * were on FBO-auth OpenGL (ensure_cpu no-ops once netplay is active). */
     psx_frontend_netplay_force_sw_gpu();
     g_np.active = 1;
+    g_psx_netplay_seen = 1;   /* psx_edge.h: the inline edge check steps aside */
     netplay_hc_reset(&g_np.hc);
     np_part_ring_reset();
     g_np.rollback = cfg->rollback ? 1 : 0;

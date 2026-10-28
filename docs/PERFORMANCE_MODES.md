@@ -135,7 +135,7 @@ and sound):
   the same pipeline sequence the slow path ran;
 - overlay DLL loads go to host entries that run those inline paths
   (`psx_cyc_load_*_host`), not the slow path;
-- the plain main-RAM store (`psx_store_fast_ok`) is tried inside
+- the plain main-RAM store (`psx_store_fast_ptr`) is tried inside
   `psx_write_word/half/byte` too, after the overlay's pending cycles are
   published, so overlay DLL stores and the executable's stores made while an
   overlay is active take it;
@@ -151,6 +151,53 @@ and sound):
   while the render thread is behind (`PSX_TURBO_PRESENT_SKIP=0`: the old
   fixed cadence); the debug display ring copies VRAM only while a recorder is
   on.
+
+Cycle 5 (2026-10-27), the same checks plus a cold boot through the opening
+movie. Profiled first: on Breath of Fire IV only ~7% of the emulation thread
+was the game's own compiled code; the rest was work around it.
+
+- **GPU linked-list hold in one span** (`dma.c`): a GP0 linked-list kick holds
+  the CPU until the walk ends. The walk used one device event per list word,
+  and every event advanced all six devices and recomputed the deadline
+  (4-11 thousand device services per VBlank). With the CPU held and no other
+  DMA moving RAM the list cannot change, so `dma_gpu_ll_cycles_to_finish` walks
+  a copy (`psx_peek_word`, no side effects) to find the end, the hold advances
+  there at once, and while it does the walker's words are not device events:
+  the other devices advance in spans bounded by their own events, as the
+  deadline path does between events. GPU word handling does not read the guest
+  clock. `PSX_DMA_LL_BULK=0`: one word per span.
+- **Block-edge interrupt check inline** (`psx_edge.h`, included last by
+  `psx_runtime.h`): the edge's common case (nothing deliverable, outside the
+  handler, no thread switch, no netplay/self-check, not the 16K-th edge) and the
+  idle detector's restart on a new candidate PC are written in place; anything
+  else calls `psx_check_interrupts_at`, which starts from the top as before.
+- **I-cache tag compare inline** (`psx_icache.h`): a hit changes nothing, so
+  only a miss calls `psx_icache_fetch_miss`; the overlay callback compares
+  first too.
+- **Scratchpad stores** take the direct store path (they went through the
+  whole slow path: ~17 thousand per VBlank in a 3D scene); main-RAM stores into
+  game text not yet seen modified take it when they write the image's own
+  bytes (`text_guard_note_write` would not mark the page).
+- **Renderer VRAM reads** (`gpu_vram_peek`): `gpu.c` keeps the 16x16 cells the
+  GPU may have drawn since the last read through the renderer (drawing area of
+  each drawing command, fill and copy destinations); elsewhere its own array
+  holds the same pixels and is read without a render-thread sync. A title that
+  polled VRAM every VBlank waited for the whole render queue each time. TCP
+  `vram_drawn_check` proves the cells (pixels outside them that a renderer read
+  changes: 0 in every scene tried).
+- **Dispatcher**: the second range validation of the same entry, right after
+  the first with no store, charged cycle or code change between, is answered
+  from the first.
+- Debug builds: the per-function-entry recorders return at once when nothing
+  records (passive policy, cyc_watch, call focus, function trace).
+- `PSX_FAST_FORWARD_SPEED` now wins over a title's own turbo speed (measuring
+  with "max": a title cap of 8x had hidden the field's real speed).
+- TCP `core_rates`: per-event work counters (device services, MMIO syncs and
+  register accesses by region, stores by path, dispatches, I-cache misses).
+
+Measured on BoF4 (16:9, 8x, turbo uncapped), PGO + ThinLTO with the same
+profile, against the build before: barco +15-29%, battle +29-35%, dungeon
++24-30%, magic +34-40%, field 7.8x (held at the title's 8x cap) -> 13.3x.
 
 ## Measured on Breath of Fire IV (2026-10-26)
 

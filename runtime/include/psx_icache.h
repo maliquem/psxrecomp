@@ -49,6 +49,22 @@ static inline void psx_icache_fetch_interp(CPUState *cpu, uint32_t addr) {
 #endif
 }
 
+/* Compiled code's fetch (the emitters write psx_icache_fetch at every line
+ * leader): the tag compare inline, as a hit is +0 and changes nothing; a
+ * miss, an inactive or not yet read model and lockstep replay take the
+ * shared path, which decides exactly as before (reset tags are 0x1, never a
+ * fetch address). Overlay DLLs keep their callback; psx_icache.c defines the
+ * addressable function. */
+#if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_ICACHE_IMPL)
+static inline void psx_icache_fetch_inline(CPUState *cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (__builtin_expect(g_psx_icache_tv[(addr & 0xFFCu) >> 2] == addr, 1)) return;
+#endif
+    psx_icache_fetch_miss(cpu, addr);
+}
+#define psx_icache_fetch(cpu, addr) psx_icache_fetch_inline((cpu), (addr))
+#endif
+
 #ifdef __cplusplus
 }
 #endif

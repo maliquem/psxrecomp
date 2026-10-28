@@ -4061,6 +4061,36 @@ static uint32_t texture_disable;   /* bit 15 */
 static uint32_t draw_area_left, draw_area_top;
 static uint32_t draw_area_right, draw_area_bottom;
 
+/* Where the GPU may have drawn since the last read through the renderer, in
+ * 16x16 cells (64 x 32, one bit each): the drawing area of every drawing
+ * command, fill and copy destinations. CPU uploads write this array and the
+ * renderer alike, so outside these cells the array already holds what the
+ * renderer has, and gpu_vram_peek there needs no renderer read. With the
+ * render thread, a renderer read is a sync point: the emulation thread waits
+ * for the whole queue (a title polling VRAM every VBlank waited 1-3 ms). */
+static uint64_t s_gpu_drawn[32];
+static int      s_gpu_drawn_area = 1;   /* the drawing area is not marked yet */
+
+static void gpu_drawn_mark(int x0, int y0, int x1, int y1) {
+    if (x1 < x0 || y1 < y0) return;
+    uint64_t cols;
+    if (x1 > 1023 || (x1 >> 4) - (x0 >> 4) >= 63) cols = ~0ull;   /* wraps or all */
+    else {
+        const int c0 = x0 >> 4, c1 = x1 >> 4;
+        cols = ((1ull << (c1 - c0 + 1)) - 1ull) << c0;
+    }
+    if (y0 > 511 || y1 > 511) { y0 = 0; y1 = 511; }   /* wraps */
+    for (int r = y0 >> 4; r <= (y1 >> 4); r++) s_gpu_drawn[r] |= cols;
+}
+
+/* A drawing command: the GPU clips it to the drawing area. */
+static inline void gpu_drawn_note_draw(void) {
+    if (!s_gpu_drawn_area) return;
+    s_gpu_drawn_area = 0;
+    gpu_drawn_mark((int)draw_area_left, (int)draw_area_top,
+                   (int)draw_area_right, (int)draw_area_bottom);
+}
+
 static int draw_area_intersects_rect(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0)
         return 0;
@@ -6787,6 +6817,7 @@ static void gp0_exec_fill_rect(void) {
     /* Fill ignores draw area, mask bits, and draw offset — writes directly to
      * VRAM. Routed through the renderer so it also fills the hi-res
      * supersampling mirror (no-op cost when supersampling is off). */
+    gpu_drawn_mark((int)dst_x, (int)dst_y, (int)(dst_x + width) - 1, (int)(dst_y + height) - 1);
     gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
     gpu_timeline_note(GTL_FILL, dst_x | (dst_y << 16), width | (height << 16));
 
@@ -6840,6 +6871,7 @@ static void gp0_exec_draw_area_tl(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_left = param & 0x3FF;
     draw_area_top  = (param >> 10) & 0x3FF;
+    s_gpu_drawn_area = 1;
     split_trace_note_draw_area();
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
@@ -6854,6 +6886,7 @@ static void gp0_exec_draw_area_br(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_right  = param & 0x3FF;
     draw_area_bottom = (param >> 10) & 0x3FF;
+    s_gpu_drawn_area = 1;
     split_trace_note_draw_area();
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
@@ -8818,6 +8851,7 @@ static void gp0_execute_command(void) {
 
     /* Draw-census: capture every drawing primitive's first vertex + camera. */
     if (opcode >= 0x20 && opcode <= 0x7F) {
+        gpu_drawn_note_draw();
         int32_t cvx, cvy;
         parse_vertex(gp0_cmd_buf[1], &cvx, &cvy);
         ws_census_record(opcode, cvx, cvy);
@@ -8989,6 +9023,7 @@ static void gp0_dispatch_command(uint8_t opcode) {
             int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
             if (w == 0) w = 0x400;
             if (h == 0) h = 0x200;
+            gpu_drawn_mark(dst_x, dst_y, dst_x + w - 1, dst_y + h - 1);
             gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
             break;
         }
@@ -9057,8 +9092,35 @@ void gpu_get_draw_area(GpuDrawArea* out) {
 
 uint16_t gpu_vram_peek(int x, int y) {
     if (x < 0 || x >= 1024 || y < 0 || y >= 512) return 0;
-    /* Through the facade so the GL backend syncs its FBO down first. */
-    return gr_vram_read(x, y);
+    if (!((s_gpu_drawn[y >> 4] >> (x >> 4)) & 1u))
+        return vram[y * 1024 + x];
+    /* Through the facade so the GL backend syncs its FBO down first: after
+     * it every GPU write so far is in this array. */
+    const uint16_t c = gr_vram_read(x, y);
+    memset(s_gpu_drawn, 0, sizeof s_gpu_drawn);
+    s_gpu_drawn_area = 1;
+    return c;
+}
+
+/* TCP vram_drawn_check: the proof of the cells above. Keeps this array's
+ * pixels outside them, reads through the renderer (every GPU write lands
+ * here) and counts the kept pixels that changed: a GPU write the cells
+ * missed. Also how many cells were marked. */
+void gpu_vram_drawn_check(uint32_t *checked, uint32_t *changed, uint32_t *cells) {
+    static uint16_t keep[1024 * 512];
+    uint32_t n = 0, d = 0, m = 0;
+    for (int r = 0; r < 32; r++) m += (uint32_t)__builtin_popcountll(s_gpu_drawn[r]);
+    memcpy(keep, vram, sizeof keep);
+    (void)gr_vram_read(0, 0);
+    for (int y = 0; y < 512; y++)
+        for (int x = 0; x < 1024; x++) {
+            if ((s_gpu_drawn[y >> 4] >> (x >> 4)) & 1u) continue;
+            n++;
+            if (keep[y * 1024 + x] != vram[y * 1024 + x]) d++;
+        }
+    memset(s_gpu_drawn, 0, sizeof s_gpu_drawn);
+    s_gpu_drawn_area = 1;
+    *checked = n; *changed = d; *cells = m;
 }
 
 /* psx_mod_vram_write: a title's own pixels, as an unmasked CPU->VRAM copy,

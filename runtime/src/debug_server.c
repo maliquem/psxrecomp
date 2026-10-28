@@ -2076,6 +2076,7 @@ void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
+static volatile int s_cyc_watch_armed;   /* defined with cyc_watch below */
 
 /* Last guest function ENTERED, fed unconditionally at every compiled entry
  * (one u32 store). The wall-time sampler's static histogram keys on THIS, not
@@ -2114,6 +2115,11 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
     if (s_fmv_quiet) return;
+    /* Nothing records an entry (no passive recorders, cyc_watch, call focus,
+     * function trace or recursion self-test armed): the rest is bookkeeping. */
+    if (!s_passive && !s_cyc_watch_armed && !s_call_focus && !s_fn_trace_active &&
+        !s_synth_recurse_armed)
+        return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
@@ -2128,8 +2134,10 @@ void debug_server_log_call_entry(uint32_t func_addr) {
         ls_suppress_end();
         return;
     }
-    card_mgr_trace_record(func_addr, 0);
-    sreg_trace_record(func_addr);
+    if (s_passive) {   /* look-back recorders: the passive policy (2 guest reads per entry) */
+        card_mgr_trace_record(func_addr, 0);
+        sreg_trace_record(func_addr);
+    }
     call_focus_record(func_addr);
     if (!s_fn_entry) { ls_suppress_end(); return; }
     if (!fn_trace_in_filter(func_addr)) { ls_suppress_end(); return; }
@@ -5985,6 +5993,62 @@ static void handle_cycles_to_next_event(int id, const char *json)
              "\"cycles_to_next_event\":%u,"
              "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u}",
              id, i_stat, i_mask, agg, t, c, d, s);
+}
+
+/* core_rates: cumulative counts of the emulation core's per-event work, to be
+ * differenced over a window (tools: per VBlank): device services and MMIO
+ * syncs, the out-of-line interrupt checks (block edges the inline in
+ * psx_edge.h passed on, plus every other caller), dispatcher iterations,
+ * I-cache misses, idle skips. */
+static void handle_core_rates(int id, const char *json)
+{
+    (void)json;
+    extern uint64_t g_psx_svc_calls, g_psx_mmio_sync_calls, g_psx_icache_misses;
+    extern uint64_t g_disp_tail_seq, g_idle_skip_count, g_idle_skip_cycles;
+    extern uint64_t psx_get_cycle_count(void);
+    extern uint64_t g_psx_store_slow[4], g_psx_store_raw[3], g_guest_store_count;
+    extern uint64_t g_psx_mmio_hist[16];
+#define H(i) (unsigned long long)g_psx_mmio_hist[i]
+    extern uint64_t overlay_loader_gen_fastpath(void);
+    extern void overlay_loader_get_reload_debug(int*, uint32_t*, uint32_t*, uint32_t*,
+                                                uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+    uint32_t reval = 0;
+    overlay_loader_get_reload_debug(NULL, NULL, NULL, NULL, NULL, &reval, NULL, NULL);
+    uint64_t entry = 0, fsr = 0, fnone = 0, mid = 0, eval = 0, deliv = 0;
+    psx_interrupt_check_path_diag(&entry, &fsr, &fnone, &mid, &eval, &deliv);
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu,\"cycles\":%llu,\"svc\":%llu,"
+             "\"mmio_sync\":%llu,\"irq_entry\":%llu,\"irq_fast_sr\":%llu,"
+             "\"irq_fast_none\":%llu,\"irq_mid\":%llu,\"irq_deliver\":%llu,"
+             "\"dispatch\":%llu,\"icache_miss\":%llu,\"idle_skips\":%llu,"
+             "\"idle_skip_cycles\":%llu,\"stores\":%llu,\"st_kernel\":%llu,"
+             "\"st_exec\":%llu,\"st_watch\":%llu,\"st_text\":%llu,"
+             "\"ovl_reval\":%u,\"ovl_fast\":%llu,\"raw_cpu\":%llu,\"raw_dma\":%llu,\"raw_io\":%llu,"
+             "\"mmio\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]}",
+             id, (unsigned long long)s_frame_count, (unsigned long long)psx_get_cycle_count(),
+             (unsigned long long)g_psx_svc_calls, (unsigned long long)g_psx_mmio_sync_calls,
+             (unsigned long long)entry, (unsigned long long)fsr, (unsigned long long)fnone,
+             (unsigned long long)mid, (unsigned long long)deliv,
+             (unsigned long long)g_disp_tail_seq, (unsigned long long)g_psx_icache_misses,
+             (unsigned long long)g_idle_skip_count, (unsigned long long)g_idle_skip_cycles,
+             (unsigned long long)g_guest_store_count, (unsigned long long)g_psx_store_slow[0],
+             (unsigned long long)g_psx_store_slow[1], (unsigned long long)g_psx_store_slow[2],
+             (unsigned long long)g_psx_store_slow[3], reval,
+             (unsigned long long)overlay_loader_gen_fastpath(),
+             (unsigned long long)g_psx_store_raw[0], (unsigned long long)g_psx_store_raw[1],
+             (unsigned long long)g_psx_store_raw[2],
+             H(0), H(1), H(2), H(3), H(4), H(5), H(6), H(7),
+             H(8), H(9), H(10), H(11), H(12), H(13), H(14), H(15));
+#undef H
+}
+
+/* vram_drawn_check: gpu_vram_peek's cells against a renderer read (gpu.h). */
+static void handle_vram_drawn_check(int id, const char *json)
+{
+    (void)json;
+    uint32_t checked = 0, changed = 0, cells = 0;
+    gpu_vram_drawn_check(&checked, &changed, &cells);
+    send_fmt("{\"id\":%d,\"ok\":true,\"checked\":%u,\"changed\":%u,\"cells\":%u}",
+             id, checked, changed, cells);
 }
 
 static void handle_irq_state(int id, const char *json)
@@ -16337,6 +16401,8 @@ static const CmdEntry s_commands[] = {
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "vram_drawn_check",  handle_vram_drawn_check },
+    { "core_rates",        handle_core_rates },
     { "vblank_rate",       handle_vblank_rate },
     { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },

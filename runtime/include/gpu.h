@@ -122,7 +122,13 @@ void gpu_ws_set_local_viewport_width_sites(const uint32_t *sites, int count);
 void gpu_ws_set_local_viewport_native_wide(int enabled);
 int psx_ws_is_local_viewport_width_site(uint32_t pc);
 void gpu_vertical_split_debug(int *active, int *left_age, int *right_age);
+/* One VRAM pixel as the GPU has it. Reads through the renderer (with the
+ * render thread a sync point) only where the GPU may have drawn since the
+ * last such read; elsewhere this side's array is the same and is read. */
 uint16_t gpu_vram_peek(int x, int y);
+/* TCP vram_drawn_check: pixels outside the marked cells, how many of them a
+ * renderer read changed (0 = the cells caught every GPU write), cells marked. */
+void gpu_vram_drawn_check(uint32_t *checked, uint32_t *changed, uint32_t *cells);
 
 /* Shaded quad vertex capture (Phase 4.5 debug). */
 typedef struct {

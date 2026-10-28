@@ -77,7 +77,9 @@ typedef struct {
     NetplaySioParts  sio;
 } ScBoundary;
 
-static int       s_phase = SC_OFF;
+/* Exported for psx_edge.h's inline edge check (0 = SC_OFF). */
+int              g_psx_selfcheck_phase = SC_OFF;
+#define s_phase g_psx_selfcheck_phase
 static CPUState *s_cpu;
 static uint32_t  s_bios_checksum;
 static uint32_t  s_entry_pc;
