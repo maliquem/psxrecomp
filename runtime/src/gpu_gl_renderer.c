@@ -929,8 +929,33 @@ static void sc_hold(ScSlot *sl) {
     sl->ev = spare.ev; sl->ecap = spare.ecap;
     s_sc_held_ok = 1;
 }
+/* TCP shadow_cache "restarts": the last list restarts ([why: 1 emit, 2 sprite,
+ * 3 triangle, 4 depth clear; area top; triangles it had; foot points taken]),
+ * the foot points handed in and those dropped with the pending list full. */
+static int      s_rs_log[8][4], s_rs_at = 0;
+static unsigned s_anc_in = 0, s_anc_full = 0;
+/* Copies of the picture being drawn (scopy_note, below). */
+enum { SCOPY_MAX = 8 };
+static int s_scopy[SCOPY_MAX][4], s_scopy_n = 0;
+static unsigned s_scopy_glass = 0;   /* TCP shadow_cache "glass": triangles drawn as glass */
+static int scopy_holds(int base_x, int base_y, const int *us, const int *vs);
 /* A new frame in this list: it starts over and takes the foot points. */
-static void sc_restart(ScSlot *sl) {
+static void sc_restart(ScSlot *sl, int why) {
+    { int *L = s_rs_log[s_rs_at++ & 7]; L[0] = why; L[1] = sl->area[1]; L[2] = sl->n; L[3] = s_anc_pend_n; }
+    if (!sl->shown && sl->n == 0) {
+        /* already started over, no 3D in it yet: the same new frame (BoF4's
+         * crater: 2D pieces drawn after the fill start the frame and take the
+         * foot points, then the fill's depth clear at the first 3D triangle
+         * came here and dropped them, the sprites cast nothing). Keep it all
+         * and take what came since. */
+        for (int i = 0; i < s_anc_pend_n && sl->nanc < SC_ANC_MAX; i++)
+            memcpy(sl->anc[sl->nanc++], s_anc_pend[i], sizeof s_anc_pend[0]);
+        s_anc_pend_n = 0;
+        for (int i = 0; i < s_pts_pend_n && sl->npts < SC_PTS_MAX; i++)
+            memcpy(sl->pts[sl->npts++], s_pts_pend[i], sizeof s_pts_pend[0]);
+        s_pts_pend_n = 0;
+        return;
+    }
     sc_hold(sl);
     sl->n = 0; sl->shown = 0; sl->conv = 0; sl->sn = 0; sl->en = 0;
     sl->atl_x = sl->atl_y = sl->atl_h = 0; sl->atl_key[0] = -1;
@@ -1066,7 +1091,7 @@ static void sc_add_emit(int x1, int y1, int x2, int y2, const int *xs, const int
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
-    if (sl->shown) sc_restart(sl);
+    if (sl->shown) sc_restart(sl, 1);
     if (sl->en >= 1024) return;
     if (sl->en == sl->ecap) {
         const int nc = sl->ecap ? sl->ecap * 2 : 64;
@@ -1104,7 +1129,7 @@ static void sc_add_sprite_tri(int x1, int y1, int x2, int y2, const int *xs, con
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
-    if (sl->shown) sc_restart(sl);
+    if (sl->shown) sc_restart(sl, 2);
     /* the camera too (when no chain reads the shadow map, no 3D triangle
      * brings it: a light that lights the sprites in an area with no sun) */
     if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
@@ -1215,7 +1240,7 @@ static void sc_add_tri(int x1, int y1, int x2, int y2, const float *tex, const f
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 1);
     if (!sl) return;
-    if (sl->shown) sc_restart(sl);   /* a new frame into a shown picture */
+    if (sl->shown) sc_restart(sl, 3);   /* a new frame into a shown picture */
     if (sl->cam_ver != s_fcam_ver) { sl->cam = s_fcam; sl->cam_ok = s_fcam_ok; sl->cam_ver = s_fcam_ver; }
     if (tone) {
         const float a = 0.5f * fabsf((s_pc_x[1] - s_pc_x[0]) * (s_pc_y[2] - s_pc_y[0]) -
@@ -1249,7 +1274,7 @@ static void sc_area_reset(int x1, int y1, int x2, int y2) {
     if (s_fg_drawing) return;
     const int area[4] = {x1, y1, x2, y2};
     ScSlot *sl = sc_slot(area, 0);
-    if (sl) sc_restart(sl);
+    if (sl) sc_restart(sl, 4);
 }
 /* The casters of the picture on screen: the list whose area holds its centre
  * (a generated frame: the real frame's, held when its slot started over). */
@@ -1585,6 +1610,17 @@ static int scc_log_json(char *out, int cap) {   /* appended to the stats */
     k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
     return k;
 }
+static int rs_log_json(char *out, int cap) {   /* appended to the stats */
+    const int at = (int)strlen(out);
+    int k = snprintf(out + at, (size_t)(cap - at), ",\"glass\":%u,\"screen_copies\":%d,\"anc_in\":%u,\"anc_full\":%u,\"anc_pend\":%d,\"restarts\":[",
+                     s_scopy_glass, s_scopy_n, s_anc_in, s_anc_full, s_anc_pend_n);
+    for (int i = 0; i < 8; i++) {
+        const int *L = s_rs_log[(s_rs_at - 1 - i) & 7];
+        k += snprintf(out + at + k, (size_t)(cap - at - k), "%s[%d,%d,%d,%d]", i ? "," : "", L[0], L[1], L[2], L[3]);
+    }
+    k += snprintf(out + at + k, (size_t)(cap - at - k), "]");
+    return k;
+}
 static int pfx_dbg_json(char *out, int cap) {   /* appended to the stats */
     const int at = (int)strlen(out);
     int k = snprintf(out + at, (size_t)(cap - at), ",\"presents\":[");
@@ -1607,7 +1643,8 @@ static void fcam_apply(const float *c) {
     s_fcam.of[0] = c[12]; s_fcam.of[1] = c[13]; s_fcam.h = c[14] > 0.0f ? c[14] : 1024.0f;
 }
 static void anchor_apply(const float *w) {
-    if (s_anc_pend_n >= SC_ANC_MAX) return;
+    s_anc_in++;
+    if (s_anc_pend_n >= SC_ANC_MAX) { s_anc_full++; return; }
     memcpy(s_anc_pend[s_anc_pend_n++], w, sizeof s_anc_pend[0]);
 }
 static void point_apply(const float *w) {
@@ -1722,7 +1759,7 @@ int gl_renderer_shadow_cache_stats(char *out, int cap) {
         s_cam_ok, s_scc_n, s_scc_alive, (unsigned long long)s_scc_matched, (unsigned long long)s_scc_added,
         (unsigned long long)s_scc_dropped, (unsigned long long)s_scc_resets, s_cam_pick, s_wg_n, s_fcam_ver, s_spr_frames, s_spr_last, s_spr_runs[0], s_spr_runs[1], s_spr_runs[2], s_spr_bent,
         s_scc_last_cx, s_scc_last_cy, s_sc_cx, s_sc_cy) +
-        scc_log_json(out, cap) + pfx_dbg_json(out, cap);
+        scc_log_json(out, cap) + rs_log_json(out, cap) + pfx_dbg_json(out, cap);
 }
 /* TCP sprite_dump: the picture on screen's foot points and 2D pieces, on the
  * picture (native px from its centre): pieces as [x0, y0, x1, y1, page x,
@@ -5068,7 +5105,7 @@ static void tex_draw_passes_ex_(int nverts, int semi, int tb_mask, int check,
         p_glUniform1i(s_uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
     }
-    if ((s_bcls_on || s_b3d_on) && (!s_fg_drawing || s_fg_marks)) {
+    if ((s_bcls_on || s_b3d_on) && b3d != 3 && (!s_fg_drawing || s_fg_marks)) {   /* 3: glass, marks kept */
         if (s_bcls_on) {
             const int bp = bcls_passes(semi, b3d == 2 ? 0 : b3d);
             bcls_begin(1, 0, 0x02);
@@ -5278,7 +5315,7 @@ static int hiw_enqueue_tex(int nverts, int semi, int mirror, int gate) {
     c->tex = s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex;
     c->palette = s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex;
     c->hd_tex = s_tb_hd_tex;
-    c->b3d = s_tb_b3d == 2 ? 2 : -1;
+    c->b3d = s_tb_b3d == 2 || s_tb_b3d == 3 ? s_tb_b3d : -1;
     if (wq) hiw_wide_set(c, gate);
     return wq;
 }
@@ -6205,12 +6242,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi));
         const int batch_semi = batch_class.key;
         const int isolate = batch_class.isolate;
-        const int tdmode = pgxp_tri_depth_mode(semi);
-        /* the batch's mark (bcls_passes / b3dm_passes): 3D, or a painted backdrop */
-        const int tex_b3d = (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() ? 1
+        /* glass: a 3D face textured with a copy of the picture (scopy_note) */
+        const int glass = depth == 2 && pgxp_tri_is_3d() && scopy_holds(base_x, base_y, us, vs);
+        if (glass) s_scopy_glass++;
+        const int tdmode = glass ? 0 : pgxp_tri_depth_mode(semi);
+        /* the batch's mark (bcls_passes / b3dm_passes): 3D, or a painted backdrop; 3 glass (none) */
+        const int tex_b3d = glass ? 3 : (s_bcls_on || s_b3d_on) && pgxp_tri_is_3d() ? 1
                           : s_b3d_on && (ctx_prim_in_backdrop() & 7) == 1 ? 2 : 0;
         s_dbg_bdm[2]++; if (tex_b3d == 2) s_dbg_bdm[1]++;
-        if ((semi == 1 || semi == 3) && s_sc_on) {
+        if ((semi == 1 || semi == 3) && s_sc_on && !glass) {
             float rgb[3], wsc, wce;
             emit_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, rgb);
             emit_wide_scale(gate, &wsc, &wce);
@@ -6231,7 +6271,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                 const int toned = tone_tex_rgb(us, vs, base_x, base_y, depth, clut_x, clut_y, col, rawtex, tone);
                 sc_add_tri(s_area_x1, s_area_y1, s_area_x2, s_area_y2, t, toned ? tone : NULL);
             }
-        } else if (s_spr_on) {
+        } else if (s_spr_on && !glass) {
             const float t6[6] = {(float)base_x, (float)base_y, (float)clut_x, (float)clut_y,
                                  s_selected_bank_tex ? -1.0f : (float)depth,
                                  (float)(twx | (twy << 5) | (tox << 10) | (toy << 15))};
@@ -6482,6 +6522,49 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
 }
 
+/* Copies of the picture being drawn: where a GP0(80h) whose source overlaps
+ * the drawing area put it (inclusive VRAM rects). A 3D polygon textured
+ * from one in 15 bits is a see-through effect (BoF4's invisible dragon: the
+ * screen behind it on its faces): "glass" for the effects, it keeps the
+ * depth and the marks of what is behind and casts nothing, so the lighting
+ * passes treat its pixels as that scenery. Any other write there forgets it. */
+static void scopy_forget(int x, int y, int w, int h) {
+    const int x1 = x + w - 1, y1 = y + h - 1;
+    for (int i = 0; i < s_scopy_n; ) {
+        const int *r = s_scopy[i];
+        if (r[0] <= x1 && x <= r[2] && r[1] <= y1 && y <= r[3]) {
+            memmove(s_scopy[i], s_scopy[i + 1], (size_t)(s_scopy_n - 1 - i) * sizeof s_scopy[0]);
+            s_scopy_n--;
+        } else i++;
+    }
+}
+static void scopy_note(int sx, int sy, int dx, int dy, int w, int h) {
+    scopy_forget(dx, dy, w, h);
+    int ov = 0;   /* the source (wrapping per pixel) overlaps the drawing area */
+    for (int k = 0; k < 2 && !ov; k++) {
+        const int ax = k ? sx - VRAM_W : sx;
+        ov = ax <= s_area_x2 && s_area_x1 <= ax + w - 1 && sy <= s_area_y2 && s_area_y1 <= sy + h - 1;
+    }
+    if (!ov || dx + w > VRAM_W || dy + h > VRAM_H) return;
+    if (s_scopy_n == SCOPY_MAX) { memmove(s_scopy[0], s_scopy[1], (SCOPY_MAX - 1) * sizeof s_scopy[0]); s_scopy_n--; }
+    int *r = s_scopy[s_scopy_n++];
+    r[0] = dx; r[1] = dy; r[2] = dx + w - 1; r[3] = dy + h - 1;
+}
+/* A 15-bit triangle's texels all inside one picture copy. */
+static int scopy_holds(int base_x, int base_y, const int *us, const int *vs) {
+    if (!s_scopy_n) return 0;
+    int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+    for (int i = 0; i < 3; i++) {
+        if (us[i] < u0) u0 = us[i]; if (us[i] > u1) u1 = us[i];
+        if (vs[i] < v0) v0 = vs[i]; if (vs[i] > v1) v1 = vs[i];
+    }
+    const int x0 = base_x + u0, x1 = base_x + u1, y0 = base_y + v0, y1 = base_y + v1;
+    for (int i = 0; i < s_scopy_n; i++) {
+        const int *r = s_scopy[i];
+        if (x0 >= r[0] && x1 <= r[2] && y0 >= r[1] && y1 <= r[3]) return 1;
+    }
+    return 0;
+}
 /* VRAM->VRAM copy of a rect that wraps neither at its source nor at its
  * destination: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
@@ -6557,6 +6640,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     sx &= VRAM_W - 1; dx &= VRAM_W - 1;
     sy &= VRAM_H - 1; dy &= VRAM_H - 1;
+    scopy_note(sx, sy, dx, dy, w, h);
     for (int r = 0; r < h; ) {
         const int ys = (sy + r) & (VRAM_H - 1), yd = (dy + r) & (VRAM_H - 1);
         int hh = h - r;
@@ -6839,6 +6923,7 @@ static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
 }
 static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
     if (pass_refuse_write("fill", x, y, w, h)) return;
+    scopy_forget(x, y, w, h);
     if (s_depth_used) DEPTH_REQUEST_CLEAR(DCLR_FILL);   /* PGXP depth: the image under it is gone */
     if (cpu_raster_required()) {
         int faithful = native_draw_begin();
@@ -7101,6 +7186,7 @@ static void depth24_upload_policy(void) {
 
 static void glb_vram_write(int x,int y,uint16_t px){
     if (pass_refuse_write("poke", x & (VRAM_W-1), y & (VRAM_H-1), 1, 1)) return;
+    scopy_forget(x & (VRAM_W-1), y & (VRAM_H-1), 1, 1);
     depth24_upload_policy();
     sw_vram_write(x,y,px);
     /* Point pokes are never MDEC frames — always stage to FBO. */
@@ -7109,6 +7195,7 @@ static void glb_vram_write(int x,int y,uint16_t px){
 static uint16_t glb_vram_read(int x,int y){ depth24_upload_policy(); ensure_cpu(); return sw_vram_read(x,y); }
 static void glb_vram_transfer_in(int x,int y,int w,int h,const uint16_t *d){
     if (pass_refuse_write("upload", x, y, w, h)) return;
+    scopy_forget(x, y, w, h);
     depth24_upload_policy();
     sw_vram_transfer_in(x,y,w,h,d);
     if (s_depth24_skip_up && depth24_is_fb_transfer(x, y, w, h)) {
