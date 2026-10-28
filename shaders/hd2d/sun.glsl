@@ -29,9 +29,11 @@
 //           2005), from a texel up to x: a bush's leaves sharp at its foot,
 //           a cliff's far edge soft; 0 = always x
 // u_ssm:    the sprites' shadow map (framework `sprshadow`, mapped as u_sm);
-//           u_ss.x 0 (framework) leaves it empty: no sprite shadows; u_ss.y
-//           0: the sprites' shadows only, no sun on the scenery (no facing,
-//           no scenery shadows; sprites stay lit)
+//           u_ss.x 0 (framework) leaves it empty: no sprite shadows; 0.5..1
+//           how dark they are (1: a full shadow, as the scenery's; the
+//           framework takes below 0.5 as none); u_ss.y 0: the sprites'
+//           shadows only, no sun on the scenery (no facing, no scenery
+//           shadows; sprites stay lit)
 // u_proj:   x = H, y = native height (240), z = internal scale (depth grid)
 // u_spr:    the sprites standing in the scene (framework `sprite` input): view
 //           depth of the sprite drawn at each pixel, >= 50000 = none; with
@@ -249,7 +251,7 @@ void main()
     float scn = u_ss.y > 0.5 ? 1.0 : 0.0;   // sprites only: no facing, no scenery shadows
     float bias = (u_shadow.y * z + 2.0 * texel) * (1.0 + 2.0 * (1.0 - lambert));
     float shadow = (lambert > 0.0 || scn < 0.5)
-        ? shadow_at(P, bias, sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), 1.0, scn) : 1.0;
+        ? shadow_at(P, bias, sqrt(max(1.0 - lambert * lambert, 0.0)) / max(lambert, 0.05), clamp(u_ss.x, 0.0, 1.0), scn) : 1.0;
     // u_shadow.w: the seam at a wall's foot filled (contact_at over w x the bias; 0 = off)
     if (u_shadow.w > 0.0 && lambert > 0.0 && scn > 0.5 && shadow > 1.0 - u_shadow.z)
         shadow = min(shadow, contact_at(P, L, u_shadow.w * bias));
