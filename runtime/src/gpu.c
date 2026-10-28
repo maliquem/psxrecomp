@@ -48,6 +48,7 @@
 #include "ws_radial_screen_mask.h"
 #include <stdint.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -837,25 +838,128 @@ int gpu_shadow_off_active(void) {
     return (sh_off_seen && (uint32_t)s_frame_count - sh_off_frame <= 4u) || gpu_shadow_area_off();
 }
 /* [video.shadow] sun_areas: the sun per area (a mod's map id, or else the
- * scene_keys' number; kept at each VBlank while the shadow map is in use). */
+ * scene_keys' number; kept at each VBlank while the shadow map is in use).
+ * Two layers: the config's suns (gpu_set_shadow_sun_areas) and the live ones
+ * (gpu_shadow_light_set: a title's own file, a tool), a sun and a moon per
+ * area, which win. Each light is one 64-bit word (mode, azimuth and
+ * elevation in tenths of a degree): the render thread reads it whole while
+ * the emulation thread changes it. */
 enum { SH_SUN_MAX = 256 };
-static int      sh_sun_n = 0;
-static uint32_t sh_sun_area[SH_SUN_MAX], sh_area = 0;
-static float    sh_sun_az[SH_SUN_MAX], sh_sun_el[SH_SUN_MAX];
+typedef struct { uint32_t area; _Atomic uint64_t light[2]; } ShLight;
+static ShLight          sh_cfg[SH_SUN_MAX], sh_live[SH_SUN_MAX];
+static _Atomic int      sh_cfg_n = 0, sh_live_n = 0;
+static _Atomic uint32_t sh_area = 0;
+static uint64_t sh_light_pack(int mode, float az, float el) {
+    const int a = (int)lroundf(az * 10.0f), e = (int)lroundf(el * 10.0f);
+    return (uint64_t)(uint8_t)mode | (uint64_t)(uint16_t)(int16_t)a << 16 | (uint64_t)(uint16_t)(int16_t)e << 32;
+}
+static int sh_light_unpack(uint64_t w, float *az, float *el) {
+    if (az) *az = (float)(int16_t)(uint16_t)(w >> 16) / 10.0f;
+    if (el) *el = (float)(int16_t)(uint16_t)(w >> 32) / 10.0f;
+    return (int)(w & 0xFFu);
+}
+static ShLight *sh_light_find(ShLight *t, int n, uint32_t area) {
+    for (int i = 0; i < n; i++) if (t[i].area == area) return &t[i];
+    return NULL;
+}
 void gpu_set_shadow_sun_areas(const uint32_t *area, const float *az, const float *el, int n) {
-    sh_sun_n = n < 0 ? 0 : n > SH_SUN_MAX ? SH_SUN_MAX : n;
-    for (int i = 0; i < sh_sun_n; i++) { sh_sun_area[i] = area[i]; sh_sun_az[i] = az[i]; sh_sun_el[i] = el[i]; }
+    n = n < 0 ? 0 : n > SH_SUN_MAX ? SH_SUN_MAX : n;
+    atomic_store(&sh_cfg_n, 0);
+    for (int i = 0; i < n; i++) {
+        sh_cfg[i].area = area[i];
+        atomic_store(&sh_cfg[i].light[0], sh_light_pack(el[i] > 0.0f ? GPU_LIGHT_AT : GPU_LIGHT_OFF, az[i], el[i]));
+        atomic_store(&sh_cfg[i].light[1], 0);
+    }
+    atomic_store(&sh_cfg_n, n);
+}
+int gpu_shadow_light_set(uint32_t area, int which, int mode, float az, float el) {
+    if (which < 0 || which > 1 || mode < GPU_LIGHT_NONE || mode > GPU_LIGHT_OFF) return 0;
+    const int n = atomic_load(&sh_live_n);
+    ShLight *l = sh_light_find(sh_live, n, area);
+    if (!l) {
+        if (mode == GPU_LIGHT_NONE) return 1;
+        if (n >= SH_SUN_MAX) return 0;
+        l = &sh_live[n];
+        l->area = area;
+        atomic_store(&l->light[0], 0); atomic_store(&l->light[1], 0);
+        atomic_store(&sh_live_n, n + 1);
+    }
+    atomic_store(&l->light[which], mode == GPU_LIGHT_NONE ? 0 : sh_light_pack(mode, az, el));
+    return 1;
+}
+int gpu_shadow_light_get(uint32_t area, int which, int layer, float *az, float *el) {
+    if (which < 0 || which > 1) return GPU_LIGHT_NONE;
+    ShLight *l = layer ? sh_light_find(sh_cfg, atomic_load(&sh_cfg_n), area)
+                       : sh_light_find(sh_live, atomic_load(&sh_live_n), area);
+    return l ? sh_light_unpack(atomic_load(&l->light[which]), az, el) : GPU_LIGHT_NONE;
+}
+uint32_t gpu_shadow_current_area(void) { return atomic_load(&sh_area); }
+/* gpu_shadow_lights_load: a lights file (a tuning tool's), one area per line:
+ *   0xAREA sun AZ EL moon AZ EL      ("off" for either; '#' starts a comment) */
+static int sh_is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+static char *sh_next_word(char **p) {
+    char *s = *p;
+    while (sh_is_space(*s)) s++;
+    if (!*s) { *p = s; return NULL; }
+    char *w = s;
+    while (*s && !sh_is_space(*s)) s++;
+    if (*s) *s++ = '\0';
+    *p = s;
+    return w;
+}
+int gpu_shadow_lights_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int n = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *p = line, *t = sh_next_word(&p);
+        if (!t) continue;
+        const uint32_t area = (uint32_t)strtoul(t, NULL, 0);
+        if (!area) continue;
+        while ((t = sh_next_word(&p)) != NULL) {
+            const int which = strcmp(t, "moon") == 0 ? 1 : strcmp(t, "sun") == 0 ? 0 : -1;
+            char *a = which < 0 ? NULL : sh_next_word(&p);
+            if (!a) break;
+            if (strcmp(a, "off") == 0) { n += gpu_shadow_light_set(area, which, GPU_LIGHT_OFF, 0.0f, 0.0f); continue; }
+            char *b = sh_next_word(&p), *ea, *eb;
+            if (!b) break;
+            const float az = strtof(a, &ea), el = strtof(b, &eb);
+            if (*ea || *eb || !(el > 0.0f && el < 90.0f)) break;
+            n += gpu_shadow_light_set(area, which, GPU_LIGHT_AT, az, el);
+        }
+    }
+    fclose(f);
+    return n;
+}
+/* the live layer's light when it has one, else the config's */
+static int sh_light_now(int which, float *az, float *el) {
+    const uint32_t a = atomic_load(&sh_area);
+    const int m = gpu_shadow_light_get(a, which, 0, az, el);
+    return m != GPU_LIGHT_NONE ? m : gpu_shadow_light_get(a, which, 1, az, el);
 }
 int gpu_shadow_sun_area(float *az, float *el) {
-    for (int i = 0; i < sh_sun_n; i++)
-        if (sh_sun_area[i] == sh_area && sh_sun_el[i] > 0.0f) { *az = sh_sun_az[i]; *el = sh_sun_el[i]; return 1; }
-    return 0;
+    float a, e;
+    if (sh_light_now(0, &a, &e) != GPU_LIGHT_AT) return 0;
+    *az = a; *el = e;
+    return 1;
 }
-/* an entry "off" (elevation 0): no sun in that area */
+int gpu_shadow_moon_area(float *az, float *el) {
+    float a, e;
+    if (sh_light_now(1, &a, &e) != GPU_LIGHT_AT) return 0;
+    *az = a; *el = e;
+    return 1;
+}
+/* "off": no sun in that area; at night (the night's share past half,
+ * gl_renderer_night) the area's moon decides when it has one */
 int gpu_shadow_area_off(void) {
-    for (int i = 0; i < sh_sun_n; i++)
-        if (sh_sun_area[i] == sh_area) return sh_sun_el[i] <= 0.0f;
-    return 0;
+    if (gl_renderer_night() > 0.5f) {
+        const int m = sh_light_now(1, NULL, NULL);
+        if (m != GPU_LIGHT_NONE) return m == GPU_LIGHT_OFF;
+    }
+    return sh_light_now(0, NULL, NULL) == GPU_LIGHT_OFF;
 }
 static int gp0_tex_hidden(uint16_t tpage, uint16_t clut) {
     if (!sh_hide_on) return 0;

@@ -239,6 +239,13 @@ int   gl_renderer_shadow_sprites_wanted(void);   /* a chain reads `sprite` */
  * whether the scenery casts (0: the sprites' shadows alone, u_ss.y 0).
  * 0 until a map was built. */
 int   gl_renderer_shadow_sun_info(float *elevation_deg, int *scenery);
+/* The same build's light in full (a tuning tool): out[0..1] = the light used
+ * (azimuth, elevation; the night's move included), [2..3] = the pass's own
+ * u_sun, [4..5] = its u_moon (a turn from the sun, elevation), [6..7] = the
+ * camera: the heading it looks along (in the sun's azimuths) and how far
+ * down it looks (degrees). Returns the presents since that build (-1: none
+ * yet). */
+int   gl_renderer_shadow_light_info(float out[8]);
 /* The scene's static geometry in world space (a game mod reads it from the
  * game's own map data): n triangles x 9 floats (x, y, z per corner, the
  * coordinates the game feeds the GTE). While set, and the picture's camera is
@@ -262,6 +269,7 @@ int   gl_renderer_scene_tone(float out[4]);
  * toward the reading pass's u_moon (x = azimuth added, y = elevation). Any
  * thread, no sync point: takes effect from the next present. */
 void  gl_renderer_set_night(float f);
+float gl_renderer_night(void);   /* the share last asked for */
 /* Faces the game culled (NCLIP back-facing), shadow-only casters: n x 9
  * floats (VRAM x, y, SZ per corner) and n x 4 drawing areas. */
 void  gl_renderer_shadow_add_backfaces(const float *v9, const int *area4, int n);
