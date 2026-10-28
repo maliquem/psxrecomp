@@ -61,8 +61,9 @@
  *   - No dithering (the software path doesn't dither either).
  *   - Gouraud interpolation happens at 8-bit precision instead of 5-bit
  *     (smoother gradients; readback re-quantizes to 5-bit).
- *   - VRAM-wrapping draws are clamped, except GP0(02h) fills which split
- *     into wrapped segments. Wrapping copies/draws are unused by real SDKs.
+ *   - VRAM-wrapping draws are clamped, except GP0(02h) fills and GP0(80h)
+ *     copies, which split into wrapped segments (BoF4's invisible dragon copies
+ *     the screen behind it from x = -126, i.e. 898..1023 then 0..129).
  *
  * INTERNAL SCALE LIMITS. S is clamped at init to the driver's texture,
  * renderbuffer and viewport limits and to a memory budget (gl_scale_limits.h),
@@ -6481,16 +6482,16 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
 }
 
-/* VRAM->VRAM copy: blit the source region to the scratch texture (resolves
+/* VRAM->VRAM copy of a rect that wraps neither at its source nor at its
+ * destination: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
-static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+static void gpu_copy_seg(int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    /* Clamp to bounds (the software path wraps; wrapping copies are unused
-     * in practice — see the file header). */
+    /* gpu_copy_rect hands whole segments; the clamp only guards bounds */
     if (sx < 0) sx = 0; if (sy < 0) sy = 0;
     if (dx < 0) dx = 0; if (dy < 0) dy = 0;
     if (sx + w > VRAM_W) w = VRAM_W - sx;
@@ -6547,6 +6548,30 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
+/* GP0(80h): source and destination addresses wrap at 1024x512 on their own,
+ * per pixel (sw_copy_rect: (x + col) & 1023, (y + row) & 511). Cut the rect
+ * where either side crosses an edge; each piece is a plain copy. */
+static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+    if (w <= 0 || h <= 0) return;
+    sx &= VRAM_W - 1; dx &= VRAM_W - 1;
+    sy &= VRAM_H - 1; dy &= VRAM_H - 1;
+    for (int r = 0; r < h; ) {
+        const int ys = (sy + r) & (VRAM_H - 1), yd = (dy + r) & (VRAM_H - 1);
+        int hh = h - r;
+        if (hh > VRAM_H - ys) hh = VRAM_H - ys;
+        if (hh > VRAM_H - yd) hh = VRAM_H - yd;
+        for (int c = 0; c < w; ) {
+            const int xs = (sx + c) & (VRAM_W - 1), xd = (dx + c) & (VRAM_W - 1);
+            int ww = w - c;
+            if (ww > VRAM_W - xs) ww = VRAM_W - xs;
+            if (ww > VRAM_W - xd) ww = VRAM_W - xd;
+            gpu_copy_seg(xs, ys, xd, yd, ww, hh);
+            c += ww;
+        }
+        r += hh;
+    }
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
