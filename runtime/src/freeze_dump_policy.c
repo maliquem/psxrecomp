@@ -82,6 +82,30 @@ void freeze_dump_policy_record_result(FreezeDumpPolicy *policy, int written) {
     policy->pending_kind = 0;
 }
 
+uint32_t freeze_wedge_classify(const FreezeWedgeWindow *w) {
+    if (!w) return 0;
+    if (w->frame_delta == 0) return 1;
+    if (w->exc_reentry_delta / w->frame_delta > FREEZE_WEDGE_EXC_REENTRY_PER_FRAME)
+        return 2;
+    if (w->frame_delta < FREEZE_WEDGE_SLOW_FRAMES_MAX_DELTA) return 3;
+    if (w->logic_pinned && !w->mdec_active &&
+        w->output_still_ticks >= FREEZE_SPIN_STILL_TICKS)
+        return 5;
+    return 0;
+}
+
+uint32_t freeze_output_observe(FreezeOutputTracker *t, uint64_t output) {
+    if (!t) return 0;
+    if (!t->primed || output != t->last_output) {
+        t->primed = 1;
+        t->last_output = output;
+        t->still_ticks = 0;
+    } else if (t->still_ticks < UINT32_MAX) {
+        t->still_ticks++;
+    }
+    return t->still_ticks;
+}
+
 int freeze_dump_format_path(char *out, size_t cap, const char *backend,
                             long long wall, uint32_t sequence) {
     if (!out || cap == 0 || !backend) return 0;

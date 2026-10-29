@@ -23,6 +23,82 @@ static void observe_healthy(FreezeDumpPolicy *policy, uint32_t ticks) {
     for (uint32_t i = 0; i < ticks; i++) EXPECT_EQ(observe(policy, 0), 0);
 }
 
+/* One 2 s window at ~60 host frames/s with the PCs pinned at both ends. */
+static uint32_t classify_pinned(uint32_t output_still_ticks) {
+    FreezeWedgeWindow w = {0};
+    w.frame_delta = 120;
+    w.exc_reentry_delta = 120u * 1600u;
+    w.logic_pinned = 1;
+    w.output_still_ticks = output_still_ticks;
+    return freeze_wedge_classify(&w);
+}
+
+/* Feed the tracker one heartbeat tick per output sample; the window's
+ * classification after the last one (PCs pinned, frames healthy). */
+static uint32_t run_ticks(FreezeOutputTracker *t, uint64_t output, uint32_t ticks) {
+    uint32_t still = 0;
+    for (uint32_t i = 0; i < ticks; i++) still = freeze_output_observe(t, output);
+    return classify_pinned(still);
+}
+
+static void check_wedge_classification(void) {
+    /* Kinds 1-3 keep their precedence and thresholds. */
+    FreezeWedgeWindow w = {0};
+    w.logic_pinned = 1;
+    w.output_still_ticks = FREEZE_SPIN_STILL_TICKS;
+    EXPECT_EQ(freeze_wedge_classify(&w), 1);
+    w.frame_delta = 120;
+    w.exc_reentry_delta = 120u * (FREEZE_WEDGE_EXC_REENTRY_PER_FRAME + 1u);
+    EXPECT_EQ(freeze_wedge_classify(&w), 2);
+    w.frame_delta = FREEZE_WEDGE_SLOW_FRAMES_MAX_DELTA - 1u;
+    w.exc_reentry_delta = 0;
+    EXPECT_EQ(freeze_wedge_classify(&w), 3);
+    w.frame_delta = 120;
+    w.mdec_active = 1;            /* FMV: parked in BIOS MDEC code */
+    EXPECT_EQ(freeze_wedge_classify(&w), 0);
+
+    /* Breath of Fire IV in play: the VSync wait is sampled at both ends of
+     * the window (PCs "pinned") while the game draws and flips every frame.
+     * Its output moves every tick, so this is never a spin. */
+    FreezeOutputTracker playing = {0};
+    uint64_t out = 1000;
+    for (uint32_t tick = 0; tick < 600; tick++) {
+        uint32_t still = freeze_output_observe(&playing, out += 37);
+        EXPECT_EQ(classify_pinned(still), 0);
+    }
+
+    /* Its boot: a fixed ~2.6 s VSync wait (frames ~278-432 at 60 Hz) with
+     * nothing drawn, no flip and no CD sector, then the logo starts. */
+    FreezeOutputTracker boot = {0};
+    EXPECT_EQ(run_ticks(&boot, 525, 26), 0);
+    EXPECT_EQ(run_ticks(&boot, 530, 1), 0);   /* first GP0 command */
+    EXPECT_EQ(boot.still_ticks, 0);
+
+    /* A real logical hang (Tomba dwarf-village dialogue): the game spins on
+     * a flag that never flips; nothing new reaches the GPU or the CD. It is
+     * still reported, once the output has been still for the whole span. */
+    FreezeOutputTracker hang = {0};
+    EXPECT_EQ(run_ticks(&hang, 77, FREEZE_SPIN_STILL_TICKS), 0);
+    EXPECT_EQ(run_ticks(&hang, 77, 1), 5);
+    EXPECT_EQ(run_ticks(&hang, 77, 1000), 5);
+    /* ...and a hang whose PCs are not pinned is still not a spin. */
+    w.mdec_active = 0;
+    w.logic_pinned = 0;
+    w.output_still_ticks = hang.still_ticks;
+    EXPECT_EQ(freeze_wedge_classify(&w), 0);
+
+    /* Output that resumes clears the stillness at once. */
+    EXPECT_EQ(run_ticks(&hang, 78, 1), 0);
+    EXPECT_EQ(hang.still_ticks, 0);
+
+    /* The first sample only primes: a tracker starts still at zero. */
+    FreezeOutputTracker fresh = {0};
+    EXPECT_EQ(freeze_output_observe(&fresh, 0), 0);
+    EXPECT_EQ(freeze_output_observe(&fresh, 0), 1);
+    fresh.primed = 0;   /* pause resets it */
+    EXPECT_EQ(freeze_output_observe(&fresh, 0), 0);
+}
+
 int main(void) {
     FreezeDumpPolicy policy = {0};
 
@@ -113,6 +189,8 @@ int main(void) {
                                       "psx-runtime", 1234, 1), 1);
     EXPECT_EQ(strcmp(path0, path1) != 0, 1);
     EXPECT_EQ(freeze_dump_format_path(path0, 4, "psx-runtime", 1234, 0), 0);
+
+    check_wedge_classification();
 
     if (failures != 0) {
         fprintf(stderr, "freeze dump policy: %d failure(s)\n", failures);

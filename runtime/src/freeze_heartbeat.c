@@ -43,6 +43,10 @@ extern void     sio_get_freeze_diag(int *irq_pending, int *irq_countdown,
                                     int *card_active);
 extern int      sio_get_mc_max_state(void);
 extern int      sio_get_tx_writes(void);
+/* The guest's output (hb_guest_output). */
+extern uint64_t gpu_display_flips(void);           /* gpu.c: GP1(05h) that moved */
+extern uint32_t gpu_get_opcode_count(uint8_t op);  /* gpu.c: GP0 commands executed */
+extern uint64_t cdrom_get_dataready_fires(void);   /* cdrom.c: data sectors delivered */
 
 /* dirty_ram_interp counters — defined as plain globals in dirty_ram_interp.c.
  * Declared weakly here in case a future build drops the unit; missing symbol
@@ -123,14 +127,18 @@ static int    s_sym_initialized = 0;
  *      never flips (Tomba dwarf-village dialogue freeze, issue #1:
  *      ~51 fps, exc_re ~1.6K/frame — UNDER every threshold above, so
  *      A/B/C all miss it). Detected by cur_fn + store_pc + dirty_insns
- *      all stable across the window while frame_delta is healthy.
+ *      stable across the window while frame_delta is healthy AND the
+ *      guest's output (display flips, GP0 commands, CD sectors) still for
+ *      FREEZE_SPIN_STILL_TICKS. The PC test alone compares two samples of
+ *      a guest that sits in its VSync wait most of the time: a healthy
+ *      game drawing at 30 fps landed on the same wait-loop store at both
+ *      ends of the window in most Breath of Fire IV runs (~820 dumps), as
+ *      did its fixed ~2.6 s VSync wait at boot, where nothing is drawn.
  *
  * Window = 20 ticks = 2.0 sec. Long enough that legitimate startup
  * activity (boot, FMV decode, save load) doesn't trip it; short enough
  * that real wedges dump within seconds. */
 #define WEDGE_WINDOW_TICKS 20u
-#define WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD 20000u /* ~10x chronic 2K/frame */
-#define WEDGE_SLOW_FRAMES_MAX_DELTA 10u   /* <5 fps avg over the 2s window */
 
 /* Per-ring caps for auto-dump. Newest-first window. The old 4-16K caps
  * spanned well under a second of activity — too short to cross a
@@ -167,6 +175,7 @@ typedef struct {
     uint64_t tcp_stall_ms;
     uint16_t t1_count;        /* Timer1/RCnt1 counter — must advance if the wait is to complete */
     uint64_t t1_irq_fired;    /* Timer1 IRQ-fire count — flat == RCnt IRQ never fires */
+    uint64_t output;          /* hb_guest_output(): flat == the guest produces nothing */
 } HbRingEntry;
 static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
@@ -175,6 +184,7 @@ static uint32_t    s_ring_count = 0;
 /* Automatic full dumps are bounded independently from deliberate fatal dumps.
  * The heartbeat JSON reports both written and suppressed event counts. */
 static FreezeDumpPolicy s_dump_policy = {0};
+static FreezeOutputTracker s_output = {0};
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
 static volatile int s_wedge_classification_paused = 0;
 
@@ -653,7 +663,7 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
             "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
-            "\"t1_count\":%u,\"t1_irq_fired\":%llu,"
+            "\"t1_count\":%u,\"t1_irq_fired\":%llu,\"output\":%llu,"
             "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
@@ -664,6 +674,7 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
             (unsigned)e->t1_count, (unsigned long long)e->t1_irq_fired,
+            (unsigned long long)e->output,
             (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
     }
@@ -786,6 +797,15 @@ void freeze_heartbeat_fatal_dump(const char *reason) {
                             sio_get_mc_max_state(), sio_get_tx_writes());
 }
 
+/* Everything the guest has produced so far: moved display starts, executed
+ * GP0 commands (any opcode: draws, fills, copies, uploads, env) and CD data
+ * sectors. Only compared for change; the per-opcode counters may wrap. */
+static uint64_t hb_guest_output(void) {
+    uint64_t sum = gpu_display_flips() + cdrom_get_dataready_fires();
+    for (unsigned op = 0; op < 256u; op++) sum += gpu_get_opcode_count((uint8_t)op);
+    return sum;
+}
+
 static void heartbeat_write(void) {
     uint64_t cyc = psx_get_cycle_count();
     uint64_t frame = s_frame_count;
@@ -836,6 +856,7 @@ static void heartbeat_write(void) {
     { uint16_t _t1c = 0; uint64_t _t1f = 0;
       timers_get_debug(1, &_t1c, NULL, NULL, &_t1f);
       re->t1_count = _t1c; re->t1_irq_fired = _t1f; }
+    re->output = hb_guest_output();
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
@@ -845,15 +866,21 @@ static void heartbeat_write(void) {
      *   A. frame_count delta == 0                  (hard freeze)
      *   B. exc_reentry delta PER FRAME > threshold (reentry storm)
      *   C. frame_count delta < slow-frames floor   (host-side stall)
+     *   D. PCs pinned + guest output still for 10 s (logical spin)
      *
      * Only fires once the ring has enough history. The dump policy requires
      * a sustained healthy interval before it accepts a new event, and bounds
      * automatic full dumps for the process. Deliberate fatal dumps bypass it. */
-    uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames */
+    uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames 5=spin */
+    uint32_t output_still = 0;
     if (s_wedge_classification_paused) {
         s_ring_count = 0;
         s_last_wedge_kind = 0;
-    } else if (s_ring_count >= WEDGE_WINDOW_TICKS) {
+        s_output.primed = 0;
+    } else {
+        output_still = freeze_output_observe(&s_output, re->output);
+    }
+    if (!s_wedge_classification_paused && s_ring_count >= WEDGE_WINDOW_TICKS) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
          * our window is WEDGE_WINDOW_TICKS - 1 ticks before it. */
         uint32_t newest_idx = (s_ring_head + RING_CAP - 1u) % RING_CAP;
@@ -879,18 +906,17 @@ static void heartbeat_write(void) {
             (s_ring[newest_idx].last_store_pc   == s_ring[oldest_idx].last_store_pc) &&
             (s_ring[newest_idx].dirty_ram_insns == s_ring[oldest_idx].dirty_ram_insns);
 
-        if (frame_delta == 0)
-            wedge_kind = 1;
-        else if (excre_delta / frame_delta > WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD)
-            wedge_kind = 2;
-        else if (frame_delta < WEDGE_SLOW_FRAMES_MAX_DELTA)
-            wedge_kind = 3;
-        else if (logic_pinned && !mdec_recently_active((uint32_t)frame_delta + 1u))
-            wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
         /* Wave-5 F9: during an FMV the guest parks in BIOS MDEC code with the dirty-RAM
          * counters legitimately still while frames advance -- exactly the spin signature.
          * Every boot FMV wrote a 47-76 MB dump (1.8 GB per kit in one session). MDEC
          * activity inside the window rules the spin classification out. */
+        FreezeWedgeWindow w = {0};
+        w.frame_delta = frame_delta;
+        w.exc_reentry_delta = excre_delta;
+        w.logic_pinned = logic_pinned;
+        w.mdec_active = mdec_recently_active((uint32_t)frame_delta + 1u);
+        w.output_still_ticks = output_still;
+        wedge_kind = freeze_wedge_classify(&w);
     }
 
     if (!s_wedge_classification_paused &&
@@ -1097,7 +1123,7 @@ static void heartbeat_write(void) {
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
             "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
-            "\"t1_count\":%u,\"t1_irq_fired\":%llu,"
+            "\"t1_count\":%u,\"t1_irq_fired\":%llu,\"output\":%llu,"
             "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
@@ -1108,6 +1134,7 @@ static void heartbeat_write(void) {
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
             (unsigned)e->t1_count, (unsigned long long)e->t1_irq_fired,
+            (unsigned long long)e->output,
             (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
         if (m <= 0 || (size_t)(n + m) >= sizeof(buf)) break;

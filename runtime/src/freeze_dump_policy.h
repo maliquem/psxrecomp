@@ -39,6 +39,38 @@ int freeze_dump_policy_observe(FreezeDumpPolicy *policy, uint32_t wedge_kind,
  * bounded number of failed attempts before the policy consumes that slot. */
 void freeze_dump_policy_record_result(FreezeDumpPolicy *policy, int written);
 
+/* Wedge classification of one detector window (kinds: 0 healthy, 1 hard
+ * freeze, 2 exception re-entry storm, 3 slow frames, 5 logical spin). */
+#define FREEZE_WEDGE_EXC_REENTRY_PER_FRAME 20000u /* ~10x chronic 2K/frame */
+#define FREEZE_WEDGE_SLOW_FRAMES_MAX_DELTA 10u    /* <5 fps over the 2s window */
+/* A logical spin also needs the guest's own output to have been still this
+ * long: no display flip, no GP0 command, no CD sector. A guest that keeps
+ * presenting is alive however its sampled PCs look, and a guest that only
+ * waits a fixed count of VSyncs (Breath of Fire IV waits ~2.6 s at boot with
+ * nothing drawn) finishes well inside it. A real hang never does. */
+#define FREEZE_SPIN_STILL_TICKS 100u              /* 10 s at the 100 ms tick */
+
+typedef struct FreezeWedgeWindow {
+    uint64_t frame_delta;        /* host frames over the window */
+    uint64_t exc_reentry_delta;  /* exception re-entry blocks over the window */
+    int logic_pinned;            /* cur_fn, store_pc, dirty insns unchanged */
+    int mdec_active;             /* an MDEC decode inside the window (FMV) */
+    uint32_t output_still_ticks; /* freeze_output_observe() */
+} FreezeWedgeWindow;
+
+uint32_t freeze_wedge_classify(const FreezeWedgeWindow *w);
+
+/* Ticks the guest's output has been still. `output` is any count that grows
+ * when the guest produces something (flips + GP0 commands + CD sectors); it
+ * is only compared for change. The first sample starts the count at zero. */
+typedef struct FreezeOutputTracker {
+    uint64_t last_output;
+    uint32_t still_ticks;
+    int primed;
+} FreezeOutputTracker;
+
+uint32_t freeze_output_observe(FreezeOutputTracker *t, uint64_t output);
+
 /* Format a unique dump path. The sequence prevents same-second truncation. */
 int freeze_dump_format_path(char *out, size_t cap, const char *backend,
                             long long wall, uint32_t sequence);
